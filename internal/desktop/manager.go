@@ -54,11 +54,12 @@ func (m *Manager) Start(id string) (*VM, error) {
 	consolePath := filepath.Join(dir, "console.log")
 	pidPath := filepath.Join(dir, "vfkit.pid")
 
-	// Disk boot: page the rootfs in on demand instead of loading it all into
-	// RAM. Each VM gets its own clone of the base image (APFS clone is
-	// copy-on-write, so this is cheap) because a writable virtio-blk image
-	// cannot be attached to two VMs at once.
-	diskBoot := m.diskAvailable()
+	// Boot mode selection:
+	//   overlay  - shared read-only squashfs base + tmpfs overlay (no per-VM copy)
+	//   disk     - per-VM clone of an ext4 image
+	//   initramfs- the whole rootfs loaded into RAM
+	overlayBoot := m.overlayAvailable()
+	diskBoot := !overlayBoot && m.diskAvailable()
 	var diskPath string
 	if diskBoot {
 		diskPath = filepath.Join(dir, "rootfs.img")
@@ -75,7 +76,10 @@ func (m *Manager) Start(id string) (*VM, error) {
 		cmdline += " warmbox.share=" + m.cfg.ShareTag
 	}
 	initrd := m.cfg.InitrdPath
-	if diskBoot {
+	switch {
+	case overlayBoot:
+		initrd = m.cfg.OverlayInitrdPath
+	case diskBoot:
 		cmdline += " root=/dev/vda rootfstype=ext4 rootwait rw"
 		initrd = m.cfg.BootInitrdPath
 	}
@@ -90,7 +94,10 @@ func (m *Manager) Start(id string) (*VM, error) {
 		"--device", "virtio-net,nat",
 		"--device", "virtio-rng",
 	}
-	if diskBoot {
+	switch {
+	case overlayBoot:
+		args = append(args, "--device", "virtio-blk,path="+m.cfg.SquashPath+",readonly")
+	case diskBoot:
 		args = append(args, "--device", "virtio-blk,path="+diskPath)
 	}
 	if m.cfg.ShareDir != "" && m.cfg.ShareTag != "" {
@@ -214,6 +221,21 @@ func (m *Manager) Shutdown() {
 	for _, id := range ids {
 		_ = m.Destroy(id)
 	}
+}
+
+// overlayAvailable reports whether overlay boot is configured and both the
+// shared squashfs base and its boot initramfs exist.
+func (m *Manager) overlayAvailable() bool {
+	if m.cfg.SquashPath == "" || m.cfg.OverlayInitrdPath == "" {
+		return false
+	}
+	if _, err := os.Stat(m.cfg.SquashPath); err != nil {
+		return false
+	}
+	if _, err := os.Stat(m.cfg.OverlayInitrdPath); err != nil {
+		return false
+	}
+	return true
 }
 
 // diskAvailable reports whether disk boot is configured and both the base image

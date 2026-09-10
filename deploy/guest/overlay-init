@@ -1,0 +1,56 @@
+#!/bin/sh
+# warmbox overlay initramfs init — PID 1 in the boot initramfs.
+#
+# Mounts a read-only squashfs base (attached as a shared, read-only virtio-blk
+# device) and layers a tmpfs upper on top, then hands off to the guest's own
+# /init via switch_root. Writes land in RAM, so the base image is shared by
+# every VM and a VM needs no per-VM disk copy.
+
+export PATH=/bin:/sbin:/usr/bin:/usr/sbin
+
+log() { echo "[warmbox-initrd] $*" > /dev/kmsg 2>/dev/null; }
+
+mount -t proc proc /proc 2>/dev/null
+mount -t sysfs sys /sys 2>/dev/null
+mount -t devtmpfs dev /dev 2>/dev/null
+mkdir -p /dev/pts /dev/shm
+mount -t devpts devpts /dev/pts 2>/dev/null
+mount -t tmpfs tmpfs /dev/shm 2>/dev/null
+
+for m in virtio_pci virtio_blk squashfs overlay; do
+    modprobe "$m" 2>/dev/null
+done
+
+i=0
+while [ ! -b /dev/vda ] && [ $i -lt 50 ]; do
+    sleep 0.1
+    i=$((i+1))
+done
+if [ ! -b /dev/vda ]; then
+    log "no /dev/vda block device"
+    exec sh
+fi
+
+mkdir -p /mnt/base
+if ! mount -t squashfs -o ro /dev/vda /mnt/base; then
+    log "squashfs mount failed"
+    exec sh
+fi
+
+mkdir -p /overlay
+mount -t tmpfs -o mode=0755 tmpfs /overlay 2>/dev/null
+mkdir -p /overlay/upper /overlay/work /newroot
+if ! mount -t overlay overlay \
+        -o lowerdir=/mnt/base,upperdir=/overlay/upper,workdir=/overlay/work \
+        /newroot; then
+    log "overlay mount failed"
+    exec sh
+fi
+
+mkdir -p /newroot/proc /newroot/sys /newroot/dev
+mount --move /proc /newroot/proc 2>/dev/null
+mount --move /sys /newroot/sys 2>/dev/null
+mount --move /dev /newroot/dev 2>/dev/null
+
+log "switching root to squashfs+overlay"
+exec switch_root /newroot /init

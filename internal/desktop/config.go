@@ -33,6 +33,16 @@ type Config struct {
 	// or missing => fall back to the all-RAM initramfs.
 	DiskPath string
 
+	// SquashPath is a read-only squashfs rootfs base shared by every VM. When
+	// it (and OverlayInitrdPath) exist, VMs boot it with a tmpfs overlay, so no
+	// per-VM disk copy is made and all writes live in RAM. Takes precedence
+	// over DiskPath.
+	SquashPath string
+
+	// OverlayInitrdPath is the boot initramfs that mounts SquashPath read-only
+	// and layers a tmpfs overlay on top (see deploy/guest/overlay-init).
+	OverlayInitrdPath string
+
 	// NoVNCDir is a directory containing the noVNC static assets.
 	NoVNCDir string
 
@@ -78,21 +88,23 @@ func DefaultConfig() *Config {
 	}
 	wd := filepath.Join(home, ".warmbox")
 	return &Config{
-		WorkDir:        wd,
-		VfkitPath:      "vfkit",
-		KernelPath:     filepath.Join(wd, "vmlinux"),
-		InitrdPath:     filepath.Join(wd, "initramfs.zst"),
-		BootInitrdPath: filepath.Join(wd, "initramfs-virt"),
-		DiskPath:       filepath.Join(wd, "rootfs.img"),
-		NoVNCDir:       filepath.Join(wd, "novnc"),
-		HostAddr:       "192.168.64.1",
-		APIAddr:        ":7070",
-		MemMiB:         4096,
-		CPUs:           4,
-		Display:        "1280x800",
-		GuestVNCPort:   5900,
-		PoolSize:       2,
-		ShareTag:       "workspace",
+		WorkDir:           wd,
+		VfkitPath:         "vfkit",
+		KernelPath:        filepath.Join(wd, "vmlinux"),
+		InitrdPath:        filepath.Join(wd, "initramfs.zst"),
+		BootInitrdPath:    filepath.Join(wd, "initramfs-virt"),
+		DiskPath:          filepath.Join(wd, "rootfs.img"),
+		SquashPath:        filepath.Join(wd, "rootfs.squashfs"),
+		OverlayInitrdPath: filepath.Join(wd, "initramfs-overlay"),
+		NoVNCDir:          filepath.Join(wd, "novnc"),
+		HostAddr:          "192.168.64.1",
+		APIAddr:           ":7070",
+		MemMiB:            4096,
+		CPUs:              4,
+		Display:           "1280x800",
+		GuestVNCPort:      5900,
+		PoolSize:          2,
+		ShareTag:          "workspace",
 	}
 }
 

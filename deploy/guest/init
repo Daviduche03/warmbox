@@ -17,14 +17,14 @@ log() { echo "[warmbox] $*" > /dev/hvc0; }
 
 # --- mounts (must come before /proc/cmdline is read) ---
 mkdir -p /proc /sys /dev /tmp /run /var/log /root
-mount -t proc proc /proc
-mount -t sysfs sys /sys
+mount -t proc proc /proc 2>/dev/null
+mount -t sysfs sys /sys 2>/dev/null
 mount -t devtmpfs dev /dev 2>/dev/null
 mkdir -p /dev/pts /dev/shm
 mount -t devpts devpts /dev/pts 2>/dev/null
-mount -t tmpfs tmpfs /dev/shm
-mount -t tmpfs tmpfs /tmp
-mount -t tmpfs tmpfs /run
+mount -t tmpfs tmpfs /dev/shm 2>/dev/null
+mount -t tmpfs tmpfs /tmp 2>/dev/null
+mount -t tmpfs tmpfs /run 2>/dev/null
 ln -sf /run /var/run 2>/dev/null
 # XDG_RUNTIME_DIR lives under the freshly mounted tmpfs.
 mkdir -p /run/user/0

@@ -83,6 +83,8 @@ func addCommonFlags(fs *flag.FlagSet, cfg *desktop.Config) {
 	fs.StringVar(&cfg.InitrdPath, "initrd", cfg.InitrdPath, "path to all-RAM initramfs.zst")
 	fs.StringVar(&cfg.DiskPath, "disk", cfg.DiskPath, "base ext4 rootfs image for low-RAM disk boot (empty = all-RAM)")
 	fs.StringVar(&cfg.BootInitrdPath, "boot-initrd", cfg.BootInitrdPath, "Alpine boot initramfs for disk boot")
+	fs.StringVar(&cfg.SquashPath, "squash", cfg.SquashPath, "shared read-only squashfs base for overlay boot")
+	fs.StringVar(&cfg.OverlayInitrdPath, "overlay-initrd", cfg.OverlayInitrdPath, "boot initramfs for overlay boot")
 	fs.StringVar(&cfg.NoVNCDir, "novnc", cfg.NoVNCDir, "noVNC asset directory")
 	fs.StringVar(&cfg.VfkitPath, "vfkit", cfg.VfkitPath, "vfkit binary")
 	fs.StringVar(&cfg.APIAddr, "addr", cfg.APIAddr, "HTTP listen address")
@@ -107,11 +109,12 @@ func cmdDaemon(args []string) {
 	if _, err := os.Stat(cfg.KernelPath); err != nil {
 		fatal("missing guest kernel %s — build it with ./deploy/guest/build.sh", cfg.KernelPath)
 	}
-	// Boot needs either the disk image + boot initramfs, or the all-RAM initramfs.
+	// Boot needs an overlay base, an ext4 disk, or the all-RAM initramfs.
+	haveOverlay := stat(cfg.SquashPath) && stat(cfg.OverlayInitrdPath)
 	haveDisk := stat(cfg.DiskPath) && stat(cfg.BootInitrdPath)
-	if !haveDisk && !stat(cfg.InitrdPath) {
-		fatal("missing guest rootfs — run ./deploy/guest/build.sh (need %s + %s, or %s)",
-			cfg.DiskPath, cfg.BootInitrdPath, cfg.InitrdPath)
+	if !haveOverlay && !haveDisk && !stat(cfg.InitrdPath) {
+		fatal("missing guest rootfs — run ./deploy/guest/build.sh (need %s + %s, %s + %s, or %s)",
+			cfg.SquashPath, cfg.OverlayInitrdPath, cfg.DiskPath, cfg.BootInitrdPath, cfg.InitrdPath)
 	}
 
 	mgr := desktop.NewManager(cfg, os.Stderr)
