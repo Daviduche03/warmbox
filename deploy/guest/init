@@ -1,0 +1,170 @@
+#!/bin/sh
+# warmbox guest init — PID 1 inside the microVM.
+#
+# Boots: virtio NIC + DHCP -> TigerVNC Xvnc -> a proper XFCE4 session
+# (via dbus-run-session + startxfce4), then reports readiness + its IP back
+# to the orchestrator so it can be leased.
+#
+# Kernel cmdline is expected to carry:
+#   warmbox.id=<id> warmbox.host=<host ip> warmbox.port=<api port>
+
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export DISPLAY=:0
+export XDG_RUNTIME_DIR=/run/user/0
+export LANG=C.UTF-8
+
+log() { echo "[warmbox] $*" > /dev/hvc0; }
+
+# --- mounts (must come before /proc/cmdline is read) ---
+mkdir -p /proc /sys /dev /tmp /run /var/log /root
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev 2>/dev/null
+mkdir -p /dev/pts /dev/shm
+mount -t devpts devpts /dev/pts 2>/dev/null
+mount -t tmpfs tmpfs /dev/shm
+mount -t tmpfs tmpfs /tmp
+mount -t tmpfs tmpfs /run
+ln -sf /run /var/run 2>/dev/null
+# XDG_RUNTIME_DIR lives under the freshly mounted tmpfs.
+mkdir -p /run/user/0
+chmod 700 /run/user/0
+hostname warmbox
+
+# When booting from a virtio-blk root (rather than the all-RAM initramfs), the
+# boot initramfs mounts the root read-only and expects a service manager to
+# remount it. We are the service manager, so do it here. No-op on tmpfs root.
+mount -o remount,rw / 2>/dev/null || true
+
+# --- kernel cmdline ---
+VM_ID=""
+HOST_ADDR=""
+API_PORT="7070"
+SHARE_TAG=""
+for kv in $(cat /proc/cmdline); do
+    case "$kv" in
+        warmbox.id=*)    VM_ID="${kv#warmbox.id=}" ;;
+        warmbox.host=*)  HOST_ADDR="${kv#warmbox.host=}" ;;
+        warmbox.port=*)  API_PORT="${kv#warmbox.port=}" ;;
+        warmbox.share=*) SHARE_TAG="${kv#warmbox.share=}" ;;
+    esac
+done
+
+# --- network ---
+modprobe virtio_net 2>/dev/null
+ip link set lo up
+i=0
+while [ $i -lt 50 ]; do
+    IFACE=$(ls /sys/class/net 2>/dev/null | grep -v '^lo$' | head -1)
+    [ -n "$IFACE" ] && break
+    sleep 0.1
+    i=$((i+1))
+done
+if [ -n "$IFACE" ]; then
+    ip link set "$IFACE" up 2>/dev/null
+    udhcpc -i "$IFACE" -b -q -t 10 -T 2 >/var/log/dhcp.log 2>&1
+    IP=$(ip -4 addr show "$IFACE" 2>/dev/null | grep -o 'inet [0-9.]*' | awk '{print $2}')
+fi
+log "id=${VM_ID:-?} iface=${IFACE:-none} ip=${IP:-none}"
+
+# --- optional virtiofs workspace share ---
+# The host can attach a directory with `--device virtio-fs,sharedDir=...,
+# mountTag=<tag>`; we mount it at /workspace so agents/editors in the guest see
+# the real project files instead of a copy.
+if [ -n "$SHARE_TAG" ]; then
+    mkdir -p /workspace
+    modprobe virtiofs 2>/dev/null
+    if mount -t virtiofs "$SHARE_TAG" /workspace 2>/var/log/virtiofs.log; then
+        log "mounted virtiofs '$SHARE_TAG' at /workspace"
+    else
+        log "WARN: virtiofs mount '$SHARE_TAG' failed: $(cat /var/log/virtiofs.log 2>/dev/null | tr '\n' '|')"
+    fi
+fi
+
+# --- D-Bus: machine id + system bus ---
+# Without /etc/machine-id and /run/dbus the system bus refuses to start.
+mkdir -p /run/dbus
+[ -s /etc/machine-id ] || dbus-uuidgen > /etc/machine-id 2>/dev/null
+dbus-daemon --system --fork 2>/var/log/dbus-system.log \
+    && log "dbus system bus up" \
+    || log "WARN: dbus system bus failed: $(cat /var/log/dbus-system.log 2>/dev/null | tr '\n' '|')"
+
+# --- X server + VNC (TigerVNC Xvnc) ---
+Xvnc :0 -geometry 1280x800 -depth 24 -SecurityTypes None -AlwaysShared \
+    -rfbport 5900 -desktop warmbox >/var/log/xvnc.log 2>&1 &
+XPID=$!
+
+# Wait for the VNC port to actually open instead of fixed sleeps.
+i=0
+while [ $i -lt 100 ]; do
+    if ss -ltn 2>/dev/null | grep -q ':5900'; then
+        break
+    fi
+    if ! kill -0 "$XPID" 2>/dev/null; then
+        log "FATAL: Xvnc died"
+        tail -20 /var/log/xvnc.log > /dev/hvc0 2>&1
+        break
+    fi
+    sleep 0.1
+    i=$((i+1))
+done
+
+if kill -0 "$XPID" 2>/dev/null; then
+    log "Xvnc running (pid $XPID)"
+    xsetroot -solid '#204060' 2>/dev/null
+    xdpyinfo 2>/dev/null | grep -E 'dimensions' | head -1 > /dev/hvc0
+else
+    log "WARN: Xvnc not running"
+fi
+
+# --- XFCE4 session ---
+# dbus-run-session gives the session its own bus; startxfce4 then brings up
+# xfsettingsd, xfwm4, xfdesktop, xfce4-panel and sets SESSION_MANAGER for us —
+# which is what the previous per-component launches were missing.
+dbus-run-session -- startxfce4 >/var/log/xfce-session.log 2>&1 &
+SESSION_PID=$!
+log "xfce4-session pid $SESSION_PID"
+
+# Wait for the window manager to own the screen, then for the panel to appear.
+i=0
+while [ $i -lt 100 ]; do
+    xprop -root _NET_SUPPORTING_WM_CHECK >/dev/null 2>&1 && break
+    sleep 0.1
+    i=$((i+1))
+done
+
+# Compositing costs CPU we want for streaming; turn it off.
+xfconf-query -c xfwm4 -p /general/use_compositing -s false 2>/dev/null || true
+
+# Give xfce4-session time to spawn the panel + desktop before we report ready.
+i=0
+while [ $i -lt 100 ]; do
+    ps -o comm= 2>/dev/null | grep -qw xfce4-panel && break
+    sleep 0.1
+    i=$((i+1))
+done
+
+xfce4-terminal >/var/log/xfce4-terminal.log 2>&1 &
+sleep 1
+log "xfce procs: $(ps -o comm= 2>/dev/null | grep -E 'xfwm4|xfce4-panel|xfdesktop|xfsettingsd|xfconfd|xfce4-terminal' | tr '\n' ' ')"
+log "session log: $(tail -4 /var/log/xfce-session.log 2>&1 | tr '\n' '|')"
+
+# --- readiness callback ---
+if ss -ltn 2>/dev/null | grep -q ':5900'; then
+    log "READY: vnc listening on 5900"
+    if [ -n "$VM_ID" ] && [ -n "$HOST_ADDR" ]; then
+        wget -q -O /dev/null \
+            "http://${HOST_ADDR}:${API_PORT}/internal/ready?id=${VM_ID}&ip=${IP}" \
+            && log "reported ready to ${HOST_ADDR}:${API_PORT}" \
+            || log "WARN: readiness callback failed"
+    fi
+else
+    log "WARN: vnc not listening"
+    tail -20 /var/log/xvnc.log > /dev/hvc0 2>&1
+fi
+
+# Reap orphans; keep PID 1 alive.
+while true; do
+    wait
+    sleep 5
+done
