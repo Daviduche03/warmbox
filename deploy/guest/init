@@ -12,6 +12,10 @@ export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export DISPLAY=:0
 export XDG_RUNTIME_DIR=/run/user/0
 export LANG=C.UTF-8
+# WebKitGTK sandboxes web processes via bubblewrap + user namespaces, which
+# the microVM kernel does not permit (bwrap: Creating new namespace failed).
+# Disable the sandbox so Epiphany and other WebKit apps can actually start.
+export WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1
 
 log() { echo "[warmbox] $*" > /dev/hvc0; }
 
@@ -118,10 +122,12 @@ else
 fi
 
 # --- XFCE4 session ---
-# dbus-run-session gives the session its own bus; startxfce4 then brings up
-# xfsettingsd, xfwm4, xfdesktop, xfce4-panel and sets SESSION_MANAGER for us —
-# which is what the previous per-component launches were missing.
-dbus-run-session -- startxfce4 >/var/log/xfce-session.log 2>&1 &
+# startxfce4 only brings up xfwm4 + xfsettingsd; the session manager never
+# spawns the panel/desktop on a fresh root (verified in a container), so we
+# launch those explicitly below on the same session bus. The bus address is
+# recorded so every component shares it — without it they run blind.
+rm -f /run/session-bus
+dbus-run-session -- sh -c 'echo "$DBUS_SESSION_BUS_ADDRESS" > /run/session-bus; exec startxfce4' >/var/log/xfce-session.log 2>&1 &
 SESSION_PID=$!
 log "xfce4-session pid $SESSION_PID"
 
@@ -136,36 +142,37 @@ done
 # Compositing costs CPU we want for streaming; turn it off.
 xfconf-query -c xfwm4 -p /general/use_compositing -s false 2>/dev/null || true
 
-# Give xfce4-session time to spawn the panel + desktop before we report ready.
+# Give xfce4-session time to bring up the WM, then join every further
+# component to its session bus.
 i=0
-while [ $i -lt 100 ]; do
-    ps -o comm= 2>/dev/null | grep -qw xfce4-panel && break
+while [ $i -lt 100 ] && [ ! -s /run/session-bus ]; do
     sleep 0.1
     i=$((i+1))
 done
+if [ -s /run/session-bus ]; then
+    export DBUS_SESSION_BUS_ADDRESS="$(cat /run/session-bus)"
+    log "session bus ${DBUS_SESSION_BUS_ADDRESS%%,*}"
+else
+    log "WARN: no session bus recorded"
+fi
 
-# Fallback: if the session failed to spawn the panel/desktop (e.g. a panel
-# plugin crashed at startup), start them explicitly so we never sit on a bare
-# xsetroot background. Each fallback is logged to the console for diagnosis.
-if ! ps -o comm= 2>/dev/null | grep -qw xfce4-panel; then
-    log "WARN: xfce4-panel missing, starting fallback panel"
-    log "session log: $(cat /var/log/xfce-session.log 2>&1 | tr '\n' '|' | cut -c1-800)"
-    (xfce4-panel >/var/log/xfce4-panel.log 2>&1 &) 
-    sleep 2
-fi
-if ! ps -o comm= 2>/dev/null | grep -qw xfdesktop; then
-    log "WARN: xfdesktop missing, starting fallback desktop"
-    (xfdesktop >/var/log/xfdesktop.log 2>&1 &)
-    sleep 2
-fi
+# Panel + desktop + terminal, explicitly on the session bus (the session
+# manager does not spawn them on a fresh root).
+for app in "xfce4-panel:/var/log/xfce4-panel.log" "xfdesktop:/var/log/xfdesktop.log" "xfce4-terminal:/var/log/xfce4-terminal.log"; do
+    bin="${app%%:*}"
+    lg="${app##*:}"
+    if ! ps -o comm= 2>/dev/null | grep -qw "$bin"; then
+        log "starting $bin on session bus"
+        ($bin >"$lg" 2>&1 &)
+    fi
+done
+sleep 2
 # Re-apply wallpaper explicitly (covers the case where the autostart script
 # ran before xfdesktop registered its xfconf backdrop paths).
 if [ -f /usr/share/backgrounds/warmbox-win11.png ]; then
     /usr/local/bin/warmbox-wallpaper.sh 2>/dev/null || true
 fi
 
-xfce4-terminal >/var/log/xfce4-terminal.log 2>&1 &
-sleep 1
 log "xfce procs: $(ps -o comm= 2>/dev/null | grep -E 'xfwm4|xfce4-panel|xfdesktop|xfsettingsd|xfconfd|xfce4-terminal' | tr '\n' ' ')"
 log "session log: $(tail -4 /var/log/xfce-session.log 2>&1 | tr '\n' '|')"
 
