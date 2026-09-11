@@ -1,0 +1,100 @@
+/* Warmbox "Win11" GTK3 theme — hand-rolled Fluent-inspired flat look.
+ *
+ * Base on GTK's built-in Adwaita (loaded from the library resource) so every
+ * widget renders correctly, then override the palette for a light, flat,
+ * Windows-11-style appearance with the Fluent accent blue.
+ */
+@import url("resource:///org/gtk/libgtk/theme/Adwaita/gtk.css");
+
+@define-color theme_bg_color #f3f3f3;
+@define-color theme_fg_color #1a1a1a;
+@define-color theme_base_color #ffffff;
+@define-color theme_text_color #1a1a1a;
+@define-color theme_selected_bg_color #0067c0;
+@define-color theme_selected_fg_color #ffffff;
+@define-color theme_unfocused_bg_color #e8e8e8;
+@define-color theme_unfocused_fg_color #6a6a6a;
+@define-color theme_unfocused_base_color #ffffff;
+@define-color theme_unfocused_text_color #1a1a1a;
+@define-color theme_unfocused_selected_bg_color #0067c0;
+@define-color theme_unfocused_selected_fg_color #ffffff;
+@define-color borders #d9d9d9;
+@define-color unfocused_borders #e0e0e0;
+@define-color warning_color #d08300;
+@define-color error_color #d11515;
+@define-color success_color #16825d;
+
+/* Fluent-style flat, slightly rounded widgets. */
+window, .background {
+    background-color: @theme_bg_color;
+}
+
+button, entry, spinbutton, .entry, .button {
+    border-radius: 4px;
+    border-width: 1px;
+    min-height: 26px;
+    background-image: none;
+    box-shadow: none;
+}
+
+button:not(:hover):not(:active):not(:checked) {
+    background-color: transparent;
+}
+
+headerbar, .titlebar, toolbar {
+    background-color: @theme_base_color;
+    background-image: none;
+    border-color: @borders;
+    box-shadow: none;
+    min-height: 34px;
+}
+
+notebook > header {
+    background-color: @theme_bg_color;
+    background-image: none;
+    border-color: @borders;
+}
+
+notebook > header > tabs > tab {
+    background-image: none;
+    border-color: @borders;
+    border-radius: 4px 4px 0 0;
+    padding: 4px 12px;
+}
+
+menu, .menu, .context-menu {
+    background-color: @theme_base_color;
+    border: 1px solid @borders;
+    border-radius: 6px;
+    padding: 4px;
+}
+
+menuitem, .menuitem {
+    border-radius: 4px;
+    padding: 5px 10px;
+}
+
+treeview, list, .list {
+    background-color: @theme_base_color;
+}
+
+scrolledwindow {
+    border-radius: 4px;
+}
+
+scrollbar {
+    background-color: transparent;
+    border: none;
+}
+
+scrollbar slider {
+    background-color: #b8b8b8;
+    border-radius: 4px;
+    min-width: 6px;
+    min-height: 6px;
+}
+
+/* xfce4-terminal specific tweaks. */
+VteTerminal, vte-terminal {
+    padding: 2px;
+}

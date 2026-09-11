@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Warmbox Win11 Wallpaper
+Comment=Set the Win11 wallpaper after the desktop starts
+Exec=/usr/local/bin/warmbox-wallpaper.sh
+X-GNOME-Autostart-enabled=true
+OnlyShowIn=XFCE;

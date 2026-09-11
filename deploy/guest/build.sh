@@ -16,6 +16,7 @@
 #
 # Env:
 #   BROWSER       none|netsurf|epiphany|firefox|chromium   (default epiphany)
+#   THEME         default|win11                             (default win11)
 #   IMAGE         docker image tag                          (default warmbox-guest:latest)
 #   WARMBOX_HOME  output directory                          (default ~/.warmbox)
 #   PLATFORM      docker build platform                     (default linux/arm64)
@@ -24,12 +25,15 @@ set -eu
 
 here=$(cd "$(dirname "$0")" && pwd)
 BROWSER="${BROWSER:-epiphany}"
+THEME="${THEME:-win11}"
 IMAGE="${IMAGE:-warmbox-guest:latest}"
 WARMBOX_HOME="${WARMBOX_HOME:-$HOME/.warmbox}"
 PLATFORM="${PLATFORM:-linux/arm64}"
 
-echo "==> building $IMAGE (BROWSER=$BROWSER, platform=$PLATFORM)"
-docker build --platform "$PLATFORM" -t "$IMAGE" --build-arg "BROWSER=$BROWSER" "$here"
+echo "==> building $IMAGE (BROWSER=$BROWSER, THEME=$THEME, platform=$PLATFORM)"
+docker build --platform "$PLATFORM" -t "$IMAGE" \
+    --build-arg "BROWSER=$BROWSER" \
+    --build-arg "THEME=$THEME" "$here"
 
 mkdir -p "$WARMBOX_HOME"
 

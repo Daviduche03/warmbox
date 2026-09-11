@@ -144,6 +144,26 @@ while [ $i -lt 100 ]; do
     i=$((i+1))
 done
 
+# Fallback: if the session failed to spawn the panel/desktop (e.g. a panel
+# plugin crashed at startup), start them explicitly so we never sit on a bare
+# xsetroot background. Each fallback is logged to the console for diagnosis.
+if ! ps -o comm= 2>/dev/null | grep -qw xfce4-panel; then
+    log "WARN: xfce4-panel missing, starting fallback panel"
+    log "session log: $(cat /var/log/xfce-session.log 2>&1 | tr '\n' '|' | cut -c1-800)"
+    (xfce4-panel >/var/log/xfce4-panel.log 2>&1 &) 
+    sleep 2
+fi
+if ! ps -o comm= 2>/dev/null | grep -qw xfdesktop; then
+    log "WARN: xfdesktop missing, starting fallback desktop"
+    (xfdesktop >/var/log/xfdesktop.log 2>&1 &)
+    sleep 2
+fi
+# Re-apply wallpaper explicitly (covers the case where the autostart script
+# ran before xfdesktop registered its xfconf backdrop paths).
+if [ -f /usr/share/backgrounds/warmbox-win11.png ]; then
+    /usr/local/bin/warmbox-wallpaper.sh 2>/dev/null || true
+fi
+
 xfce4-terminal >/var/log/xfce4-terminal.log 2>&1 &
 sleep 1
 log "xfce procs: $(ps -o comm= 2>/dev/null | grep -E 'xfwm4|xfce4-panel|xfdesktop|xfsettingsd|xfconfd|xfce4-terminal' | tr '\n' ' ')"

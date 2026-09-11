@@ -20,6 +20,7 @@
 FROM alpine:3.22
 
 ARG BROWSER=epiphany
+ARG THEME=default
 
 RUN set -eux; \
     apk add --no-cache \
@@ -44,6 +45,40 @@ RUN set -eux; \
         chromium)  apk add --no-cache chromium ;; \
         *) echo "unknown BROWSER=${BROWSER}" >&2; exit 1 ;; \
     esac
+
+# Win11 hand-rolled theme (THEME=win11): a dark, centered bottom taskbar with a
+# start menu and docklike app icons, Fluent-ish flat GTK theme, matching xfwm4
+# decorations, and a generated "bloom" wallpaper. THEME=default keeps stock XFCE.
+COPY themes /themes
+RUN set -eux; \
+    if [ "${THEME}" = "win11" ]; then \
+        apk add --no-cache xfce4-whiskermenu-plugin xfce4-docklike-plugin; \
+        # GTK + window-manager themes. The GTK theme imports Adwaita (GTK's
+        # built-in resource) so every widget still renders, then overrides the
+        # palette for the Fluent flat look. \
+        mkdir -p /usr/share/themes/Win11/gtk-3.0 /usr/share/themes/Win11/xfwm4; \
+        cp /themes/win11/gtk-3.0/* /usr/share/themes/Win11/gtk-3.0/; \
+        cp /themes/win11/xfwm4/* /usr/share/themes/Win11/xfwm4/; \
+        # Wallpaper + start-button icon (registered in the hicolor icon theme). \
+        mkdir -p /usr/share/backgrounds \
+                 /usr/share/icons/hicolor/48x48/apps; \
+        cp /themes/win11/wallpaper.png /usr/share/backgrounds/warmbox-win11.png; \
+        cp /themes/win11/start.png /usr/share/icons/hicolor/48x48/apps/warmbox-start.png; \
+        # System-wide XFCE defaults: panel layout, theme pick, window-manager
+        # behavior, desktop (wallpaper), and start menu. \
+        mkdir -p /etc/xdg/xfce4/panel \
+                 /etc/xdg/xfce4/xfconf/xfce-perchannel-xml \
+                 /etc/xdg/autostart; \
+        cp /themes/win11/panel/default.xml /etc/xdg/xfce4/panel/default.xml; \
+        cp /themes/win11/panel/docklike.rc /etc/xdg/xfce4/panel/docklike.rc; \
+        cp /themes/win11/xfconf/*.xml /etc/xdg/xfce4/xfconf/xfce-perchannel-xml/; \
+        # Session autostart applies the wallpaper to whatever monitor the VNC
+        # display reports (name is unpredictable under Xvnc). \
+        install -m 0755 /themes/win11/wallpaper.sh /usr/local/bin/warmbox-wallpaper.sh; \
+        cp /themes/win11/autostart/*.desktop /etc/xdg/autostart/; \
+        gtk-update-icon-cache -qtf /usr/share/icons/hicolor 2>/dev/null || true; \
+    fi; \
+    rm -rf /themes
 
 COPY init /init
 RUN chmod +x /init
