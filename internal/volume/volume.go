@@ -8,6 +8,8 @@ package volume
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -249,6 +251,127 @@ func (s *Store) Clone(ctx context.Context, src, dst string) (*Meta, error) {
 		return nil, fmt.Errorf("volume %q already exists", dst)
 	}
 	return s.Create(ctx, dst, 0, src)
+}
+
+// --- snapshots (frozen manifests) ---
+
+// Snapshot is a frozen copy of a volume's manifest.
+type Snapshot struct {
+	ID        string    `json:"id"`
+	Volume    string    `json:"volume"`
+	Size      int64     `json:"size"`
+	ChunkSize int64     `json:"chunk_size"`
+	Created   time.Time `json:"created"`
+}
+
+func (s *Store) snapshotMetaRemote(id string) string {
+	return s.prefix + "/snapshots/" + id + "/meta.json"
+}
+func (s *Store) snapshotManifestRemote(id string) string {
+	return s.prefix + "/snapshots/" + id + "/manifest.json"
+}
+
+// NewSnapshotID returns a short random id.
+func NewSnapshotID() string {
+	b := make([]byte, 6)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+// Snapshot freezes a volume's current manifest under a new id. The chunks are
+// already content-addressed, so this is O(1) and shares all data.
+func (s *Store) Snapshot(ctx context.Context, volumeName, id string) (*Snapshot, error) {
+	if _, err := s.Get(ctx, volumeName); err != nil {
+		return nil, err
+	}
+	man, err := s.Manifest(ctx, volumeName)
+	if err != nil {
+		return nil, err
+	}
+	if id == "" {
+		id = NewSnapshotID()
+	}
+	if !ValidName(id) {
+		return nil, fmt.Errorf("invalid snapshot id %q", id)
+	}
+	snap := &Snapshot{ID: id, Volume: volumeName, Size: man.Size, ChunkSize: man.ChunkSize, Created: time.Now().UTC()}
+	if err := s.cs.PutJSON(ctx, s.snapshotManifestRemote(id), man); err != nil {
+		return nil, err
+	}
+	if err := s.cs.PutJSON(ctx, s.snapshotMetaRemote(id), snap); err != nil {
+		return nil, err
+	}
+	return snap, nil
+}
+
+// GetSnapshot reads a snapshot's metadata.
+func (s *Store) GetSnapshot(ctx context.Context, id string) (*Snapshot, error) {
+	var sn Snapshot
+	if err := s.cs.GetJSON(ctx, s.snapshotMetaRemote(id), &sn); err != nil {
+		return nil, err
+	}
+	return &sn, nil
+}
+
+// ListSnapshots returns all snapshots, newest first.
+func (s *Store) ListSnapshots(ctx context.Context) ([]*Snapshot, error) {
+	ids, err := s.cs.ListDirs(ctx, s.prefix+"/snapshots")
+	if err != nil {
+		return nil, err
+	}
+	var out []*Snapshot
+	for _, id := range ids {
+		sn, err := s.GetSnapshot(ctx, id)
+		if err != nil {
+			continue
+		}
+		out = append(out, sn)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Created.After(out[j].Created) })
+	return out, nil
+}
+
+// DeleteSnapshot removes a snapshot's metadata/manifest.
+func (s *Store) DeleteSnapshot(ctx context.Context, id string) error {
+	_ = s.cs.Delete(ctx, s.snapshotManifestRemote(id))
+	_ = s.cs.Delete(ctx, s.snapshotMetaRemote(id))
+	_ = operations.Rmdir(ctx, s.cs.Fs(), s.prefix+"/snapshots/"+id)
+	return nil
+}
+
+// CreateFromSnapshot makes a new volume from a snapshot's manifest (O(1)).
+func (s *Store) CreateFromSnapshot(ctx context.Context, name, snapID string) (*Meta, error) {
+	if !ValidName(name) {
+		return nil, fmt.Errorf("invalid volume name %q", name)
+	}
+	if _, err := s.Get(ctx, name); err == nil {
+		return nil, fmt.Errorf("volume %q already exists", name)
+	}
+	snap, err := s.GetSnapshot(ctx, snapID)
+	if err != nil {
+		return nil, fmt.Errorf("snapshot: %w", err)
+	}
+	man := &cloudstore.Manifest{Chunks: map[string]string{}}
+	if err := s.cs.GetJSON(ctx, s.snapshotManifestRemote(snapID), man); err != nil {
+		return nil, err
+	}
+	if man.Chunks == nil {
+		man.Chunks = map[string]string{}
+	}
+	meta := &Meta{Name: name, Size: snap.Size, ChunkSize: snap.ChunkSize, Created: time.Now().UTC(), From: "snapshot:" + snapID}
+	if err := os.MkdirAll(s.dirPath(name), 0o755); err != nil {
+		return nil, err
+	}
+	if err := createSparse(s.ImagePath(name), snap.Size); err != nil {
+		return nil, err
+	}
+	if err := s.cs.PutJSON(ctx, s.metaRemote(name), meta); err != nil {
+		return nil, err
+	}
+	if err := s.cs.PutJSON(ctx, s.manifestRemote(name), man); err != nil {
+		return nil, err
+	}
+	return meta, nil
 }
 
 // EnsureLocal materializes the volume's image locally from the manifest using

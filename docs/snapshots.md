@@ -1,7 +1,7 @@
 # Snapshots & fast resume — feasibility and plan
 
-Goal: restore a running sandbox **anywhere in ~100 ms**. Status: **not started;
-one hard blocker on macOS.**
+Goal: restore a running sandbox **anywhere in ~100 ms**. Status: **S1 (disk
+snapshots) landed; S2/S3 open; memory checkpoint is blocked on macOS.**
 
 ## What a snapshot must contain
 
@@ -54,9 +54,10 @@ Linux backend.
 
 ## Plan
 
-- **S1 — disk snapshots + catalog.** `internal/snapshot` metadata, `volume.Clone`
-  as the mechanism, `warmbox snapshot create|list|rm`, `create --from-snapshot`.
-  Portable, cheap, boot-latency restore. *(no blockers; do first.)*
+- **S1 — disk snapshots + catalog.** **✅ landed:** `warmbox snapshot
+  create|list|rm`, `volume create --from-snapshot`, catalog `snapshots` table.
+  A snapshot is a frozen, content-addressed manifest, so create/restore is O(1)
+  and shares every chunk. Portable, but restore still boots (~2–3 s).
 - **S2 — paused warm pool (macOS).** Add `Pause/Resume` to the vfkit backend and a
   pool of paused sandboxes. Instant same-host acquire.
 - **S3 — Linux backend with true checkpoint.** Cloud Hypervisor (or Firecracker)

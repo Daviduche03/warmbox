@@ -50,6 +50,8 @@ func main() {
 		cmdDestroy(os.Args[2:])
 	case "volume":
 		cmdVolume(os.Args[2:])
+	case "snapshot":
+		cmdSnapshot(os.Args[2:])
 	default:
 		usage()
 		os.Exit(1)
@@ -66,10 +68,14 @@ Usage:
   warmbox list              List desktops
   warmbox destroy <id>      Destroy a desktop
 
-  warmbox volume create <name> [--size 8G] [--from <name>]
+  warmbox volume create <name> [--size 8G] [--from <name>] [--from-snapshot <id>]
   warmbox volume list
   warmbox volume clone <name> <new>
   warmbox volume rm <name>
+
+  warmbox snapshot create <volume> [--name <id>]
+  warmbox snapshot list
+  warmbox snapshot rm <id>
 
 The daemon needs vfkit (brew install vfkit) and a pre-baked guest image
 (see deploy/guest/Dockerfile).
@@ -505,11 +511,12 @@ func cmdVolume(args []string) {
 		fs.StringVar(&token, "token", token, "daemon token (default $WARMBOX_TOKEN)")
 		size := fs.String("size", "", "volume size, e.g. 8G (default: base image size)")
 		from := fs.String("from", "", "clone from an existing volume")
+		fromSnap := fs.String("from-snapshot", "", "create from a snapshot id")
 		rest := parseInterspersed(fs, args[1:])
 		if len(rest) < 1 {
-			fatal("Usage: warmbox volume create <name> [--size 8G] [--from <name>]")
+			fatal("Usage: warmbox volume create <name> [--size 8G] [--from <name>] [--from-snapshot <id>]")
 		}
-		payload, _ := json.Marshal(map[string]string{"name": rest[0], "size": *size, "from": *from})
+		payload, _ := json.Marshal(map[string]string{"name": rest[0], "size": *size, "from": *from, "from_snapshot": *fromSnap})
 		resp, err := http.Post(withToken(apiBase(addr)+"/api/volumes", token),
 			"application/json", strings.NewReader(string(payload)))
 		doVolume(resp, err)
@@ -598,5 +605,85 @@ func humanSize(n int64) string {
 		return fmt.Sprintf("%dM", n>>20)
 	default:
 		return fmt.Sprintf("%dB", n)
+	}
+}
+
+func snapshotUsage() {
+	fmt.Fprint(os.Stderr, `warmbox snapshot — frozen volume manifests
+
+Usage:
+  warmbox snapshot create <volume> [--name <id>]
+  warmbox snapshot list
+  warmbox snapshot rm <id>
+`)
+}
+
+func cmdSnapshot(args []string) {
+	if len(args) < 1 {
+		snapshotUsage()
+		os.Exit(1)
+	}
+	addr := ":7070"
+	token := tokenDefault()
+
+	switch args[0] {
+	case "create":
+		fs := flag.NewFlagSet("snapshot create", flag.ExitOnError)
+		fs.StringVar(&addr, "addr", addr, "daemon API address")
+		fs.StringVar(&token, "token", token, "daemon token (default $WARMBOX_TOKEN)")
+		name := fs.String("name", "", "snapshot id (default: random)")
+		rest := parseInterspersed(fs, args[1:])
+		if len(rest) < 1 {
+			fatal("Usage: warmbox snapshot create <volume> [--name <id>]")
+		}
+		payload, _ := json.Marshal(map[string]string{"volume": rest[0], "name": *name})
+		resp, err := http.Post(withToken(apiBase(addr)+"/api/snapshots", token),
+			"application/json", strings.NewReader(string(payload)))
+		doVolume(resp, err)
+
+	case "list":
+		fs := flag.NewFlagSet("snapshot list", flag.ExitOnError)
+		fs.StringVar(&addr, "addr", addr, "daemon API address")
+		fs.StringVar(&token, "token", token, "daemon token (default $WARMBOX_TOKEN)")
+		_ = fs.Parse(args[1:])
+		resp, err := http.Get(withToken(apiBase(addr)+"/api/snapshots", token))
+		if err != nil {
+			fatal("Error: %v", err)
+		}
+		defer resp.Body.Close()
+		var out struct {
+			Snapshots []struct {
+				ID      string `json:"id"`
+				Volume  string `json:"volume"`
+				Size    int64  `json:"size"`
+				Created string `json:"created_at"`
+			} `json:"snapshots"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+			fatal("Error decoding response: %v", err)
+		}
+		if len(out.Snapshots) == 0 {
+			fmt.Fprintln(os.Stderr, "(no snapshots)")
+			return
+		}
+		for _, s := range out.Snapshots {
+			fmt.Printf("%-14s %-16s %6s  %s\n", s.ID, s.Volume, humanSize(s.Size), s.Created)
+		}
+
+	case "rm":
+		fs := flag.NewFlagSet("snapshot rm", flag.ExitOnError)
+		fs.StringVar(&addr, "addr", addr, "daemon API address")
+		fs.StringVar(&token, "token", token, "daemon token (default $WARMBOX_TOKEN)")
+		rest := parseInterspersed(fs, args[1:])
+		if len(rest) < 1 {
+			fatal("Usage: warmbox snapshot rm <id>")
+		}
+		req, _ := http.NewRequest(http.MethodDelete, withToken(apiBase(addr)+"/api/snapshots/"+rest[0], token), nil)
+		resp, err := http.DefaultClient.Do(req)
+		doVolume(resp, err)
+
+	default:
+		snapshotUsage()
+		os.Exit(1)
 	}
 }

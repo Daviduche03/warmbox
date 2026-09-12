@@ -45,6 +45,15 @@ type Desktop struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
+// Snapshot is a frozen volume manifest.
+type Snapshot struct {
+	ID        string    `json:"id"`
+	Volume    string    `json:"volume"`
+	Size      int64     `json:"size"`
+	ChunkSize int64     `json:"chunk_size"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
 // Open opens (or creates) the catalog at path. An empty path uses an in-memory
 // database (useful for tests).
 func Open(path string) (*DB, error) {
@@ -99,7 +108,15 @@ CREATE TABLE IF NOT EXISTS leases (
     owner       TEXT NOT NULL,
     acquired_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS snapshots (
+    id         TEXT PRIMARY KEY,
+    volume     TEXT NOT NULL DEFAULT '',
+    size       INTEGER NOT NULL,
+    chunk_size INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_desktops_volume ON desktops(volume);
+CREATE INDEX IF NOT EXISTS idx_snapshots_volume ON snapshots(volume);
 `)
 	return err
 }
@@ -244,6 +261,73 @@ func scanDesktop(s scanner) (*Desktop, error) {
 		return nil, err
 	}
 	x.CreatedAt, x.UpdatedAt = parse(created), parse(updated)
+	return &x, nil
+}
+
+// --- snapshots ---
+
+// UpsertSnapshot inserts or updates a snapshot record.
+func (d *DB) UpsertSnapshot(s *Snapshot) error {
+	if s.ID == "" {
+		return fmt.Errorf("catalog: snapshot id required")
+	}
+	if s.CreatedAt.IsZero() {
+		s.CreatedAt = now()
+	}
+	_, err := d.db.Exec(`
+INSERT INTO snapshots(id, volume, size, chunk_size, created_at) VALUES(?, ?, ?, ?, ?)
+ON CONFLICT(id) DO UPDATE SET volume=excluded.volume, size=excluded.size,
+    chunk_size=excluded.chunk_size`, s.ID, s.Volume, s.Size, s.ChunkSize, format(s.CreatedAt))
+	return err
+}
+
+// GetSnapshot returns a snapshot by id.
+func (d *DB) GetSnapshot(id string) (*Snapshot, error) {
+	row := d.db.QueryRow(`SELECT id, volume, size, chunk_size, created_at FROM snapshots WHERE id = ?`, id)
+	return scanSnapshot(row)
+}
+
+// ListSnapshots returns snapshots, newest first; empty volume means all.
+func (d *DB) ListSnapshots(volume string) ([]*Snapshot, error) {
+	q := `SELECT id, volume, size, chunk_size, created_at FROM snapshots`
+	var args []any
+	if volume != "" {
+		q += ` WHERE volume = ?`
+		args = append(args, volume)
+	}
+	q += ` ORDER BY created_at DESC`
+	rows, err := d.db.Query(q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*Snapshot
+	for rows.Next() {
+		s, err := scanSnapshot(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, s)
+	}
+	return out, rows.Err()
+}
+
+// DeleteSnapshot removes a snapshot record.
+func (d *DB) DeleteSnapshot(id string) error {
+	_, err := d.db.Exec(`DELETE FROM snapshots WHERE id = ?`, id)
+	return err
+}
+
+func scanSnapshot(s scanner) (*Snapshot, error) {
+	var x Snapshot
+	var created string
+	if err := s.Scan(&x.ID, &x.Volume, &x.Size, &x.ChunkSize, &created); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	x.CreatedAt = parse(created)
 	return &x, nil
 }
 

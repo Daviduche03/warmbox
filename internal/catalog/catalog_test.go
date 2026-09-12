@@ -108,3 +108,32 @@ func TestLeases(t *testing.T) {
 		t.Fatal("lease not released")
 	}
 }
+
+func TestSnapshots(t *testing.T) {
+	d := mustOpen(t)
+	defer d.Close()
+
+	if err := d.UpsertSnapshot(&Snapshot{ID: "s1", Volume: "dev", Size: 1 << 30, ChunkSize: 16 << 20}); err != nil {
+		t.Fatal(err)
+	}
+	s, err := d.GetSnapshot("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Volume != "dev" || s.Size != 1<<30 {
+		t.Fatalf("unexpected: %+v", s)
+	}
+	if err := d.UpsertSnapshot(&Snapshot{ID: "s2", Volume: "other"}); err != nil {
+		t.Fatal(err)
+	}
+	list, err := d.ListSnapshots("dev")
+	if err != nil || len(list) != 1 {
+		t.Fatalf("list: %v n=%d", err, len(list))
+	}
+	if err := d.DeleteSnapshot("s1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.GetSnapshot("s1"); err != ErrNotFound {
+		t.Fatal("delete failed")
+	}
+}

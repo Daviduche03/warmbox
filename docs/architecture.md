@@ -93,13 +93,21 @@ etcd) or object-store locks; the `catalog` package hides that behind an interfac
    from an 8 GiB base went ~8.9 s → **~0.1 s** (first create pays ~0.6 s to build
    the base manifest once). **✅ landed.**
 3. **`internal/cloudstore`** — shared content-addressed chunk engine + JSON
-   docs. **Volume migrated ✅**; `sync` and `cloudfs` still to move onto it.
-4. **Lazy volume reads** — a shared local chunk cache (done: identical chunks
-   downloaded once per host); a FUSE-served image for true on-demand reads is
-   next.
-5. **`internal/snapshot`** — see `docs/snapshots.md`: disk snapshots are cheap
-   and portable now; a paused warm pool is instant but host-local; true ~100 ms
-   restore needs a Linux backend (Apple Virtualization has no memory snapshot).
+   docs. **Volume migrated ✅.** Note: `internal/sync` (runmesh projects) is
+   *file-level* — it copies arbitrary files, not disk chunks — and `cloudfs` is a
+   general object filesystem, so neither needs the chunk engine; the shared piece
+   they do use (building an rclone `fs.Fs` from config) already lives in
+   `internal/config`. So "one engine" means cloudstore for chunked disks, config
+   for remote construction.
+4. **Lazy volume reads** — a shared local chunk cache shipped (identical chunks
+   downloaded once per host, and re-attach reuses it). True on-demand reads for a
+   multi-GB used set would need a FUSE-served image on the host (**macFUSE
+   dependency**) or a streaming block proxy; deferred. `EnsureLocal` currently
+   pulls every referenced chunk before boot.
+5. **`internal/snapshot` — disk snapshots ✅ landed.** `warmbox snapshot
+   create|list|rm` and `volume create --from-snapshot`; a snapshot is a frozen
+   manifest, so create/restore-from is O(1) and shares all chunks. Memory
+   checkpointing ("~100 ms anywhere") is blocked on macOS — see `docs/snapshots.md`.
 6. **Size as a parameter** — grow (truncate + `resize2fs`); honor `--size`.
 
 ## Non-goals (for now)

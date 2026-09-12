@@ -57,6 +57,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /api/volumes/{name}", s.volumeDelete)
 	mux.HandleFunc("POST /api/volumes/{name}/clone", s.volumeClone)
 
+	// Snapshots: frozen volume manifests.
+	mux.HandleFunc("POST /api/snapshots", s.snapshotCreate)
+	mux.HandleFunc("GET /api/snapshots", s.snapshotList)
+	mux.HandleFunc("DELETE /api/snapshots/{id}", s.snapshotDelete)
+
 	// Guest readiness callback (guest -> host).
 	mux.HandleFunc("GET /internal/ready", s.ready)
 
@@ -318,9 +323,10 @@ func (s *Server) volumeCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Name string `json:"name"`
-		Size string `json:"size"`
-		From string `json:"from"`
+		Name         string `json:"name"`
+		Size         string `json:"size"`
+		From         string `json:"from"`
+		FromSnapshot string `json:"from_snapshot"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
@@ -331,7 +337,12 @@ func (s *Server) volumeCreate(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
-	m, err := s.volumes.Create(r.Context(), req.Name, size, req.From)
+	var m *volume.Meta
+	if req.FromSnapshot != "" {
+		m, err = s.volumes.CreateFromSnapshot(r.Context(), req.Name, req.FromSnapshot)
+	} else {
+		m, err = s.volumes.Create(r.Context(), req.Name, size, req.From)
+	}
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
@@ -443,6 +454,76 @@ func (s *Server) volumeClone(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	writeJSON(w, http.StatusCreated, m)
+}
+
+// --- snapshots ---
+
+func (s *Server) snapshotCreate(w http.ResponseWriter, r *http.Request) {
+	if !s.volumesEnabled(w) {
+		return
+	}
+	var req struct {
+		Volume string `json:"volume"`
+		Name   string `json:"name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		return
+	}
+	snap, err := s.volumes.Snapshot(r.Context(), req.Volume, req.Name)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	if s.catalog != nil {
+		_ = s.catalog.UpsertSnapshot(&catalog.Snapshot{
+			ID: snap.ID, Volume: snap.Volume, Size: snap.Size,
+			ChunkSize: snap.ChunkSize, CreatedAt: snap.Created,
+		})
+	}
+	writeJSON(w, http.StatusCreated, snap)
+}
+
+func (s *Server) snapshotList(w http.ResponseWriter, r *http.Request) {
+	if !s.volumesEnabled(w) {
+		return
+	}
+	if s.catalog != nil {
+		snaps, err := s.catalog.ListSnapshots(r.URL.Query().Get("volume"))
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		if snaps == nil {
+			snaps = []*catalog.Snapshot{}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"snapshots": snaps})
+		return
+	}
+	snaps, err := s.volumes.ListSnapshots(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	if snaps == nil {
+		snaps = []*volume.Snapshot{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"snapshots": snaps})
+}
+
+func (s *Server) snapshotDelete(w http.ResponseWriter, r *http.Request) {
+	if !s.volumesEnabled(w) {
+		return
+	}
+	id := r.PathValue("id")
+	if err := s.volumes.DeleteSnapshot(r.Context(), id); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	if s.catalog != nil {
+		_ = s.catalog.DeleteSnapshot(id)
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted", "id": id})
 }
 
 // parseSize parses "8G", "512M", "1024" (bytes) into a byte count. An empty
