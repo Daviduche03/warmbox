@@ -78,6 +78,18 @@ type Config struct {
 	// ?token= query parameter or an "Authorization: Bearer <token>" header.
 	// The guest readiness callback is never gated.
 	Token string
+
+	// VolumeDir is the local cache directory for volume disk images.
+	VolumeDir string
+
+	// VolumeBase is the base ext4 image cloned for new volumes.
+	VolumeBase string
+
+	// VolumeChunkMiB is the volume transfer chunk size in MiB.
+	VolumeChunkMiB int
+
+	// VolumePrefix is the remote prefix under which volumes are stored.
+	VolumePrefix string
 }
 
 // DefaultConfig returns a Config rooted at ~/.warmbox.
@@ -105,6 +117,10 @@ func DefaultConfig() *Config {
 		GuestVNCPort:      5900,
 		PoolSize:          2,
 		ShareTag:          "workspace",
+		VolumeDir:         filepath.Join(wd, "volumes"),
+		VolumeBase:        filepath.Join(wd, "volume-base.img"),
+		VolumeChunkMiB:    16,
+		VolumePrefix:      "volumes",
 	}
 }
 
@@ -115,7 +131,11 @@ func (c *Config) VMDir(id string) string {
 
 // EnsureDirs creates the working directories.
 func (c *Config) EnsureDirs() error {
-	for _, d := range []string{c.WorkDir, filepath.Join(c.WorkDir, "vms")} {
+	dirs := []string{c.WorkDir, filepath.Join(c.WorkDir, "vms")}
+	if c.VolumeDir != "" {
+		dirs = append(dirs, c.VolumeDir)
+	}
+	for _, d := range dirs {
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			return err
 		}

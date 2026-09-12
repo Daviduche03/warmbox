@@ -45,12 +45,14 @@ VM_ID=""
 HOST_ADDR=""
 API_PORT="7070"
 SHARE_TAG=""
+HAVE_VOLUME=""
 for kv in $(cat /proc/cmdline); do
     case "$kv" in
-        warmbox.id=*)    VM_ID="${kv#warmbox.id=}" ;;
-        warmbox.host=*)  HOST_ADDR="${kv#warmbox.host=}" ;;
-        warmbox.port=*)  API_PORT="${kv#warmbox.port=}" ;;
-        warmbox.share=*) SHARE_TAG="${kv#warmbox.share=}" ;;
+        warmbox.id=*)     VM_ID="${kv#warmbox.id=}" ;;
+        warmbox.host=*)   HOST_ADDR="${kv#warmbox.host=}" ;;
+        warmbox.port=*)   API_PORT="${kv#warmbox.port=}" ;;
+        warmbox.share=*)  SHARE_TAG="${kv#warmbox.share=}" ;;
+        warmbox.volume=*) HAVE_VOLUME=1 ;;
     esac
 done
 
@@ -70,6 +72,18 @@ if [ -n "$IFACE" ]; then
     IP=$(ip -4 addr show "$IFACE" 2>/dev/null | grep -o 'inet [0-9.]*' | awk '{print $2}')
 fi
 log "id=${VM_ID:-?} iface=${IFACE:-none} ip=${IP:-none}"
+
+# When the root lives on a persistent volume, flush it periodically so a
+# host-side commit after an unclean stop loses at most a couple of seconds.
+if [ "$HAVE_VOLUME" = "1" ]; then
+    {
+        while true; do
+            sync
+            sleep 2
+        done
+    } &
+    log "volume sync loop started"
+fi
 
 # --- optional virtiofs workspace share ---
 # The host can attach a directory with `--device virtio-fs,sharedDir=...,

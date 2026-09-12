@@ -21,9 +21,14 @@ import (
 	"syscall"
 	"time"
 
+	rfs "github.com/rclone/rclone/fs"
+	_ "github.com/rclone/rclone/backend/all"
+
 	"runmesh/workspace/internal/api"
+	"runmesh/workspace/internal/config"
 	"runmesh/workspace/internal/desktop"
 	"runmesh/workspace/internal/pool"
+	"runmesh/workspace/internal/volume"
 )
 
 func main() {
@@ -42,6 +47,8 @@ func main() {
 		cmdList(os.Args[2:])
 	case "destroy":
 		cmdDestroy(os.Args[2:])
+	case "volume":
+		cmdVolume(os.Args[2:])
 	default:
 		usage()
 		os.Exit(1)
@@ -57,6 +64,11 @@ Usage:
   warmbox create            Provision a desktop, print its noVNC URL
   warmbox list              List desktops
   warmbox destroy <id>      Destroy a desktop
+
+  warmbox volume create <name> [--size 8G] [--from <name>]
+  warmbox volume list
+  warmbox volume clone <name> <new>
+  warmbox volume rm <name>
 
 The daemon needs vfkit (brew install vfkit) and a pre-baked guest image
 (see deploy/guest/Dockerfile).
@@ -95,6 +107,10 @@ func addCommonFlags(fs *flag.FlagSet, cfg *desktop.Config) {
 	fs.StringVar(&cfg.ShareDir, "share", cfg.ShareDir, "host directory shared with guests via virtiofs (mounted at /workspace)")
 	fs.StringVar(&cfg.ShareTag, "share-tag", cfg.ShareTag, "virtiofs mount tag")
 	fs.StringVar(&cfg.Token, "token", cfg.Token, "require this token on API/UI routes (empty = no auth)")
+	fs.StringVar(&cfg.VolumeDir, "volume-dir", cfg.VolumeDir, "local cache dir for volume images")
+	fs.StringVar(&cfg.VolumeBase, "volume-base", cfg.VolumeBase, "base ext4 image cloned for new volumes")
+	fs.IntVar(&cfg.VolumeChunkMiB, "volume-chunk", cfg.VolumeChunkMiB, "volume transfer chunk size (MiB)")
+	fs.StringVar(&cfg.VolumePrefix, "volume-prefix", cfg.VolumePrefix, "remote prefix for volumes")
 }
 
 func cmdDaemon(args []string) {
@@ -123,9 +139,24 @@ func cmdDaemon(args []string) {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	store := newVolumeStore(ctx, cfg)
+	if store != nil {
+		mgr.SetOnDestroy(func(vm *desktop.VM) {
+			if vm.Volume == "" {
+				return
+			}
+			cctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			defer cancel()
+			if err := store.Commit(cctx, vm.Volume); err != nil {
+				fmt.Fprintf(os.Stderr, "volume: commit %s: %v\n", vm.Volume, err)
+			}
+			store.Release(vm.Volume, vm.ID)
+		})
+	}
+
 	go p.Run(ctx)
 
-	srv := &http.Server{Addr: cfg.APIAddr, Handler: api.New(mgr, p, cfg, os.Stderr).Handler()}
+	srv := &http.Server{Addr: cfg.APIAddr, Handler: api.New(mgr, p, cfg, store, os.Stderr).Handler()}
 	go func() {
 		fmt.Fprintf(os.Stderr, "warmbox: listening on %s (pool=%d)\n", cfg.APIAddr, cfg.PoolSize)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -140,6 +171,35 @@ func cmdDaemon(args []string) {
 	defer cancel()
 	_ = srv.Shutdown(shutCtx)
 	mgr.Shutdown()
+}
+
+// newVolumeStore builds a volume store backed by runmesh/R2 when credentials
+// are configured, otherwise by a local directory so volumes still work for
+// local development. Returns nil if no store can be created.
+func newVolumeStore(ctx context.Context, cfg *desktop.Config) *volume.Store {
+	chunk := int64(cfg.VolumeChunkMiB) << 20
+
+	if rc, err := config.LoadGlobal(); err == nil && rc != nil && rc.DefaultBucket != "" {
+		if f, err := rc.NewFs(ctx, rc.DefaultBucket, ""); err == nil {
+			fmt.Fprintf(os.Stderr, "warmbox: volumes backed by remote bucket %q\n", rc.DefaultBucket)
+			return volume.NewStore(f, cfg.VolumePrefix, cfg.VolumeDir, cfg.VolumeBase, chunk)
+		} else {
+			fmt.Fprintf(os.Stderr, "warmbox: volume remote unavailable (%v); using local storage\n", err)
+		}
+	}
+
+	local := filepath.Join(cfg.WorkDir, "volume-remote")
+	if err := os.MkdirAll(local, 0o755); err != nil {
+		fmt.Fprintf(os.Stderr, "warmbox: volumes disabled: %v\n", err)
+		return nil
+	}
+	f, err := rfs.NewFs(ctx, local)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warmbox: volumes disabled: %v\n", err)
+		return nil
+	}
+	fmt.Fprintf(os.Stderr, "warmbox: volumes backed by local dir %s (no runmesh remote configured)\n", local)
+	return volume.NewStore(f, cfg.VolumePrefix, cfg.VolumeDir, cfg.VolumeBase, chunk)
 }
 
 func cmdSetup(args []string) {
@@ -270,12 +330,19 @@ func tokenDefault() string { return os.Getenv("WARMBOX_TOKEN") }
 func cmdCreate(args []string) {
 	addr := ":7070"
 	token := tokenDefault()
+	vol := ""
 	fs := flag.NewFlagSet("create", flag.ExitOnError)
 	fs.StringVar(&addr, "addr", addr, "daemon API address")
 	fs.StringVar(&token, "token", token, "daemon token (default $WARMBOX_TOKEN)")
+	fs.StringVar(&vol, "volume", "", "attach a persistent volume by name")
 	_ = fs.Parse(args)
 
-	resp, err := http.Post(withToken(apiBase(addr)+"/api/desktops", token), "application/json", nil)
+	var body io.Reader
+	if vol != "" {
+		b, _ := json.Marshal(map[string]string{"volume": vol})
+		body = strings.NewReader(string(b))
+	}
+	resp, err := http.Post(withToken(apiBase(addr)+"/api/desktops", token), "application/json", body)
 	if err != nil {
 		fatal("Error: %v", err)
 	}
@@ -332,8 +399,7 @@ func cmdDestroy(args []string) {
 	fs := flag.NewFlagSet("destroy", flag.ExitOnError)
 	fs.StringVar(&addr, "addr", addr, "daemon API address")
 	fs.StringVar(&token, "token", token, "daemon token (default $WARMBOX_TOKEN)")
-	_ = fs.Parse(args)
-	rest := fs.Args()
+	rest := parseInterspersed(fs, args)
 	if len(rest) < 1 {
 		fatal("Usage: warmbox destroy <id>")
 	}
@@ -347,4 +413,148 @@ func cmdDestroy(args []string) {
 		fatal("destroy failed: %s", resp.Status)
 	}
 	fmt.Fprintf(os.Stderr, "destroyed %s\n", rest[0])
+}
+
+// --- volumes ---
+
+func volumeUsage() {
+	fmt.Fprint(os.Stderr, `warmbox volume — portable, cloud-backed disks
+
+Usage:
+  warmbox volume create <name> [--size 8G] [--from <name>]
+  warmbox volume list
+  warmbox volume clone <name> <new>
+  warmbox volume rm <name>
+`)
+}
+
+// parseInterspersed parses flags that may appear after positional arguments.
+// The stdlib flag package stops at the first non-flag, so this re-parses the
+// remainder and returns positional arguments in order.
+func parseInterspersed(fs *flag.FlagSet, args []string) []string {
+	var positional []string
+	for {
+		_ = fs.Parse(args)
+		rest := fs.Args()
+		if len(rest) == 0 {
+			return positional
+		}
+		if len(rest[0]) > 1 && strings.HasPrefix(rest[0], "-") {
+			args = rest
+			continue
+		}
+		positional = append(positional, rest[0])
+		args = rest[1:]
+	}
+}
+
+func cmdVolume(args []string) {
+	if len(args) < 1 {
+		volumeUsage()
+		os.Exit(1)
+	}
+	addr := ":7070"
+	token := tokenDefault()
+
+	switch args[0] {
+	case "create":
+		fs := flag.NewFlagSet("volume create", flag.ExitOnError)
+		fs.StringVar(&addr, "addr", addr, "daemon API address")
+		fs.StringVar(&token, "token", token, "daemon token (default $WARMBOX_TOKEN)")
+		size := fs.String("size", "", "volume size, e.g. 8G (default: base image size)")
+		from := fs.String("from", "", "clone from an existing volume")
+		rest := parseInterspersed(fs, args[1:])
+		if len(rest) < 1 {
+			fatal("Usage: warmbox volume create <name> [--size 8G] [--from <name>]")
+		}
+		payload, _ := json.Marshal(map[string]string{"name": rest[0], "size": *size, "from": *from})
+		resp, err := http.Post(withToken(apiBase(addr)+"/api/volumes", token),
+			"application/json", strings.NewReader(string(payload)))
+		doVolume(resp, err)
+
+	case "list":
+		fs := flag.NewFlagSet("volume list", flag.ExitOnError)
+		fs.StringVar(&addr, "addr", addr, "daemon API address")
+		fs.StringVar(&token, "token", token, "daemon token (default $WARMBOX_TOKEN)")
+		_ = fs.Parse(args[1:])
+		resp, err := http.Get(withToken(apiBase(addr)+"/api/volumes", token))
+		if err != nil {
+			fatal("Error: %v", err)
+		}
+		defer resp.Body.Close()
+		var out struct {
+			Volumes []struct {
+				Name string `json:"name"`
+				Size int64  `json:"size"`
+				From string `json:"from"`
+			} `json:"volumes"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+			fatal("Error decoding response: %v", err)
+		}
+		if len(out.Volumes) == 0 {
+			fmt.Fprintln(os.Stderr, "(no volumes)")
+			return
+		}
+		for _, v := range out.Volumes {
+			fmt.Printf("%-20s %6s  %s\n", v.Name, humanSize(v.Size), v.From)
+		}
+
+	case "clone":
+		fs := flag.NewFlagSet("volume clone", flag.ExitOnError)
+		fs.StringVar(&addr, "addr", addr, "daemon API address")
+		fs.StringVar(&token, "token", token, "daemon token (default $WARMBOX_TOKEN)")
+		rest := parseInterspersed(fs, args[1:])
+		if len(rest) < 2 {
+			fatal("Usage: warmbox volume clone <name> <new>")
+		}
+		payload, _ := json.Marshal(map[string]string{"name": rest[1]})
+		resp, err := http.Post(withToken(apiBase(addr)+"/api/volumes/"+rest[0]+"/clone", token),
+			"application/json", strings.NewReader(string(payload)))
+		doVolume(resp, err)
+
+	case "rm":
+		fs := flag.NewFlagSet("volume rm", flag.ExitOnError)
+		fs.StringVar(&addr, "addr", addr, "daemon API address")
+		fs.StringVar(&token, "token", token, "daemon token (default $WARMBOX_TOKEN)")
+		rest := parseInterspersed(fs, args[1:])
+		if len(rest) < 1 {
+			fatal("Usage: warmbox volume rm <name>")
+		}
+		req, _ := http.NewRequest(http.MethodDelete, withToken(apiBase(addr)+"/api/volumes/"+rest[0], token), nil)
+		resp, err := http.DefaultClient.Do(req)
+		doVolume(resp, err)
+
+	default:
+		volumeUsage()
+		os.Exit(1)
+	}
+}
+
+func doVolume(resp *http.Response, err error) {
+	if err != nil {
+		fatal("Error: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 300 {
+		fatal("volume request failed: %s: %s", resp.Status, strings.TrimSpace(string(body)))
+	}
+	fmt.Fprintf(os.Stderr, "%s\n", resp.Status)
+	if s := strings.TrimSpace(string(body)); s != "" {
+		fmt.Println(s)
+	}
+}
+
+func humanSize(n int64) string {
+	switch {
+	case n >= 1<<40:
+		return fmt.Sprintf("%dT", n>>40)
+	case n >= 1<<30:
+		return fmt.Sprintf("%dG", n>>30)
+	case n >= 1<<20:
+		return fmt.Sprintf("%dM", n>>20)
+	default:
+		return fmt.Sprintf("%dB", n)
+	}
 }

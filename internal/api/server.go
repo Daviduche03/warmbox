@@ -3,6 +3,7 @@
 package api
 
 import (
+	"context"
 	"crypto/subtle"
 	"encoding/json"
 	"fmt"
@@ -12,26 +13,30 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"runmesh/workspace/internal/desktop"
 	"runmesh/workspace/internal/pool"
+	"runmesh/workspace/internal/volume"
 	"runmesh/workspace/internal/vnc"
 )
 
-// Server wires the manager, warm pool and VNC bridge into an http.Handler.
+// Server wires the manager, warm pool, volume store and VNC bridge into an
+// http.Handler.
 type Server struct {
-	mgr  *desktop.Manager
-	pool *pool.Pool
-	cfg  *desktop.Config
-	log  io.Writer
+	mgr     *desktop.Manager
+	pool    *pool.Pool
+	cfg     *desktop.Config
+	volumes *volume.Store
+	log     io.Writer
 }
 
-// New builds a Server.
-func New(mgr *desktop.Manager, p *pool.Pool, cfg *desktop.Config, log io.Writer) *Server {
+// New builds a Server. volumes may be nil when volume support is disabled.
+func New(mgr *desktop.Manager, p *pool.Pool, cfg *desktop.Config, volumes *volume.Store, log io.Writer) *Server {
 	if log == nil {
 		log = io.Discard
 	}
-	return &Server{mgr: mgr, pool: p, cfg: cfg, log: log}
+	return &Server{mgr: mgr, pool: p, cfg: cfg, volumes: volumes, log: log}
 }
 
 // Handler returns the root HTTP handler.
@@ -42,6 +47,13 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/desktops", s.list)
 	mux.HandleFunc("GET /api/desktops/{id}", s.get)
 	mux.HandleFunc("DELETE /api/desktops/{id}", s.destroy)
+
+	// Volumes: portable, cloud-backed disks.
+	mux.HandleFunc("POST /api/volumes", s.volumeCreate)
+	mux.HandleFunc("GET /api/volumes", s.volumeList)
+	mux.HandleFunc("GET /api/volumes/{name}", s.volumeGet)
+	mux.HandleFunc("DELETE /api/volumes/{name}", s.volumeDelete)
+	mux.HandleFunc("POST /api/volumes/{name}/clone", s.volumeClone)
 
 	// Guest readiness callback (guest -> host).
 	mux.HandleFunc("GET /internal/ready", s.ready)
@@ -104,6 +116,17 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 }
 
 func (s *Server) create(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Volume string `json:"volume"`
+	}
+	if r.Body != nil {
+		_ = json.NewDecoder(r.Body).Decode(&req)
+	}
+	if req.Volume != "" {
+		s.createWithVolume(w, r, req.Volume)
+		return
+	}
+
 	vm, err := s.pool.Acquire(r.Context())
 	if err != nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
@@ -113,6 +136,45 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 		"id":  vm.ID,
 		"vnc": "/vnc/" + vm.ID + "/vnc.html?autoconnect=1&resize=scale&path=/websockify/" + vm.ID + s.tokenSuffix(),
 		"ws":  "/websockify/" + vm.ID,
+	})
+}
+
+// createWithVolume boots a VM whose writable layer is a persistent volume.
+// Volume-backed VMs cannot come from the warm pool (the disk must be attached
+// before boot), so they cold-boot.
+func (s *Server) createWithVolume(w http.ResponseWriter, r *http.Request, name string) {
+	if !s.volumesEnabled(w) {
+		return
+	}
+	ctx := r.Context()
+	image, err := s.volumes.EnsureLocal(ctx, name)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "preparing volume: " + err.Error()})
+		return
+	}
+	id := desktop.NewID()
+	if err := s.volumes.Attach(name, id); err != nil {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+		return
+	}
+	vm, err := s.mgr.StartWithVolume(id, name, image)
+	if err != nil {
+		s.volumes.Release(name, id)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	wctx, cancel := context.WithTimeout(ctx, 90*time.Second)
+	defer cancel()
+	if _, err := s.mgr.WaitReady(wctx, vm.ID); err != nil {
+		_ = s.mgr.Destroy(vm.ID) // destroy hook commits + releases the volume
+		writeJSON(w, http.StatusGatewayTimeout, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"id":     vm.ID,
+		"volume": name,
+		"vnc":    "/vnc/" + vm.ID + "/vnc.html?autoconnect=1&resize=scale&path=/websockify/" + vm.ID + s.tokenSuffix(),
+		"ws":     "/websockify/" + vm.ID,
 	})
 }
 
@@ -192,4 +254,126 @@ func (s *Server) index(w http.ResponseWriter, r *http.Request) {
 	idle, pending := s.pool.Stats()
 	fmt.Fprintf(w, "warmbox orchestrator\n\nwarm pool: %d idle, %d booting\n", idle, pending)
 	fmt.Fprintf(w, "POST /api/desktops to create a desktop\n")
+}
+
+// --- volumes ---
+
+func (s *Server) volumesEnabled(w http.ResponseWriter) bool {
+	if s.volumes == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "volumes are not configured"})
+		return false
+	}
+	return true
+}
+
+func (s *Server) volumeCreate(w http.ResponseWriter, r *http.Request) {
+	if !s.volumesEnabled(w) {
+		return
+	}
+	var req struct {
+		Name string `json:"name"`
+		Size string `json:"size"`
+		From string `json:"from"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		return
+	}
+	size, err := parseSize(req.Size)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	m, err := s.volumes.Create(r.Context(), req.Name, size, req.From)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusCreated, m)
+}
+
+func (s *Server) volumeList(w http.ResponseWriter, r *http.Request) {
+	if !s.volumesEnabled(w) {
+		return
+	}
+	vols, err := s.volumes.List(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	if vols == nil {
+		vols = []*volume.Meta{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"volumes": vols})
+}
+
+func (s *Server) volumeGet(w http.ResponseWriter, r *http.Request) {
+	if !s.volumesEnabled(w) {
+		return
+	}
+	m, err := s.volumes.Get(r.Context(), r.PathValue("name"))
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown volume"})
+		return
+	}
+	writeJSON(w, http.StatusOK, m)
+}
+
+func (s *Server) volumeDelete(w http.ResponseWriter, r *http.Request) {
+	if !s.volumesEnabled(w) {
+		return
+	}
+	name := r.PathValue("name")
+	if owner := s.volumes.AttachedTo(name); owner != "" {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "volume is attached to " + owner})
+		return
+	}
+	if err := s.volumes.Delete(r.Context(), name); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted", "name": name})
+}
+
+func (s *Server) volumeClone(w http.ResponseWriter, r *http.Request) {
+	if !s.volumesEnabled(w) {
+		return
+	}
+	var req struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		return
+	}
+	m, err := s.volumes.Clone(r.Context(), r.PathValue("name"), req.Name)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusCreated, m)
+}
+
+// parseSize parses "8G", "512M", "1024" (bytes) into a byte count. An empty
+// string yields 0 (meaning "use the base image size").
+func parseSize(s string) (int64, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, nil
+	}
+	up := strings.ToUpper(s)
+	mult := int64(1)
+	switch {
+	case strings.HasSuffix(up, "T"):
+		mult, s = 1<<40, s[:len(s)-1]
+	case strings.HasSuffix(up, "G"):
+		mult, s = 1<<30, s[:len(s)-1]
+	case strings.HasSuffix(up, "M"):
+		mult, s = 1<<20, s[:len(s)-1]
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid size %q", s)
+	}
+	return n * mult, nil
 }

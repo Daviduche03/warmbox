@@ -2,9 +2,12 @@
 # warmbox overlay initramfs init — PID 1 in the boot initramfs.
 #
 # Mounts a read-only squashfs base (attached as a shared, read-only virtio-blk
-# device) and layers a tmpfs upper on top, then hands off to the guest's own
-# /init via switch_root. Writes land in RAM, so the base image is shared by
-# every VM and a VM needs no per-VM disk copy.
+# device) and layers a writable upper on top, then hands off to the guest's own
+# /init via switch_root.
+#
+# The writable layer is a persistent volume (/dev/vdb, ext4) when one is
+# attached — so files AND installed apps survive — otherwise a tmpfs in RAM
+# (ephemeral). See docs/volumes.md.
 
 export PATH=/bin:/sbin:/usr/bin:/usr/sbin
 
@@ -17,7 +20,7 @@ mkdir -p /dev/pts /dev/shm
 mount -t devpts devpts /dev/pts 2>/dev/null
 mount -t tmpfs tmpfs /dev/shm 2>/dev/null
 
-for m in virtio_pci virtio_blk squashfs overlay; do
+for m in virtio_pci virtio_blk squashfs overlay ext4; do
     modprobe "$m" 2>/dev/null
 done
 
@@ -37,11 +40,31 @@ if ! mount -t squashfs -o ro /dev/vda /mnt/base; then
     exec sh
 fi
 
-mkdir -p /overlay
-mount -t tmpfs -o mode=0755 tmpfs /overlay 2>/dev/null
-mkdir -p /overlay/upper /overlay/work /newroot
+# --- writable layer: persistent volume if attached, else tmpfs ---
+UPPER=/overlay
+i=0
+while [ ! -b /dev/vdb ] && [ $i -lt 30 ]; do
+    sleep 0.1
+    i=$((i+1))
+done
+if [ -b /dev/vdb ]; then
+    mkdir -p /mnt/vol
+    if mount -t ext4 /dev/vdb /mnt/vol 2>/dev/null; then
+        UPPER=/mnt/vol
+        log "writable layer: volume /dev/vdb"
+    else
+        log "WARN: volume mount failed; falling back to tmpfs"
+    fi
+fi
+if [ "$UPPER" = /overlay ]; then
+    mkdir -p /overlay
+    mount -t tmpfs -o mode=0755 tmpfs /overlay 2>/dev/null
+    log "writable layer: tmpfs"
+fi
+
+mkdir -p "$UPPER/upper" "$UPPER/work" /newroot
 if ! mount -t overlay overlay \
-        -o lowerdir=/mnt/base,upperdir=/overlay/upper,workdir=/overlay/work \
+        -o "lowerdir=/mnt/base,upperdir=$UPPER/upper,workdir=$UPPER/work" \
         /newroot; then
     log "overlay mount failed"
     exec sh
@@ -52,5 +75,5 @@ mount --move /proc /newroot/proc 2>/dev/null
 mount --move /sys /newroot/sys 2>/dev/null
 mount --move /dev /newroot/dev 2>/dev/null
 
-log "switching root to squashfs+overlay"
+log "switching root to squashfs + $UPPER"
 exec switch_root /newroot /init

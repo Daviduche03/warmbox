@@ -18,6 +18,8 @@ type Manager struct {
 	cfg *Config
 	log io.Writer
 
+	onDestroy func(*VM)
+
 	mu  sync.Mutex
 	vms map[string]*VM
 }
@@ -30,6 +32,10 @@ func NewManager(cfg *Config, log io.Writer) *Manager {
 	return &Manager{cfg: cfg, log: log, vms: map[string]*VM{}}
 }
 
+// SetOnDestroy registers a callback invoked for each VM as it is destroyed
+// (after the process has exited), e.g. to commit and release its volume.
+func (m *Manager) SetOnDestroy(fn func(*VM)) { m.onDestroy = fn }
+
 // Config returns the manager's config.
 func (m *Manager) Config() *Config { return m.cfg }
 
@@ -41,8 +47,17 @@ func NewID() string {
 }
 
 // Start launches a new microVM and returns it (state = booting). Callers wait
-// for readiness with WaitReady.
-func (m *Manager) Start(id string) (*VM, error) {
+// for readiness with WaitReady. The writable layer is ephemeral (tmpfs).
+func (m *Manager) Start(id string) (*VM, error) { return m.start(id, "", "") }
+
+// StartWithVolume launches a microVM whose writable layer is the given volume
+// image (a raw ext4 disk) attached read-write as /dev/vdb. volumeName names it
+// for later commit/release.
+func (m *Manager) StartWithVolume(id, volumeName, image string) (*VM, error) {
+	return m.start(id, volumeName, image)
+}
+
+func (m *Manager) start(id, volumeName, volumeImage string) (*VM, error) {
 	if id == "" {
 		id = NewID()
 	}
@@ -75,6 +90,9 @@ func (m *Manager) Start(id string) (*VM, error) {
 	if m.cfg.ShareDir != "" && m.cfg.ShareTag != "" {
 		cmdline += " warmbox.share=" + m.cfg.ShareTag
 	}
+	if volumeImage != "" {
+		cmdline += " warmbox.volume=1"
+	}
 	initrd := m.cfg.InitrdPath
 	switch {
 	case overlayBoot:
@@ -106,6 +124,9 @@ func (m *Manager) Start(id string) (*VM, error) {
 			"virtio-fs,sharedDir="+m.cfg.ShareDir+",mountTag="+m.cfg.ShareTag,
 		)
 	}
+	if volumeImage != "" {
+		args = append(args, "--device", "virtio-blk,path="+volumeImage)
+	}
 	args = append(args, "--pidfile", pidPath)
 
 	cmd := exec.Command(m.cfg.VfkitPath, args...)
@@ -117,6 +138,7 @@ func (m *Manager) Start(id string) (*VM, error) {
 		ID:      id,
 		State:   StateBooting,
 		Started: time.Now(),
+		Volume:  volumeName,
 		cmd:     cmd,
 		dir:     dir,
 		ready:   make(chan struct{}),
@@ -203,6 +225,14 @@ func (m *Manager) Destroy(id string) error {
 
 	if vm.cmd != nil && vm.cmd.Process != nil {
 		_ = vm.cmd.Process.Kill()
+		// Wait briefly for vfkit to exit so an attached volume image is stable
+		// before the destroy hook commits it.
+		for i := 0; i < 30 && vm.Info().State != StateDead; i++ {
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
+	if m.onDestroy != nil {
+		m.onDestroy(vm)
 	}
 	_ = os.RemoveAll(vm.dir)
 	vm.setState(StateDead)

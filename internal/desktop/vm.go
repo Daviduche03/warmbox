@@ -22,6 +22,7 @@ type VM struct {
 	State   State
 	GuestIP string
 	Started time.Time
+	Volume  string
 
 	cmd     *exec.Cmd
 	dir     string
@@ -66,6 +67,7 @@ type Info struct {
 	State   State     `json:"state"`
 	GuestIP string    `json:"guest_ip,omitempty"`
 	Started time.Time `json:"started"`
+	Volume  string    `json:"volume,omitempty"`
 }
 
 // Info returns a copy safe for serialisation.
@@ -77,5 +79,6 @@ func (v *VM) Info() Info {
 		State:   v.State,
 		GuestIP: v.GuestIP,
 		Started: v.Started,
+		Volume:  v.Volume,
 	}
 }

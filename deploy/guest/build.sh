@@ -59,7 +59,7 @@ docker run --rm \
     -v "$tmptar:/rootfs.tar:ro" \
     alpine:3.22 sh -c '
         set -e
-        apk add --no-cache squashfs-tools cpio gzip zstd kmod >/dev/null 2>&1
+        apk add --no-cache squashfs-tools cpio gzip zstd kmod e2fsprogs >/dev/null 2>&1
 
         rm -rf /rootfs && mkdir -p /rootfs
         tar -C /rootfs -xf /rootfs.tar
@@ -70,15 +70,22 @@ docker run --rm \
         mksquashfs /rootfs /host/rootfs.squashfs \
             -comp zstd -noappend -all-root -no-progress -quiet
 
+        # --- base volume image (cloned for each new persistent volume) ---
+        if [ ! -f /host/volume-base.img ]; then
+            truncate -s 8G /host/volume-base.img
+            mke2fs -F -t ext4 -q -m 0 /host/volume-base.img
+        fi
+
         # --- overlay boot initramfs ---
         krel=$(ls /rootfs/lib/modules | head -1)
         rm -rf /initrd && mkdir -p /initrd && cd /initrd
         zcat /rootfs/boot/initramfs-virt | cpio -idm --quiet
 
         # Add the modules the base boot needs that the stock initramfs lacks.
-        for m in overlay squashfs; do
+        # Missing ones are built into the kernel, so skip rather than fail.
+        for m in overlay squashfs ext4 jbd2 mbcache crc16; do
             src=$(find /rootfs/lib/modules -name "$m.ko.gz" | head -1)
-            [ -n "$src" ] || { echo "missing module $m" >&2; exit 1; }
+            [ -n "$src" ] || { echo "note: module $m not found (built-in?)" >&2; continue; }
             rel=".${src#/rootfs}"
             mkdir -p "$(dirname "$rel")"
             cp "$src" "$rel"
@@ -101,5 +108,5 @@ rm -f "$tmptar"
 
 ls -lh "$WARMBOX_HOME/vmlinux" "$WARMBOX_HOME/initramfs.zst" \
     "$WARMBOX_HOME/initramfs-virt" "$WARMBOX_HOME/rootfs.squashfs" \
-    "$WARMBOX_HOME/initramfs-overlay" 2>/dev/null || true
+    "$WARMBOX_HOME/initramfs-overlay" "$WARMBOX_HOME/volume-base.img" 2>/dev/null || true
 echo "==> done. run: warmbox daemon --mem 768 --pool 2"
