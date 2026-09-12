@@ -26,6 +26,7 @@ import (
 	rfs "github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/object"
 	"github.com/rclone/rclone/fs/operations"
+	"golang.org/x/sys/unix"
 )
 
 // DefaultChunkSize is the transfer granularity when syncing a volume image.
@@ -247,6 +248,18 @@ func (s *Store) Get(ctx context.Context, name string) (*Meta, error) {
 	return &m, nil
 }
 
+// Manifest returns the current remote manifest for a volume.
+func (s *Store) Manifest(ctx context.Context, name string) (*Manifest, error) {
+	m := &Manifest{Chunks: map[string]string{}}
+	if err := s.readJSON(ctx, s.manifestRemote(name), m); err != nil {
+		return nil, err
+	}
+	if m.Chunks == nil {
+		m.Chunks = map[string]string{}
+	}
+	return m, nil
+}
+
 // Delete removes a volume and all of its remote chunks.
 func (s *Store) Delete(ctx context.Context, name string) error {
 	if err := operations.Purge(ctx, s.fs, s.prefix+"/"+name); err != nil {
@@ -355,7 +368,18 @@ func (s *Store) Commit(ctx context.Context, name string) error {
 	next := &Manifest{ChunkSize: chunkSize, Size: meta.Size, Chunks: map[string]string{}}
 	buf := make([]byte, chunkSize)
 
+	// Only read/hash chunks that actually contain allocated data. Volume images
+	// are mostly holes, so this turns a full-disk scan into a scan of the used
+	// space (nil => the filesystem can't tell, so fall back to every chunk).
+	allocated, aerr := allocatedChunks(img, meta.Size, chunkSize)
+	if aerr != nil {
+		return aerr
+	}
+
 	for idx := 0; idx < nChunks; idx++ {
+		if allocated != nil && !allocated[idx] {
+			continue
+		}
 		off := int64(idx) * chunkSize
 		n := chunkSize
 		if rem := meta.Size - off; rem < n {
@@ -431,6 +455,46 @@ func isZero(b []byte) bool {
 		}
 	}
 	return true
+}
+
+// allocatedChunks returns the chunk indices that contain allocated (non-hole)
+// bytes. A nil map means the filesystem can't report holes, so the caller must
+// scan every chunk.
+func allocatedChunks(f *os.File, size, chunkSize int64) (map[int]bool, error) {
+	if chunkSize <= 0 {
+		return nil, nil
+	}
+	fd := int(f.Fd())
+	out := map[int]bool{}
+	off := int64(0)
+	for off < size {
+		data, err := unix.Seek(fd, off, unix.SEEK_DATA)
+		if err != nil {
+			if errors.Is(err, unix.ENXIO) {
+				break // no data from off onward
+			}
+			if errors.Is(err, unix.EINVAL) || errors.Is(err, unix.ENOTSUP) || errors.Is(err, unix.EOPNOTSUPP) {
+				return nil, nil // unsupported: caller scans all
+			}
+			return nil, err
+		}
+		hole, err := unix.Seek(fd, data, unix.SEEK_HOLE)
+		if err != nil {
+			hole = size
+		}
+		if hole > size {
+			hole = size
+		}
+		if hole <= data {
+			hole = data + chunkSize
+		}
+		last := (hole - 1) / chunkSize
+		for idx := data / chunkSize; idx <= last; idx++ {
+			out[int(idx)] = true
+		}
+		off = hole
+	}
+	return out, nil
 }
 
 func atoiSafe(s string) int {

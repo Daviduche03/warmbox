@@ -25,6 +25,7 @@ import (
 	_ "github.com/rclone/rclone/backend/all"
 
 	"runmesh/workspace/internal/api"
+	"runmesh/workspace/internal/catalog"
 	"runmesh/workspace/internal/config"
 	"runmesh/workspace/internal/desktop"
 	"runmesh/workspace/internal/pool"
@@ -140,7 +141,9 @@ func cmdDaemon(args []string) {
 	defer stop()
 
 	store := newVolumeStore(ctx, cfg)
+	cat := openCatalog(cfg)
 	if store != nil {
+		backfillCatalog(ctx, cat, store, cfg)
 		mgr.SetOnDestroy(func(vm *desktop.VM) {
 			if vm.Volume == "" {
 				return
@@ -150,13 +153,17 @@ func cmdDaemon(args []string) {
 			if err := store.Commit(cctx, vm.Volume); err != nil {
 				fmt.Fprintf(os.Stderr, "volume: commit %s: %v\n", vm.Volume, err)
 			}
-			store.Release(vm.Volume, vm.ID)
+			if cat != nil {
+				_ = cat.ReleaseLease(vm.Volume, vm.ID)
+			} else {
+				store.Release(vm.Volume, vm.ID)
+			}
 		})
 	}
 
 	go p.Run(ctx)
 
-	srv := &http.Server{Addr: cfg.APIAddr, Handler: api.New(mgr, p, cfg, store, os.Stderr).Handler()}
+	srv := &http.Server{Addr: cfg.APIAddr, Handler: api.New(mgr, p, cfg, store, cat, os.Stderr).Handler()}
 	go func() {
 		fmt.Fprintf(os.Stderr, "warmbox: listening on %s (pool=%d)\n", cfg.APIAddr, cfg.PoolSize)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -200,6 +207,41 @@ func newVolumeStore(ctx context.Context, cfg *desktop.Config) *volume.Store {
 	}
 	fmt.Fprintf(os.Stderr, "warmbox: volumes backed by local dir %s (no runmesh remote configured)\n", local)
 	return volume.NewStore(f, cfg.VolumePrefix, cfg.VolumeDir, cfg.VolumeBase, chunk)
+}
+
+// openCatalog opens the SQLite catalog at <workdir>/warmbox.db.
+func openCatalog(cfg *desktop.Config) *catalog.DB {
+	cat, err := catalog.Open(filepath.Join(cfg.WorkDir, "warmbox.db"))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warmbox: catalog disabled: %v\n", err)
+		return nil
+	}
+	return cat
+}
+
+// backfillCatalog mirrors volumes that already exist in remote storage into the
+// local catalog, so volumes created before the catalog existed still show up.
+func backfillCatalog(ctx context.Context, cat *catalog.DB, store *volume.Store, cfg *desktop.Config) {
+	if cat == nil {
+		return
+	}
+	vols, err := store.List(ctx)
+	if err != nil {
+		return
+	}
+	for _, m := range vols {
+		if _, err := cat.GetVolume(m.Name); err == nil {
+			continue
+		}
+		_ = cat.UpsertVolume(&catalog.Volume{
+			Name:      m.Name,
+			Size:      m.Size,
+			ChunkSize: m.ChunkSize,
+			Remote:    cfg.VolumePrefix + "/" + m.Name,
+			From:      m.From,
+			CreatedAt: m.Created,
+		})
+	}
 }
 
 func cmdSetup(args []string) {

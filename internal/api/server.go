@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"runmesh/workspace/internal/catalog"
 	"runmesh/workspace/internal/desktop"
 	"runmesh/workspace/internal/pool"
 	"runmesh/workspace/internal/volume"
@@ -28,15 +29,16 @@ type Server struct {
 	pool    *pool.Pool
 	cfg     *desktop.Config
 	volumes *volume.Store
+	catalog *catalog.DB
 	log     io.Writer
 }
 
-// New builds a Server. volumes may be nil when volume support is disabled.
-func New(mgr *desktop.Manager, p *pool.Pool, cfg *desktop.Config, volumes *volume.Store, log io.Writer) *Server {
+// New builds a Server. volumes and cat may be nil when those are disabled.
+func New(mgr *desktop.Manager, p *pool.Pool, cfg *desktop.Config, volumes *volume.Store, cat *catalog.DB, log io.Writer) *Server {
 	if log == nil {
 		log = io.Discard
 	}
-	return &Server{mgr: mgr, pool: p, cfg: cfg, volumes: volumes, log: log}
+	return &Server{mgr: mgr, pool: p, cfg: cfg, volumes: volumes, catalog: cat, log: log}
 }
 
 // Handler returns the root HTTP handler.
@@ -132,6 +134,7 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 		return
 	}
+	s.recordDesktop(vm.ID, "", "busy", "", 0)
 	writeJSON(w, http.StatusCreated, map[string]any{
 		"id":  vm.ID,
 		"vnc": "/vnc/" + vm.ID + "/vnc.html?autoconnect=1&resize=scale&path=/websockify/" + vm.ID + s.tokenSuffix(),
@@ -153,16 +156,17 @@ func (s *Server) createWithVolume(w http.ResponseWriter, r *http.Request, name s
 		return
 	}
 	id := desktop.NewID()
-	if err := s.volumes.Attach(name, id); err != nil {
+	if err := s.lockVolume(name, id); err != nil {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
 		return
 	}
 	vm, err := s.mgr.StartWithVolume(id, name, image)
 	if err != nil {
-		s.volumes.Release(name, id)
+		s.unlockVolume(name, id)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
+	s.recordDesktop(id, name, "booting", "", 0)
 	wctx, cancel := context.WithTimeout(ctx, 90*time.Second)
 	defer cancel()
 	if _, err := s.mgr.WaitReady(wctx, vm.ID); err != nil {
@@ -207,6 +211,9 @@ func (s *Server) destroy(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
 		return
 	}
+	if s.catalog != nil {
+		_ = s.catalog.DeleteDesktop(id)
+	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "destroyed", "id": id})
 }
 
@@ -216,6 +223,13 @@ func (s *Server) ready(w http.ResponseWriter, r *http.Request) {
 	if !s.mgr.MarkReady(id, ip) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown vm"})
 		return
+	}
+	if s.catalog != nil && id != "" {
+		if x, err := s.catalog.GetDesktop(id); err == nil {
+			x.State = "ready"
+			x.GuestIP = ip
+			_ = s.catalog.UpsertDesktop(x)
+		}
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -258,6 +272,39 @@ func (s *Server) index(w http.ResponseWriter, r *http.Request) {
 
 // --- volumes ---
 
+// recordDesktop keeps the SQLite catalog in sync with the in-memory manager.
+func (s *Server) recordDesktop(id, vol, state, ip string, pid int) {
+	if s.catalog == nil || id == "" {
+		return
+	}
+	_ = s.catalog.UpsertDesktop(&catalog.Desktop{ID: id, Volume: vol, State: state, GuestIP: ip, PID: pid})
+}
+
+// lockVolume takes the single-writer lock for a volume (a catalog lease when
+// available, otherwise the in-process store lock).
+func (s *Server) lockVolume(name, owner string) error {
+	if s.catalog != nil {
+		return s.catalog.AcquireLease(name, owner)
+	}
+	return s.volumes.Attach(name, owner)
+}
+
+func (s *Server) unlockVolume(name, owner string) {
+	if s.catalog != nil {
+		_ = s.catalog.ReleaseLease(name, owner)
+		return
+	}
+	s.volumes.Release(name, owner)
+}
+
+func (s *Server) volumeOwner(name string) string {
+	if s.catalog != nil {
+		o, _ := s.catalog.LeaseOwner(name)
+		return o
+	}
+	return s.volumes.AttachedTo(name)
+}
+
 func (s *Server) volumesEnabled(w http.ResponseWriter) bool {
 	if s.volumes == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "volumes are not configured"})
@@ -289,11 +336,33 @@ func (s *Server) volumeCreate(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
+	if s.catalog != nil {
+		_ = s.catalog.UpsertVolume(&catalog.Volume{
+			Name:      m.Name,
+			Size:      m.Size,
+			ChunkSize: m.ChunkSize,
+			Remote:    s.cfg.VolumePrefix + "/" + m.Name,
+			From:      m.From,
+			CreatedAt: m.Created,
+		})
+	}
 	writeJSON(w, http.StatusCreated, m)
 }
 
 func (s *Server) volumeList(w http.ResponseWriter, r *http.Request) {
 	if !s.volumesEnabled(w) {
+		return
+	}
+	if s.catalog != nil {
+		vs, err := s.catalog.ListVolumes()
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		if vs == nil {
+			vs = []*catalog.Volume{}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"volumes": vs})
 		return
 	}
 	vols, err := s.volumes.List(r.Context())
@@ -311,6 +380,15 @@ func (s *Server) volumeGet(w http.ResponseWriter, r *http.Request) {
 	if !s.volumesEnabled(w) {
 		return
 	}
+	if s.catalog != nil {
+		m, err := s.catalog.GetVolume(r.PathValue("name"))
+		if err != nil {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown volume"})
+			return
+		}
+		writeJSON(w, http.StatusOK, m)
+		return
+	}
 	m, err := s.volumes.Get(r.Context(), r.PathValue("name"))
 	if err != nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown volume"})
@@ -324,13 +402,16 @@ func (s *Server) volumeDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	name := r.PathValue("name")
-	if owner := s.volumes.AttachedTo(name); owner != "" {
+	if owner := s.volumeOwner(name); owner != "" {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "volume is attached to " + owner})
 		return
 	}
 	if err := s.volumes.Delete(r.Context(), name); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
+	}
+	if s.catalog != nil {
+		_ = s.catalog.DeleteVolume(name)
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted", "name": name})
 }
@@ -350,6 +431,16 @@ func (s *Server) volumeClone(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
+	}
+	if s.catalog != nil {
+		_ = s.catalog.UpsertVolume(&catalog.Volume{
+			Name:      m.Name,
+			Size:      m.Size,
+			ChunkSize: m.ChunkSize,
+			Remote:    s.cfg.VolumePrefix + "/" + m.Name,
+			From:      m.From,
+			CreatedAt: m.Created,
+		})
 	}
 	writeJSON(w, http.StatusCreated, m)
 }

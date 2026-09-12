@@ -141,3 +141,61 @@ func TestDelete(t *testing.T) {
 		t.Fatalf("expected no volumes, got %d", len(vols))
 	}
 }
+
+func TestSparseManifest(t *testing.T) {
+	ctx := context.Background()
+	f, root := testRemote(t)
+	st := NewStore(f, "volumes", filepath.Join(root, "local"), "", 4096)
+	if _, err := st.Create(ctx, "sparse", 1<<20, ""); err != nil {
+		t.Fatal(err)
+	}
+	m, err := st.Manifest(ctx, "sparse")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(m.Chunks) != 0 {
+		t.Fatalf("fresh zero volume should have 0 chunks, got %d", len(m.Chunks))
+	}
+	// Write a single 4 KiB chunk and commit: only that chunk should appear.
+	mustWriteAt(t, st.ImagePath("sparse"), 2*4096, bytes.Repeat([]byte{7}, 4096))
+	if err := st.Commit(ctx, "sparse"); err != nil {
+		t.Fatal(err)
+	}
+	m, _ = st.Manifest(ctx, "sparse")
+	if len(m.Chunks) != 1 {
+		t.Fatalf("expected exactly 1 chunk, got %d", len(m.Chunks))
+	}
+}
+
+func TestAllocatedChunks(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "img")
+	f, err := os.OpenFile(p, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	const size = 256 << 20 // 256 MiB (small files may not stay sparse on APFS)
+	const chunk = 1 << 20  // 1 MiB
+	if err := f.Truncate(size); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteAt(bytes.Repeat([]byte{9}, 4096), 100<<20); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	got, err := allocatedChunks(f, size, chunk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == nil {
+		t.Skip("filesystem does not support SEEK_DATA/SEEK_HOLE")
+	}
+	if !got[100] {
+		t.Fatalf("chunk 100 should be allocated; got %v", got)
+	}
+	if got[0] || got[200] || len(got) > 8 {
+		t.Fatalf("sparse detection wrong: %v", got)
+	}
+}
