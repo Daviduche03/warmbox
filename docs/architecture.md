@@ -86,16 +86,20 @@ etcd) or object-store locks; the `catalog` package hides that behind an interfac
 
 ## Build order
 
-1. **`internal/catalog`** — SQLite store for volumes/desktops/leases; wire the
-   daemon and API onto it. **✅ landed.**
-2. **Sparse-aware commit** — `commit` reads only allocated extents, so `create`
-   on an 8 GiB base went from ~8.9 s to ~0.6 s. **✅ landed.** (Manifest-first
-   create, to make it truly O(1), is still open.)
-3. **`internal/cloudstore`** — extract the shared chunk/manifest/cache engine;
-   put `volume`, `sync`, `cloudfs` on it.
-4. **Lazy volume reads** — chunk cache backed by the manifest (cut local disk,
-   speed attach).
-5. **`internal/snapshot`** — VM checkpoint/restore (the speed lever).
+1. **`internal/catalog`** — SQLite store for volumes/desktops/leases; wired into
+   the daemon and API. **✅ landed.**
+2. **Sparse-aware commit + manifest-first create.** Commit reads only allocated
+   extents; create clones a manifest instead of scanning, so creating a volume
+   from an 8 GiB base went ~8.9 s → **~0.1 s** (first create pays ~0.6 s to build
+   the base manifest once). **✅ landed.**
+3. **`internal/cloudstore`** — shared content-addressed chunk engine + JSON
+   docs. **Volume migrated ✅**; `sync` and `cloudfs` still to move onto it.
+4. **Lazy volume reads** — a shared local chunk cache (done: identical chunks
+   downloaded once per host); a FUSE-served image for true on-demand reads is
+   next.
+5. **`internal/snapshot`** — see `docs/snapshots.md`: disk snapshots are cheap
+   and portable now; a paused warm pool is instant but host-local; true ~100 ms
+   restore needs a Linux backend (Apple Virtualization has no memory snapshot).
 6. **Size as a parameter** — grow (truncate + `resize2fs`); honor `--size`.
 
 ## Non-goals (for now)

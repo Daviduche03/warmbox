@@ -1,16 +1,13 @@
 // Package volume implements portable, cloud-backed disks for warmbox VMs.
 //
-// A volume is a raw ext4 image stored in a remote (S3/R2 via rclone) as
-// fixed-size chunks, with a local sparse working copy. Only chunks that change
-// are transferred, so commits stay small. See docs/volumes.md.
+// A volume is a raw ext4 image whose allocated bytes live as content-addressed
+// chunks in a remote store (via internal/cloudstore), with a local sparse
+// working copy. Creating a volume is O(1): it clones a manifest, it does not
+// scan or upload. See docs/volumes.md and docs/architecture.md.
 package volume
 
 import (
-	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -18,19 +15,18 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	rfs "github.com/rclone/rclone/fs"
-	"github.com/rclone/rclone/fs/object"
 	"github.com/rclone/rclone/fs/operations"
-	"golang.org/x/sys/unix"
+
+	"runmesh/workspace/internal/cloudstore"
 )
 
 // DefaultChunkSize is the transfer granularity when syncing a volume image.
-const DefaultChunkSize = 16 << 20
+const DefaultChunkSize = cloudstore.DefaultChunkSize
 
 // Meta describes a volume. It is stored at <prefix>/<name>/meta.json.
 type Meta struct {
@@ -41,17 +37,9 @@ type Meta struct {
 	From      string    `json:"from,omitempty"`
 }
 
-// Manifest records which chunks of a volume currently exist remotely.
-type Manifest struct {
-	ChunkSize int64             `json:"chunk_size"`
-	Size      int64             `json:"size"`
-	Chunks    map[string]string `json:"chunks"` // decimal chunk index -> sha256 hex
-}
-
-// Store manages volumes on a remote filesystem (S3/R2 or a local path) plus a
-// local cache of working images.
+// Store manages volumes on a remote filesystem plus a local cache of images.
 type Store struct {
-	fs        rfs.Fs
+	cs        *cloudstore.Store
 	prefix    string
 	localDir  string
 	baseImage string
@@ -70,9 +58,10 @@ func NewStore(f rfs.Fs, prefix, localDir, baseImage string, chunkSize int64) *St
 	if chunkSize <= 0 {
 		chunkSize = DefaultChunkSize
 	}
+	prefix = strings.Trim(prefix, "/")
 	return &Store{
-		fs:        f,
-		prefix:    strings.Trim(prefix, "/"),
+		cs:        cloudstore.New(f, prefix+"/chunks", chunkSize),
+		prefix:    prefix,
 		localDir:  localDir,
 		baseImage: baseImage,
 		chunkSize: chunkSize,
@@ -84,10 +73,11 @@ func NewStore(f rfs.Fs, prefix, localDir, baseImage string, chunkSize int64) *St
 
 func (s *Store) metaRemote(name string) string     { return s.prefix + "/" + name + "/meta.json" }
 func (s *Store) manifestRemote(name string) string { return s.prefix + "/" + name + "/manifest.json" }
-func (s *Store) chunkRemote(name string, idx int) string {
-	return fmt.Sprintf("%s/%s/chunks/%08d", s.prefix, name, idx)
-}
-func (s *Store) dirPath(name string) string  { return filepath.Join(s.localDir, name) }
+func (s *Store) baseManifestRemote() string        { return s.prefix + "/_base/manifest.json" }
+func (s *Store) dirPath(name string) string        { return filepath.Join(s.localDir, name) }
+func (s *Store) cacheDir() string                  { return filepath.Join(s.localDir, "chunks") }
+
+// ImagePath is the local working copy of a volume image.
 func (s *Store) ImagePath(name string) string { return filepath.Join(s.dirPath(name), "disk.img") }
 
 // ValidName reports whether name is a safe volume name.
@@ -106,40 +96,10 @@ func ValidName(name string) bool {
 	return true
 }
 
-// --- remote helpers ---
-
-func (s *Store) readJSON(ctx context.Context, remote string, v any) error {
-	obj, err := s.fs.NewObject(ctx, remote)
-	if err != nil {
-		return err
-	}
-	rc, err := obj.Open(ctx)
-	if err != nil {
-		return err
-	}
-	defer rc.Close()
-	return json.NewDecoder(rc).Decode(v)
-}
-
-func (s *Store) writeJSON(ctx context.Context, remote string, v any) error {
-	data, err := json.MarshalIndent(v, "", "  ")
-	if err != nil {
-		return err
-	}
-	return s.put(ctx, remote, data)
-}
-
-func (s *Store) put(ctx context.Context, remote string, data []byte) error {
-	info := object.NewStaticObjectInfo(remote, time.Now(), int64(len(data)), true, nil, s.fs)
-	_, err := s.fs.Put(ctx, bytes.NewReader(data), info)
-	return err
-}
-
 // --- API ---
 
-// Create makes a new volume. If from is non-empty it clones that volume;
-// otherwise it clones the configured base image, or creates a zero image of
-// the requested size. The new volume is committed to the remote immediately.
+// Create makes a new volume in O(1): it clones the manifest of a source volume,
+// clones the precomputed base-image manifest, or starts empty. No disk scan.
 func (s *Store) Create(ctx context.Context, name string, size int64, from string) (*Meta, error) {
 	if !ValidName(name) {
 		return nil, fmt.Errorf("invalid volume name %q", name)
@@ -147,88 +107,95 @@ func (s *Store) Create(ctx context.Context, name string, size int64, from string
 	if _, err := s.Get(ctx, name); err == nil {
 		return nil, fmt.Errorf("volume %q already exists", name)
 	} else if !errors.Is(err, rfs.ErrorObjectNotFound) {
-		// A missing meta.json is expected; anything else is a real error.
 		return nil, err
 	}
 
 	meta := &Meta{Name: name, Created: time.Now().UTC(), From: from}
-	img := s.ImagePath(name)
 	if err := os.MkdirAll(s.dirPath(name), 0o755); err != nil {
 		return nil, err
 	}
 
+	var man *cloudstore.Manifest
 	switch {
 	case from != "":
-		src, err := s.EnsureLocal(ctx, from)
+		src, err := s.Get(ctx, from)
 		if err != nil {
-			return nil, fmt.Errorf("cloning source volume: %w", err)
+			return nil, fmt.Errorf("source volume: %w", err)
 		}
-		srcMeta, err := s.Get(ctx, from)
+		m, err := s.Manifest(ctx, from)
+		if err != nil {
+			return nil, fmt.Errorf("source manifest: %w", err)
+		}
+		if srcImg := s.ImagePath(from); fileExists(srcImg) {
+			_ = cloneFile(srcImg, s.ImagePath(name))
+		}
+		meta.Size, meta.ChunkSize, meta.From = src.Size, src.ChunkSize, from
+		man = m
+	case s.baseImage != "" && fileExists(s.baseImage):
+		bm, err := s.baseManifest(ctx)
 		if err != nil {
 			return nil, err
 		}
-		if err := cloneFile(src, img); err != nil {
-			return nil, err
-		}
-		meta.Size = srcMeta.Size
-		meta.ChunkSize = srcMeta.ChunkSize
-	case s.baseImage != "":
-		if _, err := os.Stat(s.baseImage); err == nil {
-			if err := cloneFile(s.baseImage, img); err != nil {
-				return nil, err
-			}
-			fi, err := os.Stat(img)
-			if err != nil {
-				return nil, err
-			}
-			meta.Size = fi.Size()
-			meta.ChunkSize = s.chunkSize
-		}
-	}
-	if meta.Size == 0 {
+		_ = cloneFile(s.baseImage, s.ImagePath(name))
+		meta.Size, meta.ChunkSize, meta.From = bm.Size, bm.ChunkSize, "_base"
+		man = bm
+	default:
 		if size <= 0 {
 			return nil, fmt.Errorf("volume %q: no base image and no size given", name)
 		}
-		meta.Size = size
-		meta.ChunkSize = s.chunkSize
-		zf, err := os.OpenFile(img, os.O_CREATE|os.O_RDWR, 0o644)
-		if err != nil {
+		meta.Size, meta.ChunkSize = size, s.chunkSize
+		if err := createSparse(s.ImagePath(name), size); err != nil {
 			return nil, err
 		}
-		if err := zf.Truncate(size); err != nil {
-			zf.Close()
-			return nil, err
-		}
-		zf.Close()
-	}
-	if meta.ChunkSize == 0 {
-		meta.ChunkSize = s.chunkSize
+		man = &cloudstore.Manifest{ChunkSize: s.chunkSize, Size: size, Chunks: map[string]string{}}
 	}
 
-	if err := s.fs.Mkdir(ctx, s.prefix+"/"+name); err != nil {
+	if err := s.cs.PutJSON(ctx, s.metaRemote(name), meta); err != nil {
 		return nil, err
 	}
-	if err := s.writeJSON(ctx, s.metaRemote(name), meta); err != nil {
-		return nil, err
-	}
-	if err := s.Commit(ctx, name); err != nil {
+	if err := s.cs.PutJSON(ctx, s.manifestRemote(name), man); err != nil {
 		return nil, err
 	}
 	return meta, nil
 }
 
+// baseManifest returns the base image's manifest, computing and caching it on
+// first use (the only place a scan happens, and only once).
+func (s *Store) baseManifest(ctx context.Context) (*cloudstore.Manifest, error) {
+	var m cloudstore.Manifest
+	if err := s.cs.GetJSON(ctx, s.baseManifestRemote(), &m); err == nil && m.Chunks != nil {
+		return &m, nil
+	}
+	f, err := os.Open(s.baseImage)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	m2, err := s.cs.BuildManifest(ctx, f, fi.Size(), s.chunkSize)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.cs.PutJSON(ctx, s.baseManifestRemote(), m2); err != nil {
+		return nil, err
+	}
+	return m2, nil
+}
+
 // List returns all volumes.
 func (s *Store) List(ctx context.Context) ([]*Meta, error) {
-	entries, err := s.fs.List(ctx, s.prefix)
+	names, err := s.cs.ListDirs(ctx, s.prefix)
 	if err != nil {
 		return nil, err
 	}
 	var out []*Meta
-	for _, e := range entries {
-		if _, ok := e.(rfs.Directory); !ok {
+	for _, name := range names {
+		if name == "_base" {
 			continue
 		}
-		name := pathBase(e.Remote())
 		m, err := s.Get(ctx, name)
 		if err != nil {
 			continue
@@ -242,16 +209,16 @@ func (s *Store) List(ctx context.Context) ([]*Meta, error) {
 // Get reads a volume's metadata.
 func (s *Store) Get(ctx context.Context, name string) (*Meta, error) {
 	var m Meta
-	if err := s.readJSON(ctx, s.metaRemote(name), &m); err != nil {
+	if err := s.cs.GetJSON(ctx, s.metaRemote(name), &m); err != nil {
 		return nil, err
 	}
 	return &m, nil
 }
 
-// Manifest returns the current remote manifest for a volume.
-func (s *Store) Manifest(ctx context.Context, name string) (*Manifest, error) {
-	m := &Manifest{Chunks: map[string]string{}}
-	if err := s.readJSON(ctx, s.manifestRemote(name), m); err != nil {
+// Manifest returns the current manifest for a volume.
+func (s *Store) Manifest(ctx context.Context, name string) (*cloudstore.Manifest, error) {
+	m := &cloudstore.Manifest{Chunks: map[string]string{}}
+	if err := s.cs.GetJSON(ctx, s.manifestRemote(name), m); err != nil {
 		return nil, err
 	}
 	if m.Chunks == nil {
@@ -260,16 +227,20 @@ func (s *Store) Manifest(ctx context.Context, name string) (*Manifest, error) {
 	return m, nil
 }
 
-// Delete removes a volume and all of its remote chunks.
+// Delete removes a volume's metadata/manifest and local image. Content-addressed
+// chunks are shared, so they are left for a garbage collector.
 func (s *Store) Delete(ctx context.Context, name string) error {
-	if err := operations.Purge(ctx, s.fs, s.prefix+"/"+name); err != nil {
-		return err
+	_ = s.cs.Delete(ctx, s.manifestRemote(name))
+	_ = s.cs.Delete(ctx, s.metaRemote(name))
+	if err := operations.Rmdir(ctx, s.cs.Fs(), s.prefix+"/"+name); err != nil {
+		// best effort: some backends remove dirs implicitly
+		_ = err
 	}
 	_ = os.RemoveAll(s.dirPath(name))
 	return nil
 }
 
-// Clone copies src to dst (server-side chunk copy + a local image copy).
+// Clone copies src to dst (manifest clone, O(1)).
 func (s *Store) Clone(ctx context.Context, src, dst string) (*Meta, error) {
 	if !ValidName(dst) {
 		return nil, fmt.Errorf("invalid volume name %q", dst)
@@ -280,18 +251,21 @@ func (s *Store) Clone(ctx context.Context, src, dst string) (*Meta, error) {
 	return s.Create(ctx, dst, 0, src)
 }
 
-// EnsureLocal downloads the volume's image into the local cache and returns
-// its path. Missing chunks are left as holes (zeros) in the sparse image.
+// EnsureLocal materializes the volume's image locally from the manifest using
+// the shared chunk cache, and returns its path.
 func (s *Store) EnsureLocal(ctx context.Context, name string) (string, error) {
 	meta, err := s.Get(ctx, name)
 	if err != nil {
 		return "", err
 	}
-	img := s.ImagePath(name)
+	man, err := s.Manifest(ctx, name)
+	if err != nil {
+		return "", err
+	}
 	if err := os.MkdirAll(s.dirPath(name), 0o755); err != nil {
 		return "", err
 	}
-	f, err := os.OpenFile(img, os.O_CREATE|os.O_RDWR, 0o644)
+	f, err := os.OpenFile(s.ImagePath(name), os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
 		return "", err
 	}
@@ -299,49 +273,13 @@ func (s *Store) EnsureLocal(ctx context.Context, name string) (string, error) {
 	if err := f.Truncate(meta.Size); err != nil {
 		return "", err
 	}
-
-	man := &Manifest{Chunks: map[string]string{}}
-	if err := s.readJSON(ctx, s.manifestRemote(name), man); err != nil {
-		if errors.Is(err, rfs.ErrorObjectNotFound) {
-			return img, nil // no chunks yet
-		}
+	if err := s.cs.ApplyManifest(ctx, man, f, s.cacheDir()); err != nil {
 		return "", err
 	}
-	for idxStr := range man.Chunks {
-		idx, err := strconv.Atoi(idxStr)
-		if err != nil {
-			continue
-		}
-		if err := s.downloadChunk(ctx, f, name, idx, meta); err != nil {
-			return "", err
-		}
-	}
-	return img, nil
+	return s.ImagePath(name), nil
 }
 
-func (s *Store) downloadChunk(ctx context.Context, img *os.File, name string, idx int, meta *Meta) error {
-	obj, err := s.fs.NewObject(ctx, s.chunkRemote(name, idx))
-	if err != nil {
-		return fmt.Errorf("chunk %d: %w", idx, err)
-	}
-	rc, err := obj.Open(ctx)
-	if err != nil {
-		return err
-	}
-	defer rc.Close()
-	buf := make([]byte, obj.Size())
-	if _, err := io.ReadFull(rc, buf); err != nil {
-		return err
-	}
-	off := int64(idx) * meta.ChunkSize
-	if _, err := img.WriteAt(buf, off); err != nil {
-		return err
-	}
-	return nil
-}
-
-// Commit uploads the chunks of the local image that changed since the last
-// manifest, and refreshes the remote manifest.
+// Commit uploads the local image's allocated chunks and refreshes the manifest.
 func (s *Store) Commit(ctx context.Context, name string) error {
 	meta, err := s.Get(ctx, name)
 	if err != nil {
@@ -352,69 +290,11 @@ func (s *Store) Commit(ctx context.Context, name string) error {
 		return err
 	}
 	defer img.Close()
-
-	old := &Manifest{Chunks: map[string]string{}}
-	if err := s.readJSON(ctx, s.manifestRemote(name), old); err == nil {
-		if old.Chunks == nil {
-			old.Chunks = map[string]string{}
-		}
+	m, err := s.cs.BuildManifest(ctx, img, meta.Size, meta.ChunkSize)
+	if err != nil {
+		return err
 	}
-
-	chunkSize := meta.ChunkSize
-	if chunkSize <= 0 {
-		chunkSize = s.chunkSize
-	}
-	nChunks := int((meta.Size + chunkSize - 1) / chunkSize)
-	next := &Manifest{ChunkSize: chunkSize, Size: meta.Size, Chunks: map[string]string{}}
-	buf := make([]byte, chunkSize)
-
-	// Only read/hash chunks that actually contain allocated data. Volume images
-	// are mostly holes, so this turns a full-disk scan into a scan of the used
-	// space (nil => the filesystem can't tell, so fall back to every chunk).
-	allocated, aerr := allocatedChunks(img, meta.Size, chunkSize)
-	if aerr != nil {
-		return aerr
-	}
-
-	for idx := 0; idx < nChunks; idx++ {
-		if allocated != nil && !allocated[idx] {
-			continue
-		}
-		off := int64(idx) * chunkSize
-		n := chunkSize
-		if rem := meta.Size - off; rem < n {
-			n = rem
-		}
-		b := buf[:n]
-		if _, err := img.ReadAt(b, off); err != nil && err != io.EOF {
-			return err
-		}
-		key := strconv.Itoa(idx)
-		if isZero(b) {
-			continue // hole => not stored
-		}
-		sum := sha256.Sum256(b)
-		h := hex.EncodeToString(sum[:])
-		next.Chunks[key] = h
-		if old.Chunks[key] == h {
-			continue // unchanged, already remote
-		}
-		if err := s.put(ctx, s.chunkRemote(name, idx), b); err != nil {
-			return fmt.Errorf("uploading chunk %d: %w", idx, err)
-		}
-	}
-
-	// Drop remote chunks that no longer exist.
-	for key := range old.Chunks {
-		if _, ok := next.Chunks[key]; ok {
-			continue
-		}
-		if obj, err := s.fs.NewObject(ctx, s.chunkRemote(name, atoiSafe(key))); err == nil {
-			_ = obj.Remove(ctx)
-		}
-	}
-
-	return s.writeJSON(ctx, s.manifestRemote(name), next)
+	return s.cs.PutJSON(ctx, s.manifestRemote(name), m)
 }
 
 // --- single-attach lock (in-process) ---
@@ -448,66 +328,18 @@ func (s *Store) AttachedTo(name string) string {
 
 // --- helpers ---
 
-func isZero(b []byte) bool {
-	for _, c := range b {
-		if c != 0 {
-			return false
-		}
-	}
-	return true
+func fileExists(p string) bool {
+	_, err := os.Stat(p)
+	return err == nil
 }
 
-// allocatedChunks returns the chunk indices that contain allocated (non-hole)
-// bytes. A nil map means the filesystem can't report holes, so the caller must
-// scan every chunk.
-func allocatedChunks(f *os.File, size, chunkSize int64) (map[int]bool, error) {
-	if chunkSize <= 0 {
-		return nil, nil
+func createSparse(path string, size int64) error {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return err
 	}
-	fd := int(f.Fd())
-	out := map[int]bool{}
-	off := int64(0)
-	for off < size {
-		data, err := unix.Seek(fd, off, unix.SEEK_DATA)
-		if err != nil {
-			if errors.Is(err, unix.ENXIO) {
-				break // no data from off onward
-			}
-			if errors.Is(err, unix.EINVAL) || errors.Is(err, unix.ENOTSUP) || errors.Is(err, unix.EOPNOTSUPP) {
-				return nil, nil // unsupported: caller scans all
-			}
-			return nil, err
-		}
-		hole, err := unix.Seek(fd, data, unix.SEEK_HOLE)
-		if err != nil {
-			hole = size
-		}
-		if hole > size {
-			hole = size
-		}
-		if hole <= data {
-			hole = data + chunkSize
-		}
-		last := (hole - 1) / chunkSize
-		for idx := data / chunkSize; idx <= last; idx++ {
-			out[int(idx)] = true
-		}
-		off = hole
-	}
-	return out, nil
-}
-
-func atoiSafe(s string) int {
-	n, _ := strconv.Atoi(s)
-	return n
-}
-
-func pathBase(p string) string {
-	p = strings.TrimSuffix(p, "/")
-	if i := strings.LastIndex(p, "/"); i >= 0 {
-		return p[i+1:]
-	}
-	return p
+	defer f.Close()
+	return f.Truncate(size)
 }
 
 // cloneFile makes a copy-on-write clone when the filesystem supports it
