@@ -1,7 +1,7 @@
 # warmbox — self-hosted GUI desktop orchestrator (vfkit + noVNC)
 
 WARMBOX_HOME ?= $(HOME)/.warmbox
-BROWSER ?= epiphany
+BROWSER ?= chromium
 BINARY ?= warmbox
 
 .PHONY: build guest-image setup daemon run test vet clean

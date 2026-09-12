@@ -9,4 +9,3 @@ indicatorOrientation=1
 indicatorColorFromTheme=true
 noWindowsListIfSingle=true
 onlyDisplayVisible=true
-pinned=xfce4-terminal.desktop;org.gnome.Epiphany.desktop;thunar.desktop;

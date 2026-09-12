@@ -108,53 +108,60 @@ def flat_png(path, w, h, color, alpha=255):
     write_png(path, w, h, rows)
 
 
-def glyph_btn(path, w, h, glyph, fg, bg_alpha=0):
-    """Draw a simple glyph on a (possibly transparent) button background.
+def glyph_btn(path, w, h, glyph, fg, bg=None):
+    """Draw a glyph centred on the button, on an optional solid background.
 
-    glyph: 'x' close | 'min' | 'max' | 'menu' | 'restore'
+    glyph: 'x' close | 'min' | 'max' | 'restore' | 'menu'
     """
+    cx, cy = (w - 1) / 2.0, (h - 1) / 2.0
+    half = 5.0   # glyph half-size => 10px glyph box
+    stroke = 0.9
     rows = []
     for y in range(h):
         row = bytearray(w * 4)
         for x in range(w):
+            fx, fy = x - cx, y - cy
+            inside = abs(fx) <= half and abs(fy) <= half
             on = False
             if glyph == "x":
-                d = abs((x - w / 2) - (y - h / 2))
-                d2 = abs((x - w / 2) + (y - h / 2))
-                on = d <= 1.6 or d2 <= 1.6
+                on = inside and abs(abs(fx) - abs(fy)) <= stroke
             elif glyph == "min":
-                on = h // 2 - 1 <= y <= h // 2 and w // 4 <= x < 3 * w // 4
+                on = abs(fx) <= half and abs(fy) <= stroke
             elif glyph == "max":
-                m = 3
-                on = (m <= x < w - m and y in (m, h - m - 1)) or \
-                     (m <= y < h - m and x in (m, w - m - 1))
+                on = inside and min(half - abs(fx), half - abs(fy)) <= stroke
             elif glyph == "restore":
-                m = 3
-                on = (m + 3 <= x < w - m and y in (m, m + 2)) or \
-                     (m + 3 <= y < h - m and x in (m, m + 2))
-            elif glyph == "menu":
-                for i, yy in enumerate((h // 4, h // 2, 3 * h // 4)):
-                    if yy - 1 <= y <= yy and w // 4 <= x < 3 * w // 4:
+                s = half - 2.0
+                for ox, oy in ((2.5, -2.5), (-1.5, 1.5)):
+                    bx, by = fx - ox, fy - oy
+                    if abs(bx) <= s and abs(by) <= s and \
+                       min(s - abs(bx), s - abs(by)) <= stroke:
                         on = True
+            elif glyph == "menu":
+                on = abs(fx) <= half and any(abs(fy - oy) <= stroke
+                                             for oy in (-4.0, 0.0, 4.0))
             o = x * 4
             if on:
                 row[o:o + 4] = (fg[0], fg[1], fg[2], 255)
-            elif bg_alpha:
-                row[o:o + 4] = (bg[0], bg[1], bg[2], bg_alpha)
+            elif bg is not None:
+                row[o:o + 4] = (bg[0], bg[1], bg[2], 255)
             else:
                 row[o:o + 4] = (0, 0, 0, 0)
         rows.append(row)
     write_png(path, w, h, rows)
 
 
-TITLE_H = 29
-BTN_W, BTN_H = 21, TITLE_H
+# Win11-style caption buttons are wide and short; the old 21x29 buttons forced
+# the glyphs into a tall, cramped box (and the close hover dropped the glyph).
+TITLE_H = 30
+BTN_W, BTN_H = 45, TITLE_H
 TITLE_ACTIVE = (0xF3, 0xF3, 0xF3)
 TITLE_INACTIVE = (0xE6, 0xE6, 0xE6)
 BORDER = (0xD4, 0xD4, 0xD4)
 FG = (0x33, 0x33, 0x33)
 FG_HOVER = (0x11, 0x11, 0x11)
 CLOSE_HOVER = (0xE8, 0x11, 0x23)
+HOVER_BG = (0xE5, 0xE5, 0xE5)
+PRESS_BG = (0xD8, 0xD8, 0xD8)
 
 
 def gen_xfwm(theme_dir):
@@ -181,20 +188,32 @@ def gen_xfwm(theme_dir):
     flat_png(f"{theme_dir}/bottom-left-inactive.png", 16, 16, BORDER)
     flat_png(f"{theme_dir}/bottom-right-inactive.png", 16, 16, BORDER)
 
-    # Buttons: transparent bg, dark glyph; close hover turns red.
+    # Buttons: centred glyphs. Minimize/maximize get a subtle hover chip; close
+    # turns red with a white X on hover (previously it lost the glyph entirely).
     for state in ("active", "inactive", "prelight", "pressed"):
         for name, glyph in (("close", "x"), ("hide", "min"),
                             ("maximize", "max"), ("menu", "menu")):
-            fg = FG
-            if state == "prelight":
-                fg = FG_HOVER
             if name == "close" and state in ("prelight", "pressed"):
-                flat_png(f"{theme_dir}/close-{state}.png", BTN_W, BTN_H, CLOSE_HOVER)
+                glyph_btn(f"{theme_dir}/close-{state}.png", BTN_W, BTN_H,
+                          "x", (0xFF, 0xFF, 0xFF), bg=CLOSE_HOVER)
                 continue
-            glyph_btn(f"{theme_dir}/{name}-{state}.png", BTN_W, BTN_H, glyph, fg)
+            if state == "prelight":
+                fg, bg = FG_HOVER, HOVER_BG
+            elif state == "pressed":
+                fg, bg = FG_HOVER, PRESS_BG
+            else:
+                fg, bg = FG, None
+            glyph_btn(f"{theme_dir}/{name}-{state}.png", BTN_W, BTN_H, glyph, fg, bg)
     # Toggled variants (maximized/restore), reuse.
     for state in ("active", "inactive", "prelight", "pressed"):
-        glyph_btn(f"{theme_dir}/maximize-toggled-{state}.png", BTN_W, BTN_H, "restore", FG if state != "prelight" else FG_HOVER)
+        if state == "prelight":
+            fg, bg = FG_HOVER, HOVER_BG
+        elif state == "pressed":
+            fg, bg = FG_HOVER, PRESS_BG
+        else:
+            fg, bg = FG, None
+        glyph_btn(f"{theme_dir}/maximize-toggled-{state}.png", BTN_W, BTN_H,
+                  "restore", fg, bg)
 
     print(f"  wrote xfwm4 pixmaps to {theme_dir}")
 

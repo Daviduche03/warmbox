@@ -24,7 +24,7 @@
 set -eu
 
 here=$(cd "$(dirname "$0")" && pwd)
-BROWSER="${BROWSER:-epiphany}"
+BROWSER="${BROWSER:-chromium}"
 THEME="${THEME:-win11}"
 IMAGE="${IMAGE:-warmbox-guest:latest}"
 WARMBOX_HOME="${WARMBOX_HOME:-$HOME/.warmbox}"

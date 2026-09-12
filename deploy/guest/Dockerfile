@@ -19,7 +19,7 @@
 
 FROM alpine:3.22
 
-ARG BROWSER=epiphany
+ARG BROWSER=chromium
 ARG THEME=default
 
 RUN set -eux; \
@@ -45,6 +45,19 @@ RUN set -eux; \
         chromium)  apk add --no-cache chromium ;; \
         *) echo "unknown BROWSER=${BROWSER}" >&2; exit 1 ;; \
     esac
+
+# Chromium is the browser that actually works in this microVM: it runs with
+# --no-sandbox (bubblewrap/user-namespaces are blocked by the kernel) and
+# --disable-gpu (no GPU in the VM). Patch its launcher so the app menu, links
+# and exo-open all get the working flags with Chromium's real hicolor icon, and
+# make it XFCE's preferred browser.
+RUN set -eux; \
+    if command -v chromium >/dev/null 2>&1; then \
+        sed -i 's|^Exec=/usr/bin/chromium-browser|Exec=/usr/bin/chromium-browser --no-sandbox --disable-gpu --disable-dev-shm-usage|' /usr/share/applications/chromium.desktop; \
+        rm -f /usr/share/applications/xfce4-web-browser.desktop; \
+        sed -i 's/^WebBrowser=.*/WebBrowser=chromium/' /etc/xdg/xfce4/helpers.rc; \
+        update-desktop-database /usr/share/applications 2>/dev/null || true; \
+    fi
 
 # Win11 hand-rolled theme (THEME=win11): a dark, centered bottom taskbar with a
 # start menu and docklike app icons, Fluent-ish flat GTK theme, matching xfwm4
