@@ -33,6 +33,7 @@ RUN set -eux; \
         font-misc-misc font-dejavu \
         iproute2 socat bash procps coreutils \
         kmod linux-virt \
+        xmessage \
         curl zstd
 
 # Optional browser.
@@ -58,6 +59,15 @@ RUN set -eux; \
         sed -i 's/^WebBrowser=.*/WebBrowser=chromium/' /etc/xdg/xfce4/helpers.rc; \
         update-desktop-database /usr/share/applications 2>/dev/null || true; \
     fi
+
+# warmbox-app: a tiny /opt/apps convention that turns a directory + app.json
+# into a menu entry. Apps land on the writable volume, so they persist and
+# clone with the machine. A sample app ships baked in.
+COPY apps /apps
+RUN set -eux; \
+    install -m 0755 /apps/warmbox-app /usr/local/bin/warmbox-app; \
+    /usr/local/bin/warmbox-app install /apps/sample; \
+    rm -rf /apps
 
 # Win11 hand-rolled theme (THEME=win11): a dark, centered bottom taskbar with a
 # start menu and docklike app icons, Fluent-ish flat GTK theme, matching xfwm4

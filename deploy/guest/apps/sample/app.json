@@ -1,0 +1,7 @@
+{
+  "id": "agent-demo",
+  "name": "Agent Demo",
+  "command": "/opt/apps/agent-demo/run.sh",
+  "icon": "applications-internet",
+  "description": "A sample app installed with warmbox-app"
+}
