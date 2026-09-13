@@ -49,6 +49,14 @@ while [ ! -b /dev/vdb ] && [ $i -lt 30 ]; do
 done
 if [ -b /dev/vdb ]; then
     mkdir -p /mnt/vol
+    # A volume may be larger than its filesystem (volumes are grow-only) and may
+    # be dirty after an unclean stop. Repair, then stretch it, before mounting.
+    if command -v e2fsck >/dev/null 2>&1; then
+        e2fsck -f -y /dev/vdb >/dev/kmsg 2>&1 || true
+    fi
+    if command -v resize2fs >/dev/null 2>&1; then
+        resize2fs /dev/vdb >/dev/kmsg 2>&1 || true
+    fi
     if mount -t ext4 /dev/vdb /mnt/vol 2>/dev/null; then
         UPPER=/mnt/vol
         log "writable layer: volume /dev/vdb"

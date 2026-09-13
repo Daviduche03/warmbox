@@ -112,14 +112,11 @@ changing size means growing the disk file and then telling ext4 to stretch
 - The base disk built by `build.sh` sets the **floor**: `VOLUME_BASE_SIZE`
   (default `2G`). Requesting smaller than the floor is refused (shrinking ext4
   is unsafe).
-- Growth happens on the **host at create time**: natively where `resize2fs`
-  exists (Linux), or in a throwaway Docker container on macOS (Docker is already
-  required to build the guest image). The guest just mounts an already-correct
-  filesystem.
-- The manifest's chunks are unaffected by growing — the extra space is holes
-  until written, and the resize's new metadata is captured in the manifest at
-  create time.
-- Same-size creates stay O(1) (manifest clone); only a *grow* does the resize.
+- Growth happens in the **guest's boot step**, not on the host: the boot
+  initramfs runs `e2fsck -f -y /dev/vdb` + `resize2fs /dev/vdb` *before* mounting
+  the volume. No host tools and no Docker needed — it works on any host.
+- `Create` stays O(1): it just extends the local image; the filesystem catches up
+  on first boot. The extra space is holes until written.
 
 ## REST API
 

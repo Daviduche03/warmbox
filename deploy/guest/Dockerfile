@@ -33,7 +33,6 @@ RUN set -eux; \
         font-misc-misc font-dejavu \
         iproute2 socat bash procps coreutils \
         kmod linux-virt \
-        e2fsprogs-extra \
         curl zstd
 
 # Optional browser.

@@ -63,7 +63,7 @@ docker run --rm \
     -v "$tmptar:/rootfs.tar:ro" \
     alpine:3.22 sh -c '
         set -e
-        apk add --no-cache squashfs-tools cpio gzip zstd kmod e2fsprogs >/dev/null 2>&1
+        apk add --no-cache squashfs-tools cpio gzip zstd kmod e2fsprogs e2fsprogs-extra >/dev/null 2>&1
 
         rm -rf /rootfs && mkdir -p /rootfs
         tar -C /rootfs -xf /rootfs.tar
@@ -98,6 +98,18 @@ docker run --rm \
         # busybox modprobe does not read gzipped modules; store plain .ko.
         find lib/modules -name "*.ko.gz" -exec gunzip -f {} \;
         depmod -b /initrd "$krel" >/dev/null 2>&1 || true
+
+        # e2fs tools so the boot initramfs can fsck and grow a volume before it
+        # is mounted (no host-side resize needed).
+        for b in e2fsck resize2fs; do
+            bin=$(command -v "$b")
+            mkdir -p "/initrd$(dirname "$bin")"
+            cp "$bin" "/initrd$bin"
+            ldd "$bin" | grep -oE "/[^ ]+\.so[^ ]*" | while read -r lib; do
+                mkdir -p "/initrd$(dirname "$lib")"
+                cp "$lib" "/initrd$lib" 2>/dev/null || true
+            done
+        done
 
         cp /guest/overlay-init init
         chmod +x init
