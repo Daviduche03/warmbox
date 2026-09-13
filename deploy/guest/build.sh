@@ -101,7 +101,7 @@ docker run --rm \
 
         # e2fs tools so the boot initramfs can fsck and grow a volume before it
         # is mounted (no host-side resize needed).
-        for b in e2fsck resize2fs; do
+        for b in e2fsck resize2fs dumpe2fs; do
             bin=$(command -v "$b")
             mkdir -p "/initrd$(dirname "$bin")"
             cp "$bin" "/initrd$bin"
