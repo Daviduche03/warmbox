@@ -29,6 +29,9 @@ THEME="${THEME:-win11}"
 IMAGE="${IMAGE:-warmbox-guest:latest}"
 WARMBOX_HOME="${WARMBOX_HOME:-$HOME/.warmbox}"
 PLATFORM="${PLATFORM:-linux/arm64}"
+# Floor size of a volume. Volumes are grow-only, so this is the smallest a
+# volume can be; request larger with `warmbox volume create --size`.
+VOLUME_BASE_SIZE="${VOLUME_BASE_SIZE:-2G}"
 
 echo "==> building $IMAGE (BROWSER=$BROWSER, THEME=$THEME, platform=$PLATFORM)"
 docker build --platform "$PLATFORM" -t "$IMAGE" \
@@ -54,6 +57,7 @@ echo "==> building rootfs.squashfs + initramfs-overlay"
 tmptar=$(mktemp /tmp/wb-rootfs-XXXXXX)
 docker export "$cid" -o "$tmptar"
 docker run --rm \
+    -e VOLUME_BASE_SIZE="$VOLUME_BASE_SIZE" \
     -v "$WARMBOX_HOME:/host" \
     -v "$here:/guest:ro" \
     -v "$tmptar:/rootfs.tar:ro" \
@@ -72,7 +76,7 @@ docker run --rm \
 
         # --- base volume image (cloned for each new persistent volume) ---
         if [ ! -f /host/volume-base.img ]; then
-            truncate -s 8G /host/volume-base.img
+            truncate -s "${VOLUME_BASE_SIZE:-2G}" /host/volume-base.img
             mke2fs -F -t ext4 -q -m 0 /host/volume-base.img
         fi
 

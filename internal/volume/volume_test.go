@@ -99,6 +99,37 @@ func TestClone(t *testing.T) {
 	}
 }
 
+func TestGrowFromBase(t *testing.T) {
+	ctx := context.Background()
+	f, root := testRemote(t)
+	base := filepath.Join(root, "base.img")
+	if err := os.WriteFile(base, make([]byte, 1<<20), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	st := NewStore(f, "volumes", filepath.Join(root, "local"), base, 1<<20)
+	// The test's base is not a real filesystem; stub the resize step.
+	resized := false
+	st.resizeFS = func(context.Context, string) error { resized = true; return nil }
+
+	m, err := st.Create(ctx, "big", 4<<20, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.Size != 4<<20 {
+		t.Fatalf("meta size=%d, want %d", m.Size, 4<<20)
+	}
+	if !resized {
+		t.Fatal("grow did not invoke the filesystem resize")
+	}
+	if fi, err := os.Stat(st.ImagePath("big")); err != nil || fi.Size() != 4<<20 {
+		t.Fatalf("image not grown: %v %v", fi, err)
+	}
+	// Shrinking is refused.
+	if _, err := st.Create(ctx, "small", 512<<10, ""); err == nil {
+		t.Fatal("expected shrink to be refused")
+	}
+}
+
 func TestAttachLock(t *testing.T) {
 	s := NewStore(nil, "volumes", t.TempDir(), "", 0)
 	if err := s.Attach("v", "vm1"); err != nil {

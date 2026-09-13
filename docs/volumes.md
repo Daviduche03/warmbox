@@ -102,6 +102,25 @@ warmbox create --volume dev            # later / on another host: same machine
 warmbox volume clone dev dev-clean     # template a fresh box
 ```
 
+## Sizing
+
+Volumes are **grow-only**. A volume is an ext4 disk with a fixed size, so
+changing size means growing the disk file and then telling ext4 to stretch
+(`e2fsck -f` + `resize2fs`).
+
+- The image is created at the requested size: `warmbox volume create dev --size 64G`.
+- The base disk built by `build.sh` sets the **floor**: `VOLUME_BASE_SIZE`
+  (default `2G`). Requesting smaller than the floor is refused (shrinking ext4
+  is unsafe).
+- Growth happens on the **host at create time**: natively where `resize2fs`
+  exists (Linux), or in a throwaway Docker container on macOS (Docker is already
+  required to build the guest image). The guest just mounts an already-correct
+  filesystem.
+- The manifest's chunks are unaffected by growing — the extra space is holes
+  until written, and the resize's new metadata is captured in the manifest at
+  create time.
+- Same-size creates stay O(1) (manifest clone); only a *grow* does the resize.
+
 ## REST API
 
 ```

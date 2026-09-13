@@ -49,6 +49,10 @@ type Store struct {
 
 	mu       sync.Mutex
 	attached map[string]string // volume name -> owner (VM id)
+
+	// resizeFS grows an image's filesystem to fill its file. Overridable in
+	// tests; defaults to growFilesystem.
+	resizeFS func(context.Context, string) error
 }
 
 // NewStore builds a Store. prefix defaults to "volumes"; chunkSize <= 0 uses
@@ -68,6 +72,7 @@ func NewStore(f rfs.Fs, prefix, localDir, baseImage string, chunkSize int64) *St
 		baseImage: baseImage,
 		chunkSize: chunkSize,
 		attached:  map[string]string{},
+		resizeFS:  growFilesystem,
 	}
 }
 
@@ -150,6 +155,41 @@ func (s *Store) Create(ctx context.Context, name string, size int64, from string
 			return nil, err
 		}
 		man = &cloudstore.Manifest{ChunkSize: s.chunkSize, Size: size, Chunks: map[string]string{}}
+	}
+
+	// Honor an explicit size (grow-only). Growing extends the image file and
+	// grows the filesystem (e2fsck + resize2fs) so the guest just mounts it.
+	// Shrinking is refused.
+	if size > 0 && size < meta.Size {
+		return nil, fmt.Errorf("volume %q: cannot shrink %d -> %d bytes (grow-only)", name, meta.Size, size)
+	}
+	if size > meta.Size {
+		img := s.ImagePath(name)
+		if !fileExists(img) {
+			return nil, fmt.Errorf("volume %q: cannot grow a volume with no local image", name)
+		}
+		if err := os.Truncate(img, size); err != nil {
+			return nil, err
+		}
+		if s.resizeFS != nil {
+			if err := s.resizeFS(ctx, img); err != nil {
+				return nil, fmt.Errorf("growing filesystem: %w", err)
+			}
+		}
+		f, err := os.Open(img)
+		if err != nil {
+			return nil, err
+		}
+		m, err := s.cs.BuildManifest(ctx, f, size, meta.ChunkSize)
+		f.Close()
+		if err != nil {
+			return nil, err
+		}
+		meta.Size = size
+		man = m
+	}
+	if man.Size != meta.Size {
+		man.Size = meta.Size
 	}
 
 	if err := s.cs.PutJSON(ctx, s.metaRemote(name), meta); err != nil {
@@ -463,6 +503,33 @@ func createSparse(path string, size int64) error {
 	}
 	defer f.Close()
 	return f.Truncate(size)
+}
+
+// growFilesystem grows an ext4 image to fill its file. e2fsck must run first;
+// on Linux we use the native tools, otherwise a throwaway Docker container
+// (Docker is already required to build the guest image).
+func growFilesystem(ctx context.Context, img string) error {
+	if _, err := exec.LookPath("resize2fs"); err == nil {
+		cmd := fmt.Sprintf("e2fsck -f -y %s >/dev/null 2>&1 || true; resize2fs %s", shellQuote(img), shellQuote(img))
+		if out, err := exec.CommandContext(ctx, "sh", "-c", cmd).CombinedOutput(); err != nil {
+			return fmt.Errorf("%v: %s", err, strings.TrimSpace(string(out)))
+		}
+		return nil
+	}
+	if _, err := exec.LookPath("docker"); err != nil {
+		return fmt.Errorf("need e2fsprogs (Linux) or docker on the host to grow a volume")
+	}
+	dir, base := filepath.Dir(img), filepath.Base(img)
+	script := fmt.Sprintf("apk add -q e2fsprogs-extra >/dev/null 2>&1; e2fsck -f -y /v/%s >/dev/null 2>&1 || true; resize2fs /v/%s", base, base)
+	out, err := exec.CommandContext(ctx, "docker", "run", "--rm", "-v", dir+":/v", "alpine:3.22", "sh", "-c", script).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%v: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 // cloneFile makes a copy-on-write clone when the filesystem supports it

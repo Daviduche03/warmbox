@@ -108,7 +108,10 @@ etcd) or object-store locks; the `catalog` package hides that behind an interfac
    create|list|rm` and `volume create --from-snapshot`; a snapshot is a frozen
    manifest, so create/restore-from is O(1) and shares all chunks. Memory
    checkpointing ("~100 ms anywhere") is blocked on macOS — see `docs/snapshots.md`.
-6. **Size as a parameter** — grow (truncate + `resize2fs`); honor `--size`.
+6. **Size as a parameter — grow-only ✅ landed.** `--size` is honored; a grow
+   resizes the image on the host (native `e2fsprogs`, or a Docker helper on
+   macOS) and rebuilds the manifest. Shrinking is refused; the floor is
+   `VOLUME_BASE_SIZE` (default 2G).
 
 ## Non-goals (for now)
 
