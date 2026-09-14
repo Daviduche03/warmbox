@@ -1,0 +1,25 @@
+# Compiled binaries
+/warmbox
+/runmesh
+*.exe
+*.test
+*.out
+
+# Guest image + local state (built by deploy/guest/build.sh)
+*.img
+*.squashfs
+*.zst
+initramfs-virt
+initramfs-overlay
+vmlinux
+.warmbox/
+
+# Local/agent scratch
+.context/
+
+# Python (noVNC/websockify venvs)
+.venv/
+__pycache__/
+
+# OS
+.DS_Store
