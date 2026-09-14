@@ -41,9 +41,9 @@ behind an env var so CI (which has no hypervisor) can skip it.
 
 ## High-leverage areas (help wanted)
 
-1. **Hypervisor `Backend` abstraction + a Linux backend** (KVM via Cloud
-   Hypervisor / QEMU / Firecracker). This is the single biggest unlock — today it
-   only runs on Apple Silicon. It also enables real memory snapshot/restore.
+1. **A Cloud Hypervisor / Firecracker Linux backend** (QEMU/KVM already works) —
+   for leaner boot and real memory snapshot/restore. The `Backend` interface in
+   `internal/desktop/backend.go` is the seam; see `docs/architecture.md`.
 2. **Exec / agent API** — run commands and move files without driving the screen.
 3. **WebRTC streaming** — replace noVNC/RFB for latency and bandwidth.
 4. **macOS VNC bridge** — replace the `/usr/bin/nc` fallback with a signed helper

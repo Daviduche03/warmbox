@@ -26,10 +26,12 @@ storage (S3/R2) and can be cloned or restored on another host.
 
 ## Requirements
 
-- An **Apple Silicon Mac** (uses `vfkit` / Apple's Virtualization.framework).
-- **Docker** (to build the guest image).
-- **Go 1.25+**.
-- `vfkit` — `brew install vfkit`.
+**Host** — one of:
+- **macOS on Apple Silicon**, with `vfkit` (`brew install vfkit`); or
+- **Linux with KVM** and `qemu-system-x86_64` / `qemu-system-aarch64` — run the
+  daemon with `--backend qemu`. Verified on x86_64 KVM.
+
+Plus: **Docker** (to build the guest image) and **Go 1.25+**.
 
 ## Quickstart
 
@@ -48,6 +50,11 @@ go build -o warmbox ./cmd/warmbox
 # 4. Provision a desktop; prints a URL to open in your browser.
 ./warmbox create
 ```
+
+On **Linux**, add `--backend qemu` to the daemon (KVM + `qemu-system-*`). QEMU's
+user-mode networking isn't reachable host→guest, so the backend forwards a host
+port to each guest's VNC; everything else is identical. Build the guest image for
+the host arch with `PLATFORM=linux/amd64 ./deploy/guest/build.sh`.
 
 Persistent volumes:
 
@@ -82,9 +89,10 @@ point `runmesh` at it and the daemon picks it up:
 | Persistent, cloud-backed volumes (chunked) | ✅ works |
 | Grow a volume (`--size`) | ✅ works (grow-only) |
 | Disk snapshots + clone | ✅ works |
+| Linux host (QEMU/KVM) | ✅ works (x86_64 verified) |
 | `warmbox-app` (menu apps) | 🟡 experimental |
 | Publish a guest port at a URL (`/p/<vm>/<port>/`) | 🟡 experimental |
-| Linux host (KVM/Cloud Hypervisor/QEMU) | ❌ not yet |
+| Linux host (Cloud Hypervisor / Firecracker) | ❌ not yet |
 | Windows host (WSL2) | ❌ not yet |
 | Exec / agent API (no screen) | ❌ not yet |
 | Memory snapshot / ~100 ms restore | ❌ blocked on macOS |
