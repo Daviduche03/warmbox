@@ -85,6 +85,10 @@ if [ "$HAVE_VOLUME" = "1" ]; then
     log "volume sync loop started"
 fi
 
+# --- agent API (host -> guest exec/files), localhost only ---
+/usr/local/bin/warmbox-agent >/var/log/warmbox-agent.log 2>&1 &
+log "warmbox-agent started"
+
 # --- optional virtiofs workspace share ---
 # The host can attach a directory with `--device virtio-fs,sharedDir=...,
 # mountTag=<tag>`; we mount it at /workspace so agents/editors in the guest see

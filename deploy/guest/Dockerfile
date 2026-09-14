@@ -17,6 +17,11 @@
 # fails inside a minimal microVM and aborts GTK apps (xfce4-panel, xfdesktop).
 # 3.22 uses gdk-pixbuf 2.42 + the classic librsvg pixbuf loader.
 
+FROM golang:1.25-alpine AS agentbuild
+WORKDIR /src
+COPY agent/ ./
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /warmbox-agent .
+
 FROM alpine:3.22
 
 ARG BROWSER=chromium
@@ -105,8 +110,9 @@ RUN set -eux; \
     fi; \
     rm -rf /themes
 
+COPY --from=agentbuild /warmbox-agent /usr/local/bin/warmbox-agent
 COPY init /init
-RUN chmod +x /init
+RUN chmod +x /init /usr/local/bin/warmbox-agent
 
 # Regenerate caches that the GUI stack needs at runtime.
 RUN update-mime-database /usr/share/mime 2>/dev/null || true

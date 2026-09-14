@@ -66,6 +66,9 @@ type Config struct {
 	// GuestVNCPort is the VNC port the guest listens on.
 	GuestVNCPort int
 
+	// AgentPort is the port warmbox-agent listens on inside the guest.
+	AgentPort int
+
 	// PoolSize is the number of pre-booted idle VMs kept warm.
 	PoolSize int
 
@@ -119,6 +122,7 @@ func DefaultConfig() *Config {
 		CPUs:              4,
 		Display:           "1280x800",
 		GuestVNCPort:      5900,
+		AgentPort:         7077,
 		PoolSize:          2,
 		ShareTag:          "workspace",
 		VolumeDir:         filepath.Join(wd, "volumes"),

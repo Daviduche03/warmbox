@@ -52,6 +52,14 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/desktops/{id}", s.get)
 	mux.HandleFunc("DELETE /api/desktops/{id}", s.destroy)
 
+	// Agent API: exec + files inside the guest (proxied to warmbox-agent).
+	mux.HandleFunc("POST /api/desktops/{id}/exec", s.agentExec)
+	mux.HandleFunc("GET /api/desktops/{id}/files", s.agentFiles)
+	mux.HandleFunc("GET /api/desktops/{id}/file", s.agentFileGet)
+	mux.HandleFunc("PUT /api/desktops/{id}/file", s.agentFilePut)
+	mux.HandleFunc("DELETE /api/desktops/{id}/file", s.agentFileDelete)
+	mux.HandleFunc("POST /api/desktops/{id}/file/move", s.agentFileMove)
+
 	// Volumes: portable, cloud-backed disks.
 	mux.HandleFunc("POST /api/volumes", s.volumeCreate)
 	mux.HandleFunc("GET /api/volumes", s.volumeList)
@@ -251,12 +259,62 @@ func (s *Server) websockify(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unknown desktop", http.StatusNotFound)
 		return
 	}
-	target := vm.VNCTarget(s.cfg.GuestVNCPort)
+	target := vm.Target(s.cfg.GuestVNCPort)
 	if target == "" {
 		http.Error(w, "desktop not ready", http.StatusServiceUnavailable)
 		return
 	}
 	vnc.Proxy(w, r, target)
+}
+
+// agentProxy forwards a request to warmbox-agent inside the guest, preserving
+// the method, body and query (the agent exposes /exec, /files, /file, ...).
+func (s *Server) agentProxy(w http.ResponseWriter, r *http.Request, id, agentPath string) {
+	vm, ok := s.mgr.Get(id)
+	if !ok {
+		http.Error(w, "unknown desktop", http.StatusNotFound)
+		return
+	}
+	target := vm.Target(s.cfg.AgentPort)
+	if target == "" {
+		http.Error(w, "desktop not ready", http.StatusServiceUnavailable)
+		return
+	}
+	u := &url.URL{Scheme: "http", Host: target, Path: agentPath, RawQuery: r.URL.RawQuery}
+	proxy := &httputil.ReverseProxy{
+		Director: func(req *http.Request) {
+			req.URL = u
+			req.Host = target
+		},
+		Transport: &http.Transport{
+			DialContext: func(_ context.Context, _, addr string) (net.Conn, error) {
+				return netutil.Dial(addr)
+			},
+		},
+		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, err error) {
+			http.Error(w, "agent error: "+err.Error(), http.StatusBadGateway)
+		},
+	}
+	proxy.ServeHTTP(w, r)
+}
+
+func (s *Server) agentExec(w http.ResponseWriter, r *http.Request) {
+	s.agentProxy(w, r, r.PathValue("id"), "/exec")
+}
+func (s *Server) agentFiles(w http.ResponseWriter, r *http.Request) {
+	s.agentProxy(w, r, r.PathValue("id"), "/files")
+}
+func (s *Server) agentFileGet(w http.ResponseWriter, r *http.Request) {
+	s.agentProxy(w, r, r.PathValue("id"), "/file")
+}
+func (s *Server) agentFilePut(w http.ResponseWriter, r *http.Request) {
+	s.agentProxy(w, r, r.PathValue("id"), "/file")
+}
+func (s *Server) agentFileDelete(w http.ResponseWriter, r *http.Request) {
+	s.agentProxy(w, r, r.PathValue("id"), "/file")
+}
+func (s *Server) agentFileMove(w http.ResponseWriter, r *http.Request) {
+	s.agentProxy(w, r, r.PathValue("id"), "/file/move")
 }
 
 // expose reverse-proxies an HTTP request to a port inside a guest, so a server

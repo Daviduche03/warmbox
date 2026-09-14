@@ -94,7 +94,8 @@ point `runmesh` at it and the daemon picks it up:
 | Publish a guest port at a URL (`/p/<vm>/<port>/`) | 🟡 experimental |
 | Linux host (Cloud Hypervisor / Firecracker) | ❌ not yet |
 | Windows host (WSL2) | ❌ not yet |
-| Exec / agent API (no screen) | ❌ not yet |
+| Agent API: exec + files | ✅ works |
+| Agent API: streaming + screenshot/input | ❌ not yet |
 | Memory snapshot / ~100 ms restore | ❌ blocked on macOS |
 | TLS / per-guest VNC auth | ❌ not yet |
 | GPU / audio | ❌ not supported |

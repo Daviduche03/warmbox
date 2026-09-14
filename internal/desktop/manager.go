@@ -141,14 +141,14 @@ func (m *Manager) start(id, volumeName, volumeImage string) (*VM, error) {
 	}
 
 	vm := &VM{
-		ID:      id,
-		State:   StateBooting,
-		Started: time.Now(),
-		Volume:  volumeName,
-		vncAddr: inst.VNCAddr,
-		cmd:     cmd,
-		dir:     dir,
-		ready:   make(chan struct{}),
+		ID:       id,
+		State:    StateBooting,
+		Started:  time.Now(),
+		Volume:   volumeName,
+		forwards: inst.Forwards,
+		cmd:      cmd,
+		dir:      dir,
+		ready:    make(chan struct{}),
 	}
 
 	m.mu.Lock()

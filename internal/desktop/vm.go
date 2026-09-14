@@ -26,12 +26,12 @@ type VM struct {
 	Started time.Time
 	Volume  string
 
-	vncAddr string
-	cmd     *exec.Cmd
-	dir     string
-	ready   chan struct{}
-	readyMu sync.Once
-	mu      sync.Mutex
+	forwards map[int]string
+	cmd      *exec.Cmd
+	dir      string
+	ready    chan struct{}
+	readyMu  sync.Once
+	mu       sync.Mutex
 }
 
 // Ready returns a channel closed once the guest reports readiness.
@@ -64,19 +64,19 @@ func (v *VM) IP() string {
 	return v.GuestIP
 }
 
-// VNCTarget returns the address to dial for the VM's VNC server: the
-// backend-provided forwarding address (e.g. a QEMU hostfwd port), or, when the
-// host can reach the guest directly (vfkit NAT), the guest IP + port.
-func (v *VM) VNCTarget(guestVNCPort int) string {
+// Target returns the address to dial for a guest port: a backend-provided
+// forwarding address (e.g. a QEMU hostfwd port), or, when the host can reach the
+// guest directly (vfkit NAT), the guest IP + port. Empty until the VM is ready.
+func (v *VM) Target(guestPort int) string {
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	if v.vncAddr != "" {
-		return v.vncAddr
+	if addr, ok := v.forwards[guestPort]; ok {
+		return addr
 	}
 	if v.GuestIP == "" {
 		return ""
 	}
-	return net.JoinHostPort(v.GuestIP, strconv.Itoa(guestVNCPort))
+	return net.JoinHostPort(v.GuestIP, strconv.Itoa(guestPort))
 }
 
 // Info is a serialisable snapshot of a VM (no locks, safe to copy).

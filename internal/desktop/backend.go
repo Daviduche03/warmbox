@@ -43,13 +43,13 @@ type LaunchSpec struct {
 	PidFile string
 }
 
-// Instance is a launched VM. VNCAddr is where the manager should dial the
-// guest's VNC server — empty means "use the guest IP reported at readiness"
-// (the vfkit/NAT case); set means the backend already provides a forwarding
-// hop (the QEMU user-networking case).
+// Instance is a launched VM. Forwards maps a guest port to a host dial address
+// (host:port) when the host cannot reach the guest directly (QEMU user
+// networking); when empty the manager dials the guest IP + guest port (vfkit
+// NAT). The VNC port (5900) and agent port (7077) are the ones used today.
 type Instance struct {
-	Cmd     *exec.Cmd
-	VNCAddr string
+	Cmd      *exec.Cmd
+	Forwards map[int]string
 }
 
 // Backend boots microVMs on a specific hypervisor. The manager owns the process
@@ -140,9 +140,13 @@ func (b *qemuBackend) Launch(spec LaunchSpec) (*Instance, error) {
 		bin = qemuSystemBinary()
 	}
 
-	// QEMU user networking can't be reached host->guest, so forward a host port
-	// to the guest's VNC server and tell the manager to dial that instead.
+	// QEMU user networking can't be reached host->guest, so forward host ports to
+	// the guest's VNC (5900) and agent (7077) servers and dial those instead.
 	vncPort, err := freePort()
+	if err != nil {
+		return nil, err
+	}
+	agentPort, err := freePort()
 	if err != nil {
 		return nil, err
 	}
@@ -162,7 +166,7 @@ func (b *qemuBackend) Launch(spec LaunchSpec) (*Instance, error) {
 		"-append", "console=ttyS0 " + spec.Cmdline,
 		"-serial", "file:" + spec.Console,
 		"-device", "virtio-rng-pci",
-		"-netdev", fmt.Sprintf("user,id=n0,hostfwd=tcp:127.0.0.1:%d-:5900", vncPort),
+		"-netdev", fmt.Sprintf("user,id=n0,hostfwd=tcp:127.0.0.1:%d-:5900,hostfwd=tcp:127.0.0.1:%d-:7077", vncPort, agentPort),
 		"-device", "virtio-net-pci,netdev=n0",
 	}
 	for i, d := range spec.Disks {
@@ -181,8 +185,11 @@ func (b *qemuBackend) Launch(spec LaunchSpec) (*Instance, error) {
 		args = append(args, "-pidfile", spec.PidFile)
 	}
 	return &Instance{
-		Cmd:     exec.Command(bin, args...),
-		VNCAddr: fmt.Sprintf("127.0.0.1:%d", vncPort),
+		Cmd: exec.Command(bin, args...),
+		Forwards: map[int]string{
+			5900: fmt.Sprintf("127.0.0.1:%d", vncPort),
+			7077: fmt.Sprintf("127.0.0.1:%d", agentPort),
+		},
 	}, nil
 }
 
