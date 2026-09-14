@@ -1,7 +1,9 @@
 package desktop
 
 import (
+	"net"
 	"os/exec"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -24,6 +26,7 @@ type VM struct {
 	Started time.Time
 	Volume  string
 
+	vncAddr string
 	cmd     *exec.Cmd
 	dir     string
 	ready   chan struct{}
@@ -59,6 +62,21 @@ func (v *VM) IP() string {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	return v.GuestIP
+}
+
+// VNCTarget returns the address to dial for the VM's VNC server: the
+// backend-provided forwarding address (e.g. a QEMU hostfwd port), or, when the
+// host can reach the guest directly (vfkit NAT), the guest IP + port.
+func (v *VM) VNCTarget(guestVNCPort int) string {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.vncAddr != "" {
+		return v.vncAddr
+	}
+	if v.GuestIP == "" {
+		return ""
+	}
+	return net.JoinHostPort(v.GuestIP, strconv.Itoa(guestVNCPort))
 }
 
 // Info is a serialisable snapshot of a VM (no locks, safe to copy).

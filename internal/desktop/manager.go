@@ -85,9 +85,13 @@ func (m *Manager) start(id, volumeName, volumeImage string) (*VM, error) {
 	overlayBoot := m.overlayAvailable()
 	diskBoot := !overlayBoot && m.diskAvailable()
 
+	hostAddr := m.backend.GuestHostAddr()
+	if hostAddr == "" {
+		hostAddr = m.cfg.HostAddr
+	}
 	cmdline := fmt.Sprintf(
-		"console=hvc0 warmbox.id=%s warmbox.host=%s warmbox.port=%s",
-		id, m.cfg.HostAddr, portOf(m.cfg.APIAddr),
+		"warmbox.id=%s warmbox.host=%s warmbox.port=%s",
+		id, hostAddr, portOf(m.cfg.APIAddr),
 	)
 	if m.cfg.ShareDir != "" && m.cfg.ShareTag != "" {
 		cmdline += " warmbox.share=" + m.cfg.ShareTag
@@ -127,10 +131,11 @@ func (m *Manager) start(id, volumeName, volumeImage string) (*VM, error) {
 		spec.Shares = append(spec.Shares, Share{Dir: m.cfg.ShareDir, Tag: m.cfg.ShareTag})
 	}
 
-	cmd, err := m.backend.Launch(spec)
+	inst, err := m.backend.Launch(spec)
 	if err != nil {
 		return nil, err
 	}
+	cmd := inst.Cmd
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("starting %s: %w", m.backend.Name(), err)
 	}
@@ -140,6 +145,7 @@ func (m *Manager) start(id, volumeName, volumeImage string) (*VM, error) {
 		State:   StateBooting,
 		Started: time.Now(),
 		Volume:  volumeName,
+		vncAddr: inst.VNCAddr,
 		cmd:     cmd,
 		dir:     dir,
 		ready:   make(chan struct{}),

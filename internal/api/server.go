@@ -251,12 +251,11 @@ func (s *Server) websockify(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unknown desktop", http.StatusNotFound)
 		return
 	}
-	ip := vm.IP()
-	if ip == "" {
+	target := vm.VNCTarget(s.cfg.GuestVNCPort)
+	if target == "" {
 		http.Error(w, "desktop not ready", http.StatusServiceUnavailable)
 		return
 	}
-	target := net.JoinHostPort(ip, strconv.Itoa(s.cfg.GuestVNCPort))
 	vnc.Proxy(w, r, target)
 }
 
