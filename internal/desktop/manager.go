@@ -15,8 +15,9 @@ import (
 
 // Manager boots and tracks guest microVMs.
 type Manager struct {
-	cfg *Config
-	log io.Writer
+	cfg     *Config
+	log     io.Writer
+	backend Backend
 
 	onDestroy func(*VM)
 
@@ -24,13 +25,21 @@ type Manager struct {
 	vms map[string]*VM
 }
 
-// NewManager creates a Manager.
+// NewManager creates a Manager using the backend named in cfg (default vfkit).
 func NewManager(cfg *Config, log io.Writer) *Manager {
 	if log == nil {
 		log = io.Discard
 	}
-	return &Manager{cfg: cfg, log: log, vms: map[string]*VM{}}
+	backend, err := newBackend(cfg.Backend, cfg.VfkitPath)
+	if err != nil {
+		fmt.Fprintf(log, "desktop: %v; using vfkit\n", err)
+		backend, _ = newBackend("vfkit", cfg.VfkitPath)
+	}
+	return &Manager{cfg: cfg, log: log, backend: backend, vms: map[string]*VM{}}
 }
+
+// Backend returns the manager's hypervisor backend.
+func (m *Manager) Backend() Backend { return m.backend }
 
 // SetOnDestroy registers a callback invoked for each VM as it is destroyed
 // (after the process has exited), e.g. to commit and release its volume.
@@ -67,7 +76,7 @@ func (m *Manager) start(id, volumeName, volumeImage string) (*VM, error) {
 	}
 
 	consolePath := filepath.Join(dir, "console.log")
-	pidPath := filepath.Join(dir, "vfkit.pid")
+	pidPath := filepath.Join(dir, "vm.pid")
 
 	// Boot mode selection:
 	//   overlay  - shared read-only squashfs base + tmpfs overlay (no per-VM copy)
@@ -75,13 +84,6 @@ func (m *Manager) start(id, volumeName, volumeImage string) (*VM, error) {
 	//   initramfs- the whole rootfs loaded into RAM
 	overlayBoot := m.overlayAvailable()
 	diskBoot := !overlayBoot && m.diskAvailable()
-	var diskPath string
-	if diskBoot {
-		diskPath = filepath.Join(dir, "rootfs.img")
-		if err := cloneFile(m.cfg.DiskPath, diskPath); err != nil {
-			return nil, fmt.Errorf("cloning rootfs image: %w", err)
-		}
-	}
 
 	cmdline := fmt.Sprintf(
 		"console=hvc0 warmbox.id=%s warmbox.host=%s warmbox.port=%s",
@@ -93,45 +95,44 @@ func (m *Manager) start(id, volumeName, volumeImage string) (*VM, error) {
 	if volumeImage != "" {
 		cmdline += " warmbox.volume=1"
 	}
-	initrd := m.cfg.InitrdPath
-	switch {
-	case overlayBoot:
-		initrd = m.cfg.OverlayInitrdPath
-	case diskBoot:
-		cmdline += " root=/dev/vda rootfstype=ext4 rootwait rw"
-		initrd = m.cfg.BootInitrdPath
-	}
 
-	args := []string{
-		"--cpus", fmt.Sprint(m.cfg.CPUs),
-		"--memory", fmt.Sprint(m.cfg.MemMiB),
-		"--kernel", m.cfg.KernelPath,
-		"--initrd", initrd,
-		"--kernel-cmdline", cmdline,
-		"--device", "virtio-serial,logFilePath=" + consolePath,
-		"--device", "virtio-net,nat",
-		"--device", "virtio-rng",
+	spec := LaunchSpec{
+		ID:      id,
+		CPUs:    m.cfg.CPUs,
+		MemMiB:  m.cfg.MemMiB,
+		Kernel:  m.cfg.KernelPath,
+		Cmdline: cmdline,
+		Console: consolePath,
+		PidFile: pidPath,
 	}
 	switch {
 	case overlayBoot:
-		args = append(args, "--device", "virtio-blk,path="+m.cfg.SquashPath+",readonly")
+		spec.Initrd = m.cfg.OverlayInitrdPath
+		spec.Disks = append(spec.Disks, Disk{Path: m.cfg.SquashPath, ReadOnly: true})
 	case diskBoot:
-		args = append(args, "--device", "virtio-blk,path="+diskPath)
-	}
-	if m.cfg.ShareDir != "" && m.cfg.ShareTag != "" {
-		args = append(args,
-			"--device",
-			"virtio-fs,sharedDir="+m.cfg.ShareDir+",mountTag="+m.cfg.ShareTag,
-		)
+		diskPath := filepath.Join(dir, "rootfs.img")
+		if err := cloneFile(m.cfg.DiskPath, diskPath); err != nil {
+			return nil, fmt.Errorf("cloning rootfs image: %w", err)
+		}
+		spec.Cmdline += " root=/dev/vda rootfstype=ext4 rootwait rw"
+		spec.Initrd = m.cfg.BootInitrdPath
+		spec.Disks = append(spec.Disks, Disk{Path: diskPath})
+	default:
+		spec.Initrd = m.cfg.InitrdPath
 	}
 	if volumeImage != "" {
-		args = append(args, "--device", "virtio-blk,path="+volumeImage)
+		spec.Disks = append(spec.Disks, Disk{Path: volumeImage})
 	}
-	args = append(args, "--pidfile", pidPath)
+	if m.cfg.ShareDir != "" && m.cfg.ShareTag != "" {
+		spec.Shares = append(spec.Shares, Share{Dir: m.cfg.ShareDir, Tag: m.cfg.ShareTag})
+	}
 
-	cmd := exec.Command(m.cfg.VfkitPath, args...)
+	cmd, err := m.backend.Launch(spec)
+	if err != nil {
+		return nil, err
+	}
 	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("starting vfkit: %w", err)
+		return nil, fmt.Errorf("starting %s: %w", m.backend.Name(), err)
 	}
 
 	vm := &VM{
@@ -148,7 +149,7 @@ func (m *Manager) start(id, volumeName, volumeImage string) (*VM, error) {
 	m.vms[id] = vm
 	m.mu.Unlock()
 
-	fmt.Fprintf(m.log, "desktop: booting vm %s (pid %d)\n", id, cmd.Process.Pid)
+	fmt.Fprintf(m.log, "desktop: booting vm %s via %s (pid %d)\n", id, m.backend.Name(), cmd.Process.Pid)
 
 	go func() {
 		err := cmd.Wait()

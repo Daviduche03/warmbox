@@ -20,8 +20,8 @@ import (
 	"runmesh/workspace/internal/desktop"
 	"runmesh/workspace/internal/netutil"
 	"runmesh/workspace/internal/pool"
-	"runmesh/workspace/internal/volume"
 	"runmesh/workspace/internal/vnc"
+	"runmesh/workspace/internal/volume"
 )
 
 // Server wires the manager, warm pool, volume store and VNC bridge into an

@@ -21,8 +21,8 @@ import (
 	"syscall"
 	"time"
 
-	rfs "github.com/rclone/rclone/fs"
 	_ "github.com/rclone/rclone/backend/all"
+	rfs "github.com/rclone/rclone/fs"
 
 	"runmesh/workspace/internal/api"
 	"runmesh/workspace/internal/catalog"
@@ -106,6 +106,7 @@ func addCommonFlags(fs *flag.FlagSet, cfg *desktop.Config) {
 	fs.StringVar(&cfg.OverlayInitrdPath, "overlay-initrd", cfg.OverlayInitrdPath, "boot initramfs for overlay boot")
 	fs.StringVar(&cfg.NoVNCDir, "novnc", cfg.NoVNCDir, "noVNC asset directory")
 	fs.StringVar(&cfg.VfkitPath, "vfkit", cfg.VfkitPath, "vfkit binary")
+	fs.StringVar(&cfg.Backend, "backend", cfg.Backend, "hypervisor backend (vfkit)")
 	fs.StringVar(&cfg.APIAddr, "addr", cfg.APIAddr, "HTTP listen address")
 	fs.StringVar(&cfg.HostAddr, "host", cfg.HostAddr, "address guests use to reach this host")
 	fs.UintVar(&cfg.MemMiB, "mem", cfg.MemMiB, "memory per VM (MiB)")

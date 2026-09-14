@@ -17,6 +17,9 @@ type Config struct {
 	// VfkitPath is the vfkit binary (Apple Virtualization.framework frontend).
 	VfkitPath string
 
+	// Backend selects the hypervisor backend (default "vfkit").
+	Backend string
+
 	// KernelPath is the uncompressed arm64 vmlinux.
 	KernelPath string
 
@@ -102,6 +105,7 @@ func DefaultConfig() *Config {
 	return &Config{
 		WorkDir:           wd,
 		VfkitPath:         "vfkit",
+		Backend:           "vfkit",
 		KernelPath:        filepath.Join(wd, "vmlinux"),
 		InitrdPath:        filepath.Join(wd, "initramfs.zst"),
 		BootInitrdPath:    filepath.Join(wd, "initramfs-virt"),

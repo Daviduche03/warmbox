@@ -7,8 +7,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	rfs "github.com/rclone/rclone/fs"
 	_ "github.com/rclone/rclone/backend/local"
+	rfs "github.com/rclone/rclone/fs"
 )
 
 func testRemote(t *testing.T) (rfs.Fs, string) {
