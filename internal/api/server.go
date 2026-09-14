@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httputil"
 	"net/url"
 	"strconv"
 	"strings"
@@ -17,6 +18,7 @@ import (
 
 	"runmesh/workspace/internal/catalog"
 	"runmesh/workspace/internal/desktop"
+	"runmesh/workspace/internal/netutil"
 	"runmesh/workspace/internal/pool"
 	"runmesh/workspace/internal/volume"
 	"runmesh/workspace/internal/vnc"
@@ -67,6 +69,9 @@ func (s *Server) Handler() http.Handler {
 
 	// WebSocket bridge to the guest VNC server.
 	mux.HandleFunc("GET /websockify/{id}", s.websockify)
+
+	// Publish a guest HTTP server (e.g. an agent-built dashboard) at a link.
+	mux.HandleFunc("GET /p/{id}/{port}/", s.expose)
 
 	// Static noVNC assets, one namespace per VM.
 	mux.HandleFunc("GET /vnc/{id}/", s.novnc)
@@ -253,6 +258,51 @@ func (s *Server) websockify(w http.ResponseWriter, r *http.Request) {
 	}
 	target := net.JoinHostPort(ip, strconv.Itoa(s.cfg.GuestVNCPort))
 	vnc.Proxy(w, r, target)
+}
+
+// expose reverse-proxies an HTTP request to a port inside a guest, so a server
+// an agent runs there (a dashboard, an app) can be opened and shared as a URL.
+// GET /p/<id>/<port>/... -> http://<guest-ip>:<port>/...
+func (s *Server) expose(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	port := r.PathValue("port")
+	vm, ok := s.mgr.Get(id)
+	if !ok {
+		http.Error(w, "unknown desktop", http.StatusNotFound)
+		return
+	}
+	ip := vm.IP()
+	if ip == "" {
+		http.Error(w, "desktop not ready", http.StatusServiceUnavailable)
+		return
+	}
+	if p, err := strconv.Atoi(port); err != nil || p <= 0 || p > 65535 {
+		http.Error(w, "invalid port", http.StatusBadRequest)
+		return
+	}
+	target := net.JoinHostPort(ip, port)
+	prefix := "/p/" + id + "/" + port
+
+	proxy := &httputil.ReverseProxy{
+		Director: func(req *http.Request) {
+			req.URL.Scheme = "http"
+			req.URL.Host = target
+			req.URL.Path = strings.TrimPrefix(req.URL.Path, prefix)
+			if req.URL.Path == "" {
+				req.URL.Path = "/"
+			}
+			req.Host = target
+		},
+		Transport: &http.Transport{
+			DialContext: func(_ context.Context, _, addr string) (net.Conn, error) {
+				return netutil.Dial(addr)
+			},
+		},
+		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, err error) {
+			http.Error(w, "proxy error: "+err.Error(), http.StatusBadGateway)
+		},
+	}
+	proxy.ServeHTTP(w, r)
 }
 
 func (s *Server) novnc(w http.ResponseWriter, r *http.Request) {

@@ -34,6 +34,7 @@ RUN set -eux; \
         iproute2 socat bash procps coreutils \
         kmod linux-virt \
         xmessage \
+        darkhttpd \
         curl zstd
 
 # Optional browser.
@@ -67,6 +68,7 @@ COPY apps /apps
 RUN set -eux; \
     install -m 0755 /apps/warmbox-app /usr/local/bin/warmbox-app; \
     /usr/local/bin/warmbox-app install /apps/sample; \
+    /usr/local/bin/warmbox-app install /apps/dashboard; \
     rm -rf /apps
 
 # Win11 hand-rolled theme (THEME=win11): a dark, centered bottom taskbar with a
