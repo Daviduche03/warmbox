@@ -48,7 +48,10 @@ behind an env var so CI (which has no hypervisor) can skip it.
 3. **WebRTC streaming** — replace noVNC/RFB for latency and bandwidth.
 4. **macOS VNC bridge** — replace the `/usr/bin/nc` fallback with a signed helper
    or a configurable bridge.
-5. **Tests** — API and lifecycle integration tests.
+5. **Windows** — a WSL2 setup guide, and/or a native QEMU **WHPX** backend
+   (`-accel whpx`; the current QEMU backend hardcodes KVM). Untested; see
+   `internal/desktop/backend.go`.
+6. **Tests** — API and lifecycle integration tests.
 
 ## Platform notes
 

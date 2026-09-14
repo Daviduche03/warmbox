@@ -140,10 +140,17 @@ docs/               architecture, volumes, snapshots, oss-positioning, vision
 
 ## Help wanted
 
-The highest-leverage things right now: a **hypervisor `Backend` abstraction +
-Linux backend** (KVM/Cloud Hypervisor/QEMU), an **exec/agent API**, **WebRTC**
-streaming, and dropping the macOS `/usr/bin/nc` VNC bridge for a signed helper.
-See `CONTRIBUTING.md`.
+- **Cloud Hypervisor / Firecracker backend** — leaner boot and real memory
+  snapshot/restore (the "~100 ms restore anywhere" story).
+- **Windows** — either a **WSL2 setup guide** (WSL2 is Linux + KVM, so it should
+  work as-is) or a native **WHPX** QEMU backend (`-accel whpx`). Unverified; the
+  seam is `internal/desktop/backend.go`.
+- **Exec / agent API** — run commands and move files without driving the screen.
+- **WebRTC streaming** — replace noVNC/RFB for latency and bandwidth.
+- **macOS VNC bridge** — replace the `/usr/bin/nc` fallback with a signed helper.
+- **Tests** — API and VM lifecycle integration tests.
+
+See [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ## License
 
