@@ -46,6 +46,33 @@ type Config struct {
 	// and layers a tmpfs overlay on top (see deploy/guest/overlay-init).
 	OverlayInitrdPath string
 
+	// Image selects the guest boot profile: "overlay", "disk", "initramfs" or
+	// "efi". Empty picks the best available (overlay > disk > initramfs).
+	// "efi" boots a full EFI disk via firmware and ignores Kernel/Initrd.
+	Image string
+
+	// EFIDisk is a full EFI-bootable disk image (e.g. an installed Omarchy
+	// disk) used when Image is "efi". Every VM boots its own clone.
+	EFIDisk string
+
+	// EFIVars is an optional seed EFI variable store copied into each VM. An
+	// EFI install often keeps its boot entry only in NVRAM, so a fresh store
+	// may not find anything to boot; seeding from the machine that installed
+	// the disk fixes that.
+	EFIVars string
+
+	// GPU, when non-empty (e.g. "1440x900"), attaches a virtio-gpu device so a
+	// Wayland compositor in the guest has an output to render to. Empty leaves
+	// the guest headless (the default image streams Xvnc over VNC).
+	GPU string
+
+	// Input attaches virtio keyboard and pointing devices to the guest.
+	Input bool
+
+	// GUI opens the hypervisor's native window (vfkit --gui). A bring-up aid
+	// for image guests; normal operation streams over VNC.
+	GUI bool
+
 	// NoVNCDir is a directory containing the noVNC static assets.
 	NoVNCDir string
 

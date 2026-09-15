@@ -5,6 +5,8 @@ import (
 	"net"
 	"os/exec"
 	"runtime"
+	"strconv"
+	"strings"
 )
 
 // Caps describes what a hypervisor backend can do.
@@ -37,6 +39,16 @@ type LaunchSpec struct {
 	Kernel  string
 	Initrd  string
 	Cmdline string
+	// EFI boots via firmware from the first disk (vfkit --bootloader efi),
+	// ignoring Kernel/Initrd/Cmdline. EFIVars is the per-VM variable store
+	// path; a fresh store is created when the file is missing.
+	EFI     bool
+	EFIVars string
+	// Display, when non-empty ("1440x900"), attaches a virtio-gpu device so a
+	// Wayland compositor in the guest has an output to render to. Input adds
+	// virtio keyboard and pointing devices.
+	Display string
+	Input   bool
 	Disks   []Disk
 	Shares  []Share
 	Console string // serial console log path
@@ -65,14 +77,14 @@ type Backend interface {
 }
 
 // newBackend returns the named backend. vfkit (macOS) and qemu (Linux) exist.
-func newBackend(name, vfkitPath string) (Backend, error) {
-	switch name {
+func newBackend(cfg *Config) (Backend, error) {
+	switch cfg.Backend {
 	case "", "vfkit":
-		return &vfkitBackend{path: vfkitPath}, nil
+		return &vfkitBackend{path: cfg.VfkitPath, gui: cfg.GUI}, nil
 	case "qemu":
 		return &qemuBackend{}, nil
 	default:
-		return nil, fmt.Errorf("unknown backend %q (supported: vfkit, qemu)", name)
+		return nil, fmt.Errorf("unknown backend %q (supported: vfkit, qemu)", cfg.Backend)
 	}
 }
 
@@ -80,6 +92,7 @@ func newBackend(name, vfkitPath string) (Backend, error) {
 
 type vfkitBackend struct {
 	path string // vfkit binary; empty => "vfkit" from PATH
+	gui  bool   // open the native window (bring-up aid)
 }
 
 func (b *vfkitBackend) Name() string          { return "vfkit" }
@@ -94,12 +107,33 @@ func (b *vfkitBackend) Launch(spec LaunchSpec) (*Instance, error) {
 	args := []string{
 		"--cpus", fmt.Sprint(spec.CPUs),
 		"--memory", fmt.Sprint(spec.MemMiB),
-		"--kernel", spec.Kernel,
-		"--initrd", spec.Initrd,
-		"--kernel-cmdline", "console=hvc0 " + spec.Cmdline,
-		"--device", "virtio-serial,logFilePath=" + spec.Console,
+	}
+	if spec.EFI {
+		args = append(args, "--bootloader", "efi,variable-store="+spec.EFIVars+",create")
+	} else {
+		args = append(args,
+			"--kernel", spec.Kernel,
+			"--initrd", spec.Initrd,
+			"--kernel-cmdline", "console=hvc0 "+spec.Cmdline,
+		)
+	}
+	args = append(args,
+		"--device", "virtio-serial,logFilePath="+spec.Console,
 		"--device", "virtio-net,nat",
 		"--device", "virtio-rng",
+	)
+	if spec.Display != "" {
+		w, h, err := parseDisplay(spec.Display)
+		if err != nil {
+			return nil, err
+		}
+		args = append(args, "--device", fmt.Sprintf("virtio-gpu,width=%d,height=%d", w, h))
+	}
+	if spec.Input {
+		args = append(args,
+			"--device", "virtio-input,keyboard",
+			"--device", "virtio-input,pointing",
+		)
 	}
 	for _, d := range spec.Disks {
 		dev := "virtio-blk,path=" + d.Path
@@ -114,7 +148,27 @@ func (b *vfkitBackend) Launch(spec LaunchSpec) (*Instance, error) {
 	if spec.PidFile != "" {
 		args = append(args, "--pidfile", spec.PidFile)
 	}
+	if b.gui {
+		args = append(args, "--gui")
+	}
 	return &Instance{Cmd: exec.Command(bin, args...)}, nil
+}
+
+// parseDisplay splits a "WIDTHxHEIGHT" string.
+func parseDisplay(s string) (int, int, error) {
+	parts := strings.SplitN(strings.ToLower(s), "x", 2)
+	if len(parts) != 2 {
+		return 0, 0, fmt.Errorf("bad display %q (want WIDTHxHEIGHT, e.g. 1440x900)", s)
+	}
+	w, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return 0, 0, fmt.Errorf("bad display width in %q", s)
+	}
+	h, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return 0, 0, fmt.Errorf("bad display height in %q", s)
+	}
+	return w, h, nil
 }
 
 // --- QEMU (KVM, Linux) ---
@@ -135,6 +189,9 @@ func qemuSystemBinary() string {
 }
 
 func (b *qemuBackend) Launch(spec LaunchSpec) (*Instance, error) {
+	if spec.EFI {
+		return nil, fmt.Errorf("efi boot is not supported on the qemu backend yet (needs OVMF)")
+	}
 	bin := b.path
 	if bin == "" {
 		bin = qemuSystemBinary()

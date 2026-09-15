@@ -104,6 +104,12 @@ func addCommonFlags(fs *flag.FlagSet, cfg *desktop.Config) {
 	fs.StringVar(&cfg.BootInitrdPath, "boot-initrd", cfg.BootInitrdPath, "Alpine boot initramfs for disk boot")
 	fs.StringVar(&cfg.SquashPath, "squash", cfg.SquashPath, "shared read-only squashfs base for overlay boot")
 	fs.StringVar(&cfg.OverlayInitrdPath, "overlay-initrd", cfg.OverlayInitrdPath, "boot initramfs for overlay boot")
+	fs.StringVar(&cfg.Image, "image", cfg.Image, "guest boot profile: overlay|disk|initramfs|efi (empty = auto)")
+	fs.StringVar(&cfg.EFIDisk, "efi-disk", cfg.EFIDisk, "EFI-bootable disk image (e.g. an installed Omarchy disk) for --image efi")
+	fs.StringVar(&cfg.EFIVars, "efi-vars", cfg.EFIVars, "seed EFI variable store copied per VM (from the installing machine)")
+	fs.StringVar(&cfg.GPU, "gpu", cfg.GPU, "virtio-gpu size, e.g. 1440x900 (empty = headless)")
+	fs.BoolVar(&cfg.Input, "input", cfg.Input, "attach virtio keyboard/pointing devices")
+	fs.BoolVar(&cfg.GUI, "gui", cfg.GUI, "open the hypervisor window (vfkit only; bring-up aid)")
 	fs.StringVar(&cfg.NoVNCDir, "novnc", cfg.NoVNCDir, "noVNC asset directory")
 	fs.StringVar(&cfg.VfkitPath, "vfkit", cfg.VfkitPath, "vfkit binary")
 	fs.StringVar(&cfg.Backend, "backend", cfg.Backend, "hypervisor backend (vfkit)")
@@ -131,14 +137,23 @@ func cmdDaemon(args []string) {
 		fatal("Error: %v", err)
 	}
 	if _, err := os.Stat(cfg.KernelPath); err != nil {
-		fatal("missing guest kernel %s — build it with ./deploy/guest/build.sh", cfg.KernelPath)
+		// EFI-booting images carry their own kernel in the disk.
+		if cfg.Image != "efi" {
+			fatal("missing guest kernel %s — build it with ./deploy/guest/build.sh", cfg.KernelPath)
+		}
 	}
-	// Boot needs an overlay base, an ext4 disk, or the all-RAM initramfs.
-	haveOverlay := stat(cfg.SquashPath) && stat(cfg.OverlayInitrdPath)
-	haveDisk := stat(cfg.DiskPath) && stat(cfg.BootInitrdPath)
-	if !haveOverlay && !haveDisk && !stat(cfg.InitrdPath) {
-		fatal("missing guest rootfs — run ./deploy/guest/build.sh (need %s + %s, %s + %s, or %s)",
-			cfg.SquashPath, cfg.OverlayInitrdPath, cfg.DiskPath, cfg.BootInitrdPath, cfg.InitrdPath)
+	if cfg.Image == "efi" {
+		if !stat(cfg.EFIDisk) {
+			fatal("image efi needs --efi-disk pointing at an installed EFI disk")
+		}
+	} else {
+		// Boot needs an overlay base, an ext4 disk, or the all-RAM initramfs.
+		haveOverlay := stat(cfg.SquashPath) && stat(cfg.OverlayInitrdPath)
+		haveDisk := stat(cfg.DiskPath) && stat(cfg.BootInitrdPath)
+		if !haveOverlay && !haveDisk && !stat(cfg.InitrdPath) {
+			fatal("missing guest rootfs — run ./deploy/guest/build.sh (need %s + %s, %s + %s, or %s)",
+				cfg.SquashPath, cfg.OverlayInitrdPath, cfg.DiskPath, cfg.BootInitrdPath, cfg.InitrdPath)
+		}
 	}
 
 	mgr := desktop.NewManager(cfg, os.Stderr)
