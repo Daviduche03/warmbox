@@ -93,13 +93,13 @@ func (m *Manager) start(id, volumeName, volumeImage, imageName string) (*VM, err
 		meta             ImageMeta
 	)
 	switch {
-	case imageName != "":
+	case imageName != "" && !isBuiltinImage(imageName):
 		d, v, mm, err := m.resolveImage(imageName)
 		if err != nil {
 			return nil, err
 		}
 		efiDisk, efiVars, meta = d, v, mm
-	case m.cfg.EFIDisk != "":
+	case !isBuiltinImage(imageName) && m.cfg.EFIDisk != "":
 		efiDisk, efiVars = m.cfg.EFIDisk, m.cfg.EFIVars
 	}
 
@@ -182,6 +182,7 @@ func (m *Manager) start(id, volumeName, volumeImage, imageName string) (*VM, err
 		}
 		spec.Shares = append(spec.Shares, Share{Dir: cfgDir, Tag: "warmbox-config"})
 	case m.overlayAvailable():
+		spec.Kernel = m.cfg.KernelPath
 		spec.Cmdline = cmdline
 		spec.Initrd = m.cfg.OverlayInitrdPath
 		spec.Disks = append(spec.Disks, Disk{Path: m.cfg.SquashPath, ReadOnly: true})

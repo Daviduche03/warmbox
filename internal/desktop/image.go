@@ -17,23 +17,53 @@ type ImageMeta struct {
 	Input  bool   `json:"input"`   // attach virtio keyboard/pointing
 }
 
-// Images lists the named images available under cfg.ImageDir.
+// BuiltinImage is the reserved name of the built-in image (the Alpine + XFCE
+// desktop built by deploy/guest/build.sh). "xfce" and "alpine" are aliases.
+const BuiltinImage = "default"
+
+// isBuiltinImage reports whether a name refers to the built-in image.
+func isBuiltinImage(name string) bool {
+	switch name {
+	case "", BuiltinImage, "xfce", "alpine":
+		return true
+	}
+	return false
+}
+
+// builtinAvailable reports whether the built-in image's artifacts exist.
+func (m *Manager) builtinAvailable() bool {
+	if m.overlayAvailable() || m.diskAvailable() {
+		return true
+	}
+	if m.cfg.InitrdPath == "" {
+		return false
+	}
+	_, err := os.Stat(m.cfg.InitrdPath)
+	return err == nil
+}
+
+// Images lists the images the daemon can boot: the built-in image (when its
+// artifacts exist) followed by the named images under cfg.ImageDir.
 func (m *Manager) Images() []string {
+	var out []string
+	if m.builtinAvailable() {
+		out = append(out, BuiltinImage)
+	}
 	entries, err := os.ReadDir(m.cfg.ImageDir)
 	if err != nil {
-		return nil
+		return out
 	}
-	var out []string
+	var named []string
 	for _, e := range entries {
 		if !e.IsDir() {
 			continue
 		}
 		if _, err := os.Stat(filepath.Join(m.cfg.ImageDir, e.Name(), "disk.raw")); err == nil {
-			out = append(out, e.Name())
+			named = append(named, e.Name())
 		}
 	}
-	sort.Strings(out)
-	return out
+	sort.Strings(named)
+	return append(out, named...)
 }
 
 // resolveImage returns the EFI disk and optional variable-store seed for a

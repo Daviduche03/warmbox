@@ -3,7 +3,9 @@ package desktop
 import (
 	"fmt"
 	"net"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -151,7 +153,15 @@ func (b *vfkitBackend) Launch(spec LaunchSpec) (*Instance, error) {
 	if b.gui {
 		args = append(args, "--gui")
 	}
-	return &Instance{Cmd: exec.Command(bin, args...)}, nil
+	cmd := exec.Command(bin, args...)
+	// Keep vfkit's own diagnostics with the VM (next to the guest serial log)
+	// rather than dropping them or spamming the daemon.
+	if spec.Console != "" {
+		if f, err := os.OpenFile(filepath.Join(filepath.Dir(spec.Console), "vfkit.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644); err == nil {
+			cmd.Stderr = f
+		}
+	}
+	return &Instance{Cmd: cmd}, nil
 }
 
 // parseDisplay splits a "WIDTHxHEIGHT" string.
