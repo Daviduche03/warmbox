@@ -1,0 +1,16 @@
+[Unit]
+Description=warmbox guest agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/warmbox-agent
+Environment=WARMBOX_AGENT_ADDR=0.0.0.0:7077
+Environment=WARMBOX_AGENT_ROOT=/
+Restart=always
+RestartSec=2
+User=root
+
+[Install]
+WantedBy=multi-user.target

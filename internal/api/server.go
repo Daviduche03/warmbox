@@ -48,6 +48,7 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("POST /api/desktops", s.create)
+	mux.HandleFunc("GET /api/images", s.images)
 	mux.HandleFunc("GET /api/desktops", s.list)
 	mux.HandleFunc("GET /api/desktops/{id}", s.get)
 	mux.HandleFunc("DELETE /api/desktops/{id}", s.destroy)
@@ -138,12 +139,17 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Volume string `json:"volume"`
+		Image  string `json:"image"`
 	}
 	if r.Body != nil {
 		_ = json.NewDecoder(r.Body).Decode(&req)
 	}
 	if req.Volume != "" {
 		s.createWithVolume(w, r, req.Volume)
+		return
+	}
+	if req.Image != "" {
+		s.createImage(w, r, req.Image)
 		return
 	}
 
@@ -158,6 +164,36 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 		"vnc": "/vnc/" + vm.ID + "/vnc.html?autoconnect=1&resize=scale&path=/websockify/" + vm.ID + s.tokenSuffix(),
 		"ws":  "/websockify/" + vm.ID,
 	})
+}
+
+// createImage cold-boots a desktop from a named image (e.g. "omarchy"). Named
+// images cannot come from the warm pool (each is a different disk), so they
+// boot on demand.
+func (s *Server) createImage(w http.ResponseWriter, r *http.Request, name string) {
+	id := desktop.NewID()
+	vm, err := s.mgr.StartImage(id, "", "", name)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	s.recordDesktop(id, "", "booting", "", 0)
+	wctx, cancel := context.WithTimeout(r.Context(), 120*time.Second)
+	defer cancel()
+	if _, err := s.mgr.WaitReady(wctx, vm.ID); err != nil {
+		_ = s.mgr.Destroy(vm.ID)
+		writeJSON(w, http.StatusGatewayTimeout, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"id":  vm.ID,
+		"vnc": "/vnc/" + vm.ID + "/vnc.html?autoconnect=1&resize=scale&path=/websockify/" + vm.ID + s.tokenSuffix(),
+		"ws":  "/websockify/" + vm.ID,
+	})
+}
+
+// images lists the guest images the daemon can boot.
+func (s *Server) images(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{"images": s.mgr.Images()})
 }
 
 // createWithVolume boots a VM whose writable layer is a persistent volume.

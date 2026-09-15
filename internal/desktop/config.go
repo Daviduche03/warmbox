@@ -46,13 +46,18 @@ type Config struct {
 	// and layers a tmpfs overlay on top (see deploy/guest/overlay-init).
 	OverlayInitrdPath string
 
-	// Image selects the guest boot profile: "overlay", "disk", "initramfs" or
-	// "efi". Empty picks the best available (overlay > disk > initramfs).
-	// "efi" boots a full EFI disk via firmware and ignores Kernel/Initrd.
+	// Image names the default guest image to boot when a caller does not ask
+	// for one explicitly. Names resolve under ImageDir. Empty falls back to
+	// the built-in image (overlay > disk > initramfs), or to EFIDisk when set.
 	Image string
 
-	// EFIDisk is a full EFI-bootable disk image (e.g. an installed Omarchy
-	// disk) used when Image is "efi". Every VM boots its own clone.
+	// ImageDir is where named guest images live: <ImageDir>/<name>/ containing
+	// disk.raw (an EFI-bootable disk), an optional efi-vars.fd seed, and an
+	// optional meta.json ({"gpu","mem_mib","cpus","input"}).
+	ImageDir string
+
+	// EFIDisk is a full EFI-bootable disk image used when Image is empty (a
+	// legacy anonymous EFI image). Every VM boots its own clone.
 	EFIDisk string
 
 	// EFIVars is an optional seed EFI variable store copied into each VM. An
@@ -142,6 +147,7 @@ func DefaultConfig() *Config {
 		DiskPath:          filepath.Join(wd, "rootfs.img"),
 		SquashPath:        filepath.Join(wd, "rootfs.squashfs"),
 		OverlayInitrdPath: filepath.Join(wd, "initramfs-overlay"),
+		ImageDir:          filepath.Join(wd, "images"),
 		NoVNCDir:          filepath.Join(wd, "novnc"),
 		HostAddr:          "192.168.64.1",
 		APIAddr:           ":7070",

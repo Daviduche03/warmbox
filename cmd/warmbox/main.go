@@ -44,6 +44,8 @@ func main() {
 		cmdSetup(os.Args[2:])
 	case "create":
 		cmdCreate(os.Args[2:])
+	case "images":
+		cmdImages(os.Args[2:])
 	case "list":
 		cmdList(os.Args[2:])
 	case "destroy":
@@ -65,6 +67,7 @@ Usage:
   warmbox daemon            Run the orchestrator (warm pool + REST API)
   warmbox setup             Check host prerequisites, fetch noVNC
   warmbox create            Provision a desktop, print its noVNC URL
+  warmbox images            List the named guest images the daemon can boot
   warmbox list              List desktops
   warmbox destroy <id>      Destroy a desktop
 
@@ -104,9 +107,10 @@ func addCommonFlags(fs *flag.FlagSet, cfg *desktop.Config) {
 	fs.StringVar(&cfg.BootInitrdPath, "boot-initrd", cfg.BootInitrdPath, "Alpine boot initramfs for disk boot")
 	fs.StringVar(&cfg.SquashPath, "squash", cfg.SquashPath, "shared read-only squashfs base for overlay boot")
 	fs.StringVar(&cfg.OverlayInitrdPath, "overlay-initrd", cfg.OverlayInitrdPath, "boot initramfs for overlay boot")
-	fs.StringVar(&cfg.Image, "image", cfg.Image, "guest boot profile: overlay|disk|initramfs|efi (empty = auto)")
-	fs.StringVar(&cfg.EFIDisk, "efi-disk", cfg.EFIDisk, "EFI-bootable disk image (e.g. an installed Omarchy disk) for --image efi")
-	fs.StringVar(&cfg.EFIVars, "efi-vars", cfg.EFIVars, "seed EFI variable store copied per VM (from the installing machine)")
+	fs.StringVar(&cfg.Image, "image", cfg.Image, "default guest image name to warm (empty = built-in)")
+	fs.StringVar(&cfg.ImageDir, "image-dir", cfg.ImageDir, "directory of named guest images (disk.raw + efi-vars.fd + meta.json)")
+	fs.StringVar(&cfg.EFIDisk, "efi-disk", cfg.EFIDisk, "legacy anonymous EFI disk image (when no named image is used)")
+	fs.StringVar(&cfg.EFIVars, "efi-vars", cfg.EFIVars, "seed EFI variable store copied per VM")
 	fs.StringVar(&cfg.GPU, "gpu", cfg.GPU, "virtio-gpu size, e.g. 1440x900 (empty = headless)")
 	fs.BoolVar(&cfg.Input, "input", cfg.Input, "attach virtio keyboard/pointing devices")
 	fs.BoolVar(&cfg.GUI, "gui", cfg.GUI, "open the hypervisor window (vfkit only; bring-up aid)")
@@ -136,17 +140,15 @@ func cmdDaemon(args []string) {
 	if err := cfg.EnsureDirs(); err != nil {
 		fatal("Error: %v", err)
 	}
-	if _, err := os.Stat(cfg.KernelPath); err != nil {
-		// EFI-booting images carry their own kernel in the disk.
-		if cfg.Image != "efi" {
+	mgr := desktop.NewManager(cfg, os.Stderr)
+	images := mgr.Images()
+
+	// Named images (and a legacy --efi-disk) carry their own kernel, so the
+	// built-in guest artifacts are only required when there is no image.
+	if len(images) == 0 && cfg.EFIDisk == "" {
+		if _, err := os.Stat(cfg.KernelPath); err != nil {
 			fatal("missing guest kernel %s — build it with ./deploy/guest/build.sh", cfg.KernelPath)
 		}
-	}
-	if cfg.Image == "efi" {
-		if !stat(cfg.EFIDisk) {
-			fatal("image efi needs --efi-disk pointing at an installed EFI disk")
-		}
-	} else {
 		// Boot needs an overlay base, an ext4 disk, or the all-RAM initramfs.
 		haveOverlay := stat(cfg.SquashPath) && stat(cfg.OverlayInitrdPath)
 		haveDisk := stat(cfg.DiskPath) && stat(cfg.BootInitrdPath)
@@ -154,9 +156,13 @@ func cmdDaemon(args []string) {
 			fatal("missing guest rootfs — run ./deploy/guest/build.sh (need %s + %s, %s + %s, or %s)",
 				cfg.SquashPath, cfg.OverlayInitrdPath, cfg.DiskPath, cfg.BootInitrdPath, cfg.InitrdPath)
 		}
+	} else if len(images) > 0 {
+		fmt.Fprintf(os.Stderr, "warmbox: images: %v\n", images)
+		if cfg.Image != "" && !stat(filepath.Join(cfg.ImageDir, cfg.Image, "disk.raw")) {
+			fatal("default image %q not found under %s", cfg.Image, cfg.ImageDir)
+		}
 	}
 
-	mgr := desktop.NewManager(cfg, os.Stderr)
 	p := pool.New(mgr, cfg.PoolSize, os.Stderr)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -395,15 +401,24 @@ func cmdCreate(args []string) {
 	addr := ":7070"
 	token := tokenDefault()
 	vol := ""
+	image := ""
 	fs := flag.NewFlagSet("create", flag.ExitOnError)
 	fs.StringVar(&addr, "addr", addr, "daemon API address")
 	fs.StringVar(&token, "token", token, "daemon token (default $WARMBOX_TOKEN)")
 	fs.StringVar(&vol, "volume", "", "attach a persistent volume by name")
+	fs.StringVar(&image, "image", "", "boot from a named image (e.g. omarchy)")
 	_ = fs.Parse(args)
 
-	var body io.Reader
+	req := map[string]string{}
 	if vol != "" {
-		b, _ := json.Marshal(map[string]string{"volume": vol})
+		req["volume"] = vol
+	}
+	if image != "" {
+		req["image"] = image
+	}
+	var body io.Reader
+	if len(req) > 0 {
+		b, _ := json.Marshal(req)
 		body = strings.NewReader(string(b))
 	}
 	resp, err := http.Post(withToken(apiBase(addr)+"/api/desktops", token), "application/json", body)
@@ -423,6 +438,34 @@ func cmdCreate(args []string) {
 	}
 	fmt.Fprintf(os.Stderr, "desktop %s ready\n", out.ID)
 	fmt.Printf("%s%s\n", apiBase(addr), out.VNC)
+}
+
+func cmdImages(args []string) {
+	addr := ":7070"
+	token := tokenDefault()
+	fs := flag.NewFlagSet("images", flag.ExitOnError)
+	fs.StringVar(&addr, "addr", addr, "daemon API address")
+	fs.StringVar(&token, "token", token, "daemon token (default $WARMBOX_TOKEN)")
+	_ = fs.Parse(args)
+
+	resp, err := http.Get(withToken(apiBase(addr)+"/api/images", token))
+	if err != nil {
+		fatal("Error: %v", err)
+	}
+	defer resp.Body.Close()
+	var out struct {
+		Images []string `json:"images"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		fatal("Error decoding response: %v", err)
+	}
+	if len(out.Images) == 0 {
+		fmt.Fprintln(os.Stderr, "(no named images)")
+		return
+	}
+	for _, n := range out.Images {
+		fmt.Println(n)
+	}
 }
 
 func cmdList(args []string) {

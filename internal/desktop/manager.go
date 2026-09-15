@@ -56,18 +56,24 @@ func NewID() string {
 	return hex.EncodeToString(b)
 }
 
-// Start launches a new microVM and returns it (state = booting). Callers wait
-// for readiness with WaitReady. The writable layer is ephemeral (tmpfs).
-func (m *Manager) Start(id string) (*VM, error) { return m.start(id, "", "") }
+// Start launches a new microVM from the default image and returns it (state =
+// booting). Callers wait for readiness with WaitReady.
+func (m *Manager) Start(id string) (*VM, error) { return m.start(id, "", "", m.cfg.Image) }
 
 // StartWithVolume launches a microVM whose writable layer is the given volume
 // image (a raw ext4 disk) attached read-write as /dev/vdb. volumeName names it
 // for later commit/release.
 func (m *Manager) StartWithVolume(id, volumeName, image string) (*VM, error) {
-	return m.start(id, volumeName, image)
+	return m.start(id, volumeName, image, m.cfg.Image)
 }
 
-func (m *Manager) start(id, volumeName, volumeImage string) (*VM, error) {
+// StartImage launches a microVM from a named image under cfg.ImageDir,
+// optionally attached to a persistent volume.
+func (m *Manager) StartImage(id, volumeName, volumeImage, imageName string) (*VM, error) {
+	return m.start(id, volumeName, volumeImage, imageName)
+}
+
+func (m *Manager) start(id, volumeName, volumeImage, imageName string) (*VM, error) {
 	if id == "" {
 		id = NewID()
 	}
@@ -79,21 +85,38 @@ func (m *Manager) start(id, volumeName, volumeImage string) (*VM, error) {
 	consolePath := filepath.Join(dir, "console.log")
 	pidPath := filepath.Join(dir, "vm.pid")
 
-	// Boot mode selection:
-	//   overlay  - shared read-only squashfs base + tmpfs overlay (no per-VM copy)
-	//   disk     - per-VM clone of an ext4 image
-	//   initramfs- the whole rootfs loaded into RAM
-	//   efi      - per-VM clone of a full EFI-bootable disk, booted via firmware
-	mode := m.cfg.Image
-	if mode == "" {
-		switch {
-		case m.overlayAvailable():
-			mode = "overlay"
-		case m.diskAvailable():
-			mode = "disk"
-		default:
-			mode = "initramfs"
+	// Resolve the boot image. A named image (under ImageDir) or an EFIDisk
+	// boots as a full EFI disk; otherwise fall back to the built-in image
+	// (overlay > disk > initramfs).
+	var (
+		efiDisk, efiVars string
+		meta             ImageMeta
+	)
+	switch {
+	case imageName != "":
+		d, v, mm, err := m.resolveImage(imageName)
+		if err != nil {
+			return nil, err
 		}
+		efiDisk, efiVars, meta = d, v, mm
+	case m.cfg.EFIDisk != "":
+		efiDisk, efiVars = m.cfg.EFIDisk, m.cfg.EFIVars
+	}
+
+	// Per-image overrides win over the daemon defaults.
+	cpus, mem := m.cfg.CPUs, m.cfg.MemMiB
+	display, input := m.cfg.GPU, m.cfg.Input
+	if meta.CPUs > 0 {
+		cpus = meta.CPUs
+	}
+	if meta.MemMiB > 0 {
+		mem = meta.MemMiB
+	}
+	if meta.GPU != "" {
+		display = meta.GPU
+	}
+	if meta.Input {
+		input = true
 	}
 
 	hostAddr := m.backend.GuestHostAddr()
@@ -113,30 +136,27 @@ func (m *Manager) start(id, volumeName, volumeImage string) (*VM, error) {
 
 	spec := LaunchSpec{
 		ID:      id,
-		CPUs:    m.cfg.CPUs,
-		MemMiB:  m.cfg.MemMiB,
+		CPUs:    cpus,
+		MemMiB:  mem,
 		Console: consolePath,
 		PidFile: pidPath,
-		Display: m.cfg.GPU,
-		Input:   m.cfg.Input,
+		Display: display,
+		Input:   input,
 	}
-	switch mode {
-	case "efi":
-		if m.cfg.EFIDisk == "" {
-			return nil, fmt.Errorf("image %q requires --efi-disk", mode)
-		}
-		if _, err := os.Stat(m.cfg.EFIDisk); err != nil {
-			return nil, fmt.Errorf("efi disk %s: %w", m.cfg.EFIDisk, err)
+	switch {
+	case efiDisk != "":
+		if _, err := os.Stat(efiDisk); err != nil {
+			return nil, fmt.Errorf("efi disk %s: %w", efiDisk, err)
 		}
 		diskPath := filepath.Join(dir, "disk.raw")
-		if err := cloneFile(m.cfg.EFIDisk, diskPath); err != nil {
+		if err := cloneFile(efiDisk, diskPath); err != nil {
 			return nil, fmt.Errorf("cloning efi disk: %w", err)
 		}
 		// Seed the boot entry from the machine that installed the disk when a
 		// variable store is provided; otherwise let vfkit create a fresh one.
 		varPath := filepath.Join(dir, "efi-vars.fd")
-		if m.cfg.EFIVars != "" {
-			if err := copyFile(m.cfg.EFIVars, varPath); err != nil {
+		if efiVars != "" {
+			if err := copyFile(efiVars, varPath); err != nil {
 				return nil, fmt.Errorf("seeding efi vars: %w", err)
 			}
 		} else {
@@ -161,11 +181,11 @@ func (m *Manager) start(id, volumeName, volumeImage string) (*VM, error) {
 			return nil, fmt.Errorf("writing config.json: %w", err)
 		}
 		spec.Shares = append(spec.Shares, Share{Dir: cfgDir, Tag: "warmbox-config"})
-	case "overlay":
+	case m.overlayAvailable():
 		spec.Cmdline = cmdline
 		spec.Initrd = m.cfg.OverlayInitrdPath
 		spec.Disks = append(spec.Disks, Disk{Path: m.cfg.SquashPath, ReadOnly: true})
-	case "disk":
+	case m.diskAvailable():
 		diskPath := filepath.Join(dir, "rootfs.img")
 		if err := cloneFile(m.cfg.DiskPath, diskPath); err != nil {
 			return nil, fmt.Errorf("cloning rootfs image: %w", err)
