@@ -146,7 +146,8 @@ docs/               architecture, volumes, snapshots, oss-positioning, vision
 - **Windows** — either a **WSL2 setup guide** (WSL2 is Linux + KVM, so it should
   work as-is) or a native **WHPX** QEMU backend (`-accel whpx`). Unverified; the
   seam is `internal/desktop/backend.go`.
-- **Exec / agent API** — run commands and move files without driving the screen.
+- **Agent API** — phase 1 (`exec` + `files`) works; sessions, streaming/background
+  exec, and the computer-use endpoints are next (`docs/agent-api.md`).
 - **WebRTC streaming** — replace noVNC/RFB for latency and bandwidth.
 - **macOS VNC bridge** — replace the `/usr/bin/nc` fallback with a signed helper.
 - **Tests** — API and VM lifecycle integration tests.

@@ -44,7 +44,10 @@ behind an env var so CI (which has no hypervisor) can skip it.
 1. **A Cloud Hypervisor / Firecracker Linux backend** (QEMU/KVM already works) —
    for leaner boot and real memory snapshot/restore. The `Backend` interface in
    `internal/desktop/backend.go` is the seam; see `docs/architecture.md`.
-2. **Exec / agent API** — run commands and move files without driving the screen.
+2. **Exec / agent API** — phase 1 (`exec` + `files`) works. Next: **persistent
+   sessions** (state that survives between calls), **background + streaming
+   exec**, `tty`/shell/base64 options, then an SDK. Roadmap in
+   `docs/agent-api.md`.
 3. **WebRTC streaming** — replace noVNC/RFB for latency and bandwidth.
 4. **macOS VNC bridge** — replace the `/usr/bin/nc` fallback with a signed helper
    or a configurable bridge.

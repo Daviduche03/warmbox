@@ -100,8 +100,43 @@ Thin clients over the host API: Go first, then Python/TypeScript.
 - **Auth:** the host API keeps the daemon token; the agent itself is unauthenticated
   because the VM's NAT network is the boundary (single-user). Revisit for fleets.
 
+## Roadmap
+
+### exec — make it agent-grade
+Today `exec` is one-shot. Planned, in priority order:
+
+**Tier 1**
+- **Persistent sessions** — a long-lived shell per desktop so `cwd`/env/exports
+  persist across calls (today every call is a fresh `sh -c` and loses state).
+  `POST /sessions`, `POST /sessions/{id}/input`, `GET /sessions/{id}/output`,
+  `DELETE /sessions/{id}`.
+- **Background + streaming exec** — every exec returns a `runId` immediately, with
+  a live output stream and status/kill/attach. Needed for anything outliving a
+  call (dev servers, builds). `POST /exec → {runId}`,
+  `GET /exec/{runId}/stream` (SSE), `DELETE /exec/{runId}`.
+- **Send stdin to a running process** — prompts and interactivity.
+
+**Tier 2**
+- `tty: true` (correct output for tools that check `isatty`).
+- shell selection (`sh`/`bash`).
+- binary-safe output (`encoding: "base64"`).
+- richer result: `signal`, `truncated`, `stdout_bytes`/`stderr_bytes`.
+- per-desktop default `cwd`/`env`.
+
+**Tier 3**
+- concurrency cap / queue per VM (no fork-bombs).
+- cgroup resource limits (memory/CPU/pids).
+- cancel on disconnect; an audit log of execs; run as a non-root user.
+
+### computer-use (later)
+- `GET /screenshot` + `POST /input` (guest `scrot` + `xdotool`), for operating
+  arbitrary GUI windows. For web tasks, prefer CDP or `exec` — pixels are the
+  slow path.
+
+### SDKs
+- Go first, then Python / TypeScript.
+
 ## Still open
-- Streaming + background exec (SSE, `detach:true` → runId).
-- Screenshot source: guest `xwd` vs grabbing the VNC framebuffer in the daemon.
+- Screenshot source: guest `scrot` vs grabbing the VNC framebuffer in the daemon.
 - Input API: an actions DSL (click/type/scroll) vs raw events.
-- Per-VM agent tokens (if the guest network ever becomes reachable by others).
+- Per-VM agent tokens (only needed if the guest network becomes reachable by others).
