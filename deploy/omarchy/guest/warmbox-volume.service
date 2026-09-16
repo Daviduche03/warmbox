@@ -1,0 +1,13 @@
+[Unit]
+Description=warmbox volume mount
+After=network-online.target
+Before=warmbox-ready.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/warmbox-volume
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

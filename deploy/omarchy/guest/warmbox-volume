@@ -1,0 +1,59 @@
+#!/bin/sh
+# Mount the warmbox volume when one is attached to this VM.
+#
+# Like warmbox-ready, the daemon signals a volume over the virtiofs config
+# share (EFI boot has no kernel cmdline). The volume is a raw ext4 disk
+# attached as /dev/vdb; it is grow-only, so repair only when needed and grow
+# the filesystem when the disk is larger than it.
+set -u
+TAG=warmbox-config
+MNT=/run/warmbox-config
+VOL=/volume
+log() { echo "warmbox-volume: $*"; }
+
+mkdir -p "$MNT"
+i=0
+while [ $i -lt 50 ]; do
+  mount -t virtiofs "$TAG" "$MNT" 2>/dev/null && break
+  i=$((i+1)); sleep 0.2
+done
+if [ ! -f "$MNT/config.json" ]; then
+  log "no config.json; nothing to mount"
+  exit 0
+fi
+if ! grep -q '"volume"[[:space:]]*:[[:space:]]*"1"' "$MNT/config.json"; then
+  log "no volume attached"
+  exit 0
+fi
+
+i=0
+while [ ! -b /dev/vdb ] && [ $i -lt 30 ]; do sleep 0.1; i=$((i+1)); done
+if [ ! -b /dev/vdb ]; then
+  log "WARN: volume requested but no /dev/vdb"; exit 0
+fi
+
+if command -v e2fsck >/dev/null 2>&1; then
+  e2fsck -p /dev/vdb >/dev/kmsg 2>&1 || true
+fi
+if command -v resize2fs >/dev/null 2>&1 && command -v dumpe2fs >/dev/null 2>&1; then
+  info=$(dumpe2fs -h /dev/vdb 2>/dev/null)
+  fsblk=$(echo "$info" | awk -F: '/Block count/{gsub(/ /,"",$2);print $2;exit}')
+  fssz=$(echo "$info"  | awk -F: '/Block size/{gsub(/ /,"",$2);print $2;exit}')
+  devsec=$(cat /sys/class/block/vdb/size 2>/dev/null)
+  if [ -n "$fsblk" ] && [ -n "$fssz" ] && [ -n "$devsec" ] && [ "$fssz" -gt 0 ] && \
+     [ $((devsec * 512 / fssz)) -gt "$fsblk" ]; then
+    resize2fs /dev/vdb >/dev/kmsg 2>&1 || true
+  fi
+fi
+
+mkdir -p "$VOL"
+if mount -t ext4 /dev/vdb "$VOL"; then
+  chown "${OMARCHY_USER:-omarchy}" "$VOL" 2>/dev/null || true
+  # Start the periodic flush now that the mount exists (its boot-time
+  # ConditionPathIsMountPoint can race with this unit). --no-block: never wait
+  # on the job from inside a oneshot service.
+  systemctl start --no-block warmbox-volume-sync.service 2>/dev/null || true
+  log "mounted /dev/vdb at $VOL"
+else
+  log "WARN: could not mount /dev/vdb at $VOL"
+fi

@@ -1,0 +1,15 @@
+[Unit]
+Description=warmbox volume periodic sync
+ConditionPathIsMountPoint=/volume
+
+[Service]
+Type=simple
+# The VM is stopped uncleanly (vfkit is killed), so flush the volume regularly
+# to keep the window of lost writes small. Same idea as the built-in image.
+# Started explicitly by warmbox-volume once the mount exists; no ordering on
+# that unit (that would deadlock, since it starts this one).
+ExecStart=/bin/sh -c 'while true; do sync; sleep 2; done'
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

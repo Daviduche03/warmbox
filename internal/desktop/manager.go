@@ -172,11 +172,15 @@ func (m *Manager) start(id, volumeName, volumeImage, imageName string) (*VM, err
 		if err := os.MkdirAll(cfgDir, 0o755); err != nil {
 			return nil, fmt.Errorf("creating config share: %w", err)
 		}
-		conf, _ := json.Marshal(map[string]string{
+		confMap := map[string]string{
 			"id":   id,
 			"host": hostAddr,
 			"port": portOf(m.cfg.APIAddr),
-		})
+		}
+		if volumeImage != "" {
+			confMap["volume"] = "1"
+		}
+		conf, _ := json.Marshal(confMap)
 		if err := os.WriteFile(filepath.Join(cfgDir, "config.json"), conf, 0o644); err != nil {
 			return nil, fmt.Errorf("writing config.json: %w", err)
 		}

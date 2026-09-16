@@ -50,8 +50,10 @@ note "building warmbox-agent (linux/arm64)"
     go build -trimpath -ldflags '-s -w' -o "$img/warmbox-agent" . )
 
 note "staging provisioning assets"
-cp "$here/guest/warmbox-ready" "$here/guest/warmbox-agent.service" \
-   "$here/guest/warmbox-ready.service" "$here/guest/setup.sh" "$here/guest/tune.sh" "$img/"
+cp "$here/guest/warmbox-ready" "$here/guest/warmbox-volume" \
+   "$here/guest/warmbox-agent.service" "$here/guest/warmbox-ready.service" \
+   "$here/guest/warmbox-volume.service" "$here/guest/warmbox-volume-sync.service" \
+   "$here/guest/setup.sh" "$here/guest/tune.sh" "$img/"
 
 note "cloning Omarchy disk -> $img/disk.raw"
 cp -c "$OMARCHY_SRC" "$img/disk.raw" 2>/dev/null || cp "$OMARCHY_SRC" "$img/disk.raw"

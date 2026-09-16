@@ -26,6 +26,19 @@ virtio-gpu device. Warmbox hands the guest its identity over a virtiofs share
 (tag `warmbox-config`) because EFI boot has no kernel cmdline — the image's
 `warmbox-ready` unit reads it and reports readiness back to the daemon.
 
+## Volumes
+
+A persistent volume (a raw ext4 disk attached as `/dev/vdb`) is mounted at
+`/volume` by `guest/warmbox-volume`, which the daemon triggers over the same
+config share (`"volume":"1"`). Because the VM is stopped by killing vfkit,
+`guest/warmbox-volume-sync` flushes every 2s so at most a couple of seconds of
+writes are lost. Use it like any other warmbox volume:
+
+```
+warmbox volume create mywork --size 4G
+warmbox create --volume mywork            # + --image omarchy for Omarchy
+```
+
 ## Building the image
 
 `build.sh` stages an **already installed** Omarchy disk as a named image and
