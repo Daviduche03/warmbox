@@ -64,6 +64,15 @@ go build -o warmbox ./cmd/warmbox
 ./warmbox create
 ```
 
+Each desktop gets a short URL (`http://localhost:7070/d/<id>`); open it and
+noVNC fills the page. The token is dropped from the address bar after the first
+load. To run the daemon in the background instead of the foreground:
+
+```sh
+./warmbox service install --pool 1   # macOS launchd; pool 1 = ~1s creates
+./warmbox service status             # start | stop | restart | status
+```
+
 On **Linux**, add `--backend qemu` to the daemon (KVM + `qemu-system-*`). QEMU's
 user-mode networking isn't reachable host→guest, so the backend forwards a host
 port to each guest's VNC; everything else is identical. Build the guest image for

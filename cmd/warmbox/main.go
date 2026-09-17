@@ -7,6 +7,8 @@ import (
 	"archive/tar"
 	"compress/gzip"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -17,6 +19,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -41,6 +44,8 @@ func main() {
 	switch os.Args[1] {
 	case "daemon":
 		cmdDaemon(os.Args[2:])
+	case "service":
+		cmdService(os.Args[2:])
 	case "setup":
 		cmdSetup(os.Args[2:])
 	case "create":
@@ -68,6 +73,8 @@ func usage() {
 
 Usage:
   warmbox daemon            Run the orchestrator (warm pool + REST API)
+  warmbox service <cmd>     Manage the background daemon (macOS launchd):
+                            install | start | stop | restart | status
   warmbox setup             Check host prerequisites, fetch noVNC
   warmbox create            Provision a desktop, print its noVNC URL
   warmbox images            List the named guest images the daemon can boot
@@ -136,6 +143,129 @@ func addCommonFlags(fs *flag.FlagSet, cfg *desktop.Config) {
 	fs.StringVar(&cfg.VolumeBase, "volume-base", cfg.VolumeBase, "base ext4 image cloned for new volumes")
 	fs.IntVar(&cfg.VolumeChunkMiB, "volume-chunk", cfg.VolumeChunkMiB, "volume transfer chunk size (MiB)")
 	fs.StringVar(&cfg.VolumePrefix, "volume-prefix", cfg.VolumePrefix, "remote prefix for volumes")
+}
+
+const warmboxLabel = "com.warmbox.daemon"
+
+func launchAgentPath() string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, "Library", "LaunchAgents", warmboxLabel+".plist")
+}
+
+// serviceToken returns the daemon token from ~/.warmbox/token, generating one
+// if it does not exist yet.
+func serviceToken() string {
+	home, _ := os.UserHomeDir()
+	p := filepath.Join(home, ".warmbox", "token")
+	if b, err := os.ReadFile(p); err == nil && strings.TrimSpace(string(b)) != "" {
+		return strings.TrimSpace(string(b))
+	}
+	buf := make([]byte, 24)
+	_, _ = rand.Read(buf)
+	tok := hex.EncodeToString(buf)
+	_ = os.MkdirAll(filepath.Dir(p), 0o755)
+	_ = os.WriteFile(p, []byte(tok+"\n"), 0o600)
+	return tok
+}
+
+func writeLaunchAgent(cfg *desktop.Config, pool int) error {
+	if vf, err := exec.LookPath(cfg.VfkitPath); err == nil {
+		cfg.VfkitPath = vf
+	}
+	self, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	logPath := filepath.Join(cfg.WorkDir, "daemon.log")
+	plist := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>%s</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>%s</string><string>daemon</string>
+    <string>--workdir</string><string>%s</string>
+    <string>--addr</string><string>%s</string>
+    <string>--pool</string><string>%d</string>
+    <string>--image</string><string>%s</string>
+    <string>--vfkit</string><string>%s</string>
+    <string>--token</string><string>%s</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict><key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string></dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>%s</string>
+  <key>StandardErrorPath</key><string>%s</string>
+</dict>
+</plist>
+`, warmboxLabel, self, cfg.WorkDir, cfg.APIAddr, pool, cfg.Image, cfg.VfkitPath, serviceToken(), logPath, logPath)
+	if err := os.MkdirAll(filepath.Dir(launchAgentPath()), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(launchAgentPath(), []byte(plist), 0o644)
+}
+
+// cmdService manages the warmbox daemon as a background service (macOS launchd).
+func cmdService(args []string) {
+	if runtime.GOOS != "darwin" {
+		fatal("service management is implemented for macOS (launchd) so far; on Linux run the daemon under systemd yourself")
+	}
+	cfg := desktop.DefaultConfig()
+	pool := 0
+	fs := flag.NewFlagSet("service", flag.ExitOnError)
+	fs.StringVar(&cfg.WorkDir, "workdir", cfg.WorkDir, "state directory")
+	fs.StringVar(&cfg.APIAddr, "addr", cfg.APIAddr, "HTTP listen address")
+	fs.StringVar(&cfg.Image, "image", cfg.Image, "default image")
+	fs.IntVar(&pool, "pool", 0, "warm pool size (0 = boot on demand; 1+ = instant create, holds RAM)")
+	sub := ""
+	if len(args) > 0 {
+		sub = args[0]
+		_ = fs.Parse(args[1:])
+	}
+
+	domain := fmt.Sprintf("gui/%d", os.Getuid())
+	target := domain + "/" + warmboxLabel
+	lc := func(a ...string) error {
+		cmd := exec.Command("launchctl", a...)
+		cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr
+		return cmd.Run()
+	}
+
+	switch sub {
+	case "install":
+		if err := cfg.EnsureDirs(); err != nil {
+			fatal("Error: %v", err)
+		}
+		if err := writeLaunchAgent(cfg, pool); err != nil {
+			fatal("Error: %v", err)
+		}
+		_ = lc("bootout", target) // ignore "not loaded"
+		if err := lc("bootstrap", domain, launchAgentPath()); err != nil {
+			fatal("Error: %v", err)
+		}
+		fmt.Fprintf(os.Stderr, "installed and started %s (pool=%d)\n", warmboxLabel, pool)
+	case "start":
+		if err := lc("bootstrap", domain, launchAgentPath()); err != nil {
+			_ = lc("kickstart", target)
+		}
+		fmt.Fprintln(os.Stderr, "started")
+	case "stop":
+		if err := lc("bootout", target); err != nil {
+			fatal("Error: %v", err)
+		}
+		fmt.Fprintln(os.Stderr, "stopped")
+	case "restart":
+		if err := lc("kickstart", "-k", target); err != nil {
+			fatal("Error (is it installed?): %v", err)
+		}
+		fmt.Fprintln(os.Stderr, "restarted")
+	case "status":
+		_ = lc("print", target)
+	default:
+		fatal("Usage: warmbox service <install|start|stop|restart|status> [--pool N] [--image NAME]")
+	}
 }
 
 func cmdDaemon(args []string) {

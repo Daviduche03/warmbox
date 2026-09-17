@@ -82,6 +82,9 @@ func (s *Server) Handler() http.Handler {
 	// Publish a guest HTTP server (e.g. an agent-built dashboard) at a link.
 	mux.HandleFunc("GET /p/{id}/{port}/", s.expose)
 
+	// Short desktop URL: serves noVNC full-screen, no token in the address bar.
+	mux.HandleFunc("GET /d/{id}", s.dash)
+
 	// Static noVNC assets, one namespace per VM.
 	mux.HandleFunc("GET /vnc/{id}/", s.novnc)
 
@@ -161,7 +164,7 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 	s.recordDesktop(vm.ID, "", "busy", "", 0)
 	writeJSON(w, http.StatusCreated, map[string]any{
 		"id":  vm.ID,
-		"vnc": "/vnc/" + vm.ID + "/vnc.html?autoconnect=1&resize=scale&path=/websockify/" + vm.ID + s.tokenSuffix(),
+		"vnc": "/d/" + vm.ID + s.tokenQuery(),
 		"ws":  "/websockify/" + vm.ID,
 	})
 }
@@ -186,7 +189,7 @@ func (s *Server) createImage(w http.ResponseWriter, r *http.Request, name string
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{
 		"id":  vm.ID,
-		"vnc": "/vnc/" + vm.ID + "/vnc.html?autoconnect=1&resize=scale&path=/websockify/" + vm.ID + s.tokenSuffix(),
+		"vnc": "/d/" + vm.ID + s.tokenQuery(),
 		"ws":  "/websockify/" + vm.ID,
 	})
 }
@@ -231,7 +234,7 @@ func (s *Server) createWithVolume(w http.ResponseWriter, r *http.Request, name s
 	writeJSON(w, http.StatusCreated, map[string]any{
 		"id":     vm.ID,
 		"volume": name,
-		"vnc":    "/vnc/" + vm.ID + "/vnc.html?autoconnect=1&resize=scale&path=/websockify/" + vm.ID + s.tokenSuffix(),
+		"vnc":    "/d/" + vm.ID + s.tokenQuery(),
 		"ws":     "/websockify/" + vm.ID,
 	})
 }
@@ -243,6 +246,41 @@ func (s *Server) tokenSuffix() string {
 		return ""
 	}
 	return "&token=" + url.QueryEscape(s.cfg.Token)
+}
+
+// tokenQuery is tokenSuffix for a URL with no query yet.
+func (s *Server) tokenQuery() string {
+	if s.cfg.Token == "" {
+		return ""
+	}
+	return "?token=" + url.QueryEscape(s.cfg.Token)
+}
+
+// dashHTML is the short desktop page: noVNC fills the viewport. The iframe
+// inherits the auth cookie, so the URL carries no token after the first visit.
+const dashHTML = `<!doctype html>
+<html><head><meta charset="utf-8"><title>warmbox</title>
+<style>html,body{margin:0;height:100%%;background:#111}
+iframe{border:0;width:100vw;height:100vh;display:block}</style></head>
+<body><iframe allow="clipboard-read;clipboard-write"
+ src="/vnc/%s/vnc.html?autoconnect=1&resize=scale&show_dot=1&path=/websockify/%s"></iframe>
+</body></html>`
+
+// dash serves the short desktop URL. A request that still carries ?token= is
+// redirected to the bare path (the auth cookie has been set by the middleware),
+// so the address bar ends up clean.
+func (s *Server) dash(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if _, ok := s.mgr.Get(id); !ok {
+		http.NotFound(w, r)
+		return
+	}
+	if r.URL.Query().Get("token") != "" {
+		http.Redirect(w, r, "/d/"+id, http.StatusFound)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	fmt.Fprintf(w, dashHTML, id, id)
 }
 
 func (s *Server) list(w http.ResponseWriter, r *http.Request) {
