@@ -30,6 +30,16 @@ func isBuiltinImage(name string) bool {
 	return false
 }
 
+// SameImage reports whether two image names refer to the same image, treating
+// the built-in aliases ("", "default", "xfce", "alpine") as equivalent. Used to
+// decide whether a request can be served from the warm pool.
+func SameImage(a, b string) bool {
+	if isBuiltinImage(a) && isBuiltinImage(b) {
+		return true
+	}
+	return a == b
+}
+
 // builtinAvailable reports whether the built-in image's artifacts exist.
 func (m *Manager) builtinAvailable() bool {
 	if m.overlayAvailable() || m.diskAvailable() {

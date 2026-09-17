@@ -177,6 +177,24 @@ func writeLaunchAgent(cfg *desktop.Config, pool int) error {
 		return err
 	}
 	logPath := filepath.Join(cfg.WorkDir, "daemon.log")
+
+	args := []string{
+		self, "daemon",
+		"--workdir", cfg.WorkDir,
+		"--addr", cfg.APIAddr,
+		"--pool", fmt.Sprint(pool),
+		"--vfkit", cfg.VfkitPath,
+		"--token", serviceToken(),
+	}
+	if cfg.Image != "" {
+		args = append(args, "--image", cfg.Image)
+	}
+	esc := strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;").Replace
+	var b strings.Builder
+	for _, a := range args {
+		fmt.Fprintf(&b, "    <string>%s</string>\n", esc(a))
+	}
+
 	plist := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -184,14 +202,7 @@ func writeLaunchAgent(cfg *desktop.Config, pool int) error {
   <key>Label</key><string>%s</string>
   <key>ProgramArguments</key>
   <array>
-    <string>%s</string><string>daemon</string>
-    <string>--workdir</string><string>%s</string>
-    <string>--addr</string><string>%s</string>
-    <string>--pool</string><string>%d</string>
-    <string>--image</string><string>%s</string>
-    <string>--vfkit</string><string>%s</string>
-    <string>--token</string><string>%s</string>
-  </array>
+%s  </array>
   <key>EnvironmentVariables</key>
   <dict><key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string></dict>
   <key>RunAtLoad</key><true/>
@@ -200,7 +211,7 @@ func writeLaunchAgent(cfg *desktop.Config, pool int) error {
   <key>StandardErrorPath</key><string>%s</string>
 </dict>
 </plist>
-`, warmboxLabel, self, cfg.WorkDir, cfg.APIAddr, pool, cfg.Image, cfg.VfkitPath, serviceToken(), logPath, logPath)
+`, warmboxLabel, b.String(), esc(logPath), esc(logPath))
 	if err := os.MkdirAll(filepath.Dir(launchAgentPath()), 0o755); err != nil {
 		return err
 	}
@@ -232,6 +243,26 @@ func cmdService(args []string) {
 		cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr
 		return cmd.Run()
 	}
+	lcQuiet := func(a ...string) error {
+		return exec.Command("launchctl", a...).Run()
+	}
+	loaded := func() bool {
+		c := exec.Command("launchctl", "print", target)
+		c.Stdout, c.Stderr = nil, nil
+		return c.Run() == nil
+	}
+	// bootstrap can race a just-issued bootout (launchd returns before the old
+	// process exits), so retry briefly.
+	bootstrap := func() error {
+		var err error
+		for i := 0; i < 10; i++ {
+			if err = lc("bootstrap", domain, launchAgentPath()); err == nil {
+				return nil
+			}
+			time.Sleep(400 * time.Millisecond)
+		}
+		return err
+	}
 
 	switch sub {
 	case "install":
@@ -241,27 +272,44 @@ func cmdService(args []string) {
 		if err := writeLaunchAgent(cfg, pool); err != nil {
 			fatal("Error: %v", err)
 		}
-		_ = lc("bootout", target) // ignore "not loaded"
-		if err := lc("bootstrap", domain, launchAgentPath()); err != nil {
+		_ = lcQuiet("bootout", target) // ignore "not loaded"
+		if err := bootstrap(); err != nil {
 			fatal("Error: %v", err)
 		}
 		fmt.Fprintf(os.Stderr, "installed and started %s (pool=%d)\n", warmboxLabel, pool)
 	case "start":
-		if err := lc("bootstrap", domain, launchAgentPath()); err != nil {
-			_ = lc("kickstart", target)
+		if loaded() {
+			if err := lc("kickstart", target); err != nil {
+				fatal("Error: %v", err)
+			}
+		} else if err := bootstrap(); err != nil {
+			fatal("Error (install first?): %v", err)
 		}
 		fmt.Fprintln(os.Stderr, "started")
 	case "stop":
+		if !loaded() {
+			fmt.Fprintln(os.Stderr, "not running")
+			return
+		}
 		if err := lc("bootout", target); err != nil {
 			fatal("Error: %v", err)
 		}
 		fmt.Fprintln(os.Stderr, "stopped")
 	case "restart":
-		if err := lc("kickstart", "-k", target); err != nil {
-			fatal("Error (is it installed?): %v", err)
+		if loaded() {
+			if err := lc("bootout", target); err != nil {
+				fatal("Error: %v", err)
+			}
+		}
+		if err := bootstrap(); err != nil {
+			fatal("Error (install first?): %v", err)
 		}
 		fmt.Fprintln(os.Stderr, "restarted")
 	case "status":
+		if !loaded() {
+			fmt.Fprintln(os.Stderr, "not running")
+			return
+		}
 		_ = lc("print", target)
 	default:
 		fatal("Usage: warmbox service <install|start|stop|restart|status> [--pool N] [--image NAME]")

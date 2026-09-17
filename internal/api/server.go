@@ -169,10 +169,25 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// createImage cold-boots a desktop from a named image (e.g. "omarchy"). Named
-// images cannot come from the warm pool (each is a different disk), so they
-// boot on demand.
+// createImage provisions a desktop from a named image. If it is the daemon's
+// default image it can come from the warm pool (instant); other images boot on
+// demand (each is a different disk).
 func (s *Server) createImage(w http.ResponseWriter, r *http.Request, name string) {
+	if desktop.SameImage(name, s.cfg.Image) {
+		vm, err := s.pool.Acquire(r.Context())
+		if err != nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+			return
+		}
+		s.recordDesktop(vm.ID, "", "busy", "", 0)
+		writeJSON(w, http.StatusCreated, map[string]any{
+			"id":  vm.ID,
+			"vnc": "/d/" + vm.ID + s.tokenQuery(),
+			"ws":  "/websockify/" + vm.ID,
+		})
+		return
+	}
+
 	id := desktop.NewID()
 	vm, err := s.mgr.StartImage(id, "", "", name)
 	if err != nil {
