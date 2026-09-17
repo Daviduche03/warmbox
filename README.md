@@ -5,9 +5,15 @@ disks. Boot a Linux desktop in a second, hand a browser a link, and keep the
 whole machine — files, installed apps, settings — on a disk that lives in object
 storage (S3/R2) and can be cloned or restored on another host.
 
-> **Status: experimental alpha.** macOS / Apple Silicon only today. Not hardened:
-> no TLS, no VNC auth, single-user. See [Status](#status) and
-> [Limitations](#limitations) before you run it on anything shared.
+Two guest images ship out of the box: a tiny **Alpine + XFCE** desktop (~776 MB,
+boots in ~1s from a shared read-only rootfs) and a full **Omarchy**
+(Arch + Hyprland, ~8.4 GB) built as an EFI disk. You pick the OS at create time.
+
+> **Status: experimental alpha.** macOS / Apple Silicon is the primary target;
+> Linux + KVM works for the built-in image. Not hardened: no TLS, guest VNC is
+> unauthenticated, the guest runs as root, the API token is optional. See
+> [Status](#status) and [Limitations](#limitations) before you run it on
+> anything shared.
 
 ## What it does
 
@@ -15,8 +21,14 @@ storage (S3/R2) and can be cloned or restored on another host.
   every VM; the writable layer is a per-VM *volume* stored as content-addressed
   chunks in an S3-compatible bucket (via [rclone](https://rclone.org)). Start a VM
   on any host, attach the volume, and it is the same machine.
-- **Fast boot.** A warm pool of pre-booted VMs; a desktop is ready in ~1–3s.
+- **Fast boot.** Create clones the golden image with an APFS copy-on-write copy
+  (instant, shared blocks) and boots it; a warm pool of pre-booted VMs makes a
+  desktop ready in ~1s.
+- **Choose your OS at create time.** `warmbox create --image omarchy` boots a
+  clone of the Omarchy disk; no image argument uses the built-in desktop.
 - **Browser access.** Each desktop is streamed over noVNC — no client to install.
+- **Agent API.** `exec` + file read/write/list inside any guest over HTTP, no SSH
+  keys (`docs/agent-api.md`).
 - **Snapshots & clones.** A snapshot is a frozen disk manifest, so it is O(1) and
   shares every chunk; clone it into a fresh box.
 - **Apps.** `warmbox-app` turns a directory (e.g. an agent-built HTML dashboard)
@@ -29,15 +41,16 @@ storage (S3/R2) and can be cloned or restored on another host.
 **Host** — one of:
 - **macOS on Apple Silicon**, with `vfkit` (`brew install vfkit`); or
 - **Linux with KVM** and `qemu-system-x86_64` / `qemu-system-aarch64` — run the
-  daemon with `--backend qemu`. Verified on x86_64 KVM.
+  daemon with `--backend qemu`. Verified on x86_64 KVM. Note: the Linux backend
+  cannot boot EFI disk images yet (no OVMF), so image guests are macOS-only.
 
-Plus: **Docker** (to build the guest image) and **Go 1.25+**.
+Plus: **Docker** (to build the built-in guest image) and **Go 1.25+**.
 
 ## Quickstart
 
 ```sh
-# 1. Build the guest image (kernel + rootfs + a 2 GiB base disk). First run is
-#    slow (Docker + squashfs); artifacts land in ~/.warmbox by default.
+# 1. Build the built-in guest image (kernel + rootfs + a 2 GiB base disk).
+#    First run is slow (Docker + squashfs); artifacts land in ~/.warmbox.
 ./deploy/guest/build.sh
 
 # 2. Build the CLI and fetch noVNC.
@@ -56,7 +69,51 @@ user-mode networking isn't reachable host→guest, so the backend forwards a hos
 port to each guest's VNC; everything else is identical. Build the guest image for
 the host arch with `PLATFORM=linux/amd64 ./deploy/guest/build.sh`.
 
-Persistent volumes:
+## Images
+
+A named image is a directory under `$WARMBOX_HOME/images/<name>/` holding
+`disk.raw` (a bootable disk), an optional `efi-vars.fd` seed, and an optional
+`meta.json` (`{"gpu","mem_mib","cpus","input"}`). The daemon discovers them at
+startup and you choose one per desktop:
+
+```sh
+./warmbox images                     # list what the daemon can boot
+./warmbox create --image omarchy     # a full Omarchy (Hyprland) desktop
+./warmbox create --image default     # the built-in desktop (aliases: xfce, alpine)
+./warmbox create                     # whatever --image the daemon was started with
+```
+
+| image | base | size on disk | boot |
+|---|---|---|---|
+| `default` | Alpine + XFCE | ~776 MB (compressed squashfs base) | ~1s, shared rootfs |
+| `omarchy` | Arch + Hyprland/Quickshell | 24 GB sparse, ~8.4 GB real | ~13s cold, instant if pooled |
+
+Images travel as a single compressed artifact:
+
+```sh
+./warmbox image pack omarchy                 # -> ~/.warmbox/images/omarchy.tar.zst (~3.9 GB)
+./warmbox image pull omarchy <file-or-url>   # expand into ~/.warmbox/images/omarchy
+./warmbox image list                         # local images (offline)
+```
+
+See [`deploy/omarchy/README.md`](deploy/omarchy/README.md) for how the Omarchy
+image is built and provisioned (it stands on the community aarch64 port).
+
+## Agent API
+
+Run commands and move files inside any guest over HTTP — the daemon proxies to
+`warmbox-agent` in the VM, reachable on the same dial path as VNC:
+
+```sh
+curl -X POST localhost:7070/api/desktops/$ID/exec -d '{"cmd":"uname -a"}'
+curl "localhost:7070/api/desktops/$ID/files?path=/home"
+curl "localhost:7070/api/desktops/$ID/file?path=/etc/hostname"
+```
+
+Phase 1 is `exec` + files; streaming/background exec, `tty`, and
+screenshot/input are next. Design: [`docs/agent-api.md`](docs/agent-api.md).
+
+## Persistent volumes
 
 ```sh
 ./warmbox volume create dev --size 8G     # grow-only; floor is VOLUME_BASE_SIZE
@@ -64,6 +121,10 @@ Persistent volumes:
 ./warmbox snapshot create dev             # freeze it
 ./warmbox volume clone dev dev-clean      # template a fresh box
 ```
+
+Volumes attach to image guests too. On the built-in image the volume *is* the
+writable overlay (the whole machine persists); on an image guest like Omarchy it
+is a data disk mounted at `/volume`, flushed every couple of seconds.
 
 Inside the guest:
 
@@ -86,31 +147,41 @@ point `runmesh` at it and the daemon picks it up:
 | Area | State |
 |---|---|
 | Guest desktop (XFCE over noVNC), warm pool | ✅ works |
+| Named images + create-time selection | ✅ works |
+| Omarchy guest (EFI disk image) | ✅ works (macOS) |
 | Persistent, cloud-backed volumes (chunked) | ✅ works |
+| Volumes on image guests (`/volume`) | ✅ works |
 | Grow a volume (`--size`) | ✅ works (grow-only) |
 | Disk snapshots + clone | ✅ works |
-| Linux host (QEMU/KVM) | ✅ works (x86_64 verified) |
+| Image pack / pull (compressed artifacts) | ✅ works |
+| Agent API: exec + files | ✅ works |
+| Linux host (QEMU/KVM) | ✅ works (x86_64 verified; no EFI images) |
 | `warmbox-app` (menu apps) | 🟡 experimental |
 | Publish a guest port at a URL (`/p/<vm>/<port>/`) | 🟡 experimental |
+| Agent API: streaming, tty, screenshot/input | ❌ not yet |
 | Linux host (Cloud Hypervisor / Firecracker) | ❌ not yet |
-| Windows host (WSL2) | ❌ not yet |
-| Agent API: exec + files | ✅ works |
-| Agent API: streaming + screenshot/input | ❌ not yet |
+| Windows host (WSL2 / native WHPX) | ❌ not yet |
 | Memory snapshot / ~100 ms restore | ❌ blocked on macOS |
 | TLS / per-guest VNC auth | ❌ not yet |
 | GPU / audio | ❌ not supported |
 
 ## Limitations
 
-- **Apple Silicon only.** `vfkit` wraps Apple's Virtualization.framework; there is
-  no Linux/Windows port yet. ARM64 guests only.
+- **Apple Silicon only** (for image guests). `vfkit` wraps Apple's
+  Virtualization.framework; ARM64 guests only. The Linux/QEMU backend boots the
+  built-in image but not EFI disks.
 - **Local-only security posture.** Off by default: no TLS, guest VNC is
-  `-SecurityTypes None`, guest runs as **root**, the API token is optional. Don't
-  expose it.
-- **No programmatic agent channel.** Agents drive the GUI; there is no exec/SSH
-  API. `warmbox-app`/`serve` are run from a guest shell.
+  `-SecurityTypes None`, the guest runs as **root**, the API token is optional.
+  Don't expose it.
 - **No memory snapshots.** Apple's framework exposes no VM state save/restore, so
   fast "restore anywhere" needs a Linux backend (see `docs/snapshots.md`).
+- **Guests have no GPU.** AVF exposes virtio-gpu without 3D, so a Wayland desktop
+  composites through Mesa `llvmpipe`; the Omarchy image is tuned for it (small
+  output, effects off). X11 is lighter for remote display.
+- **Images are big.** Arch + Omarchy is multi-GB; the packed artifact is ~3.9 GB,
+  but because btrfs fragments its free space and APFS only preserves large holes,
+  an expanded copy may not be as sparse as you'd like. The built-in image is the
+  small one.
 - **Single writer.** A volume attaches to one VM at a time; the lock is
   in-process (fine for one host, not a fleet).
 - **Commit cost.** Committing hashes the changed extents; a commit is fast for
@@ -119,16 +190,18 @@ point `runmesh` at it and the daemon picks it up:
 ## Repository layout
 
 ```
-cmd/warmbox         the orchestrator CLI (daemon, create, volume, snapshot)
+cmd/warmbox         the orchestrator CLI (daemon, create, image, volume, snapshot)
 cmd/runmesh         the storage/sync CLI (up/down/watch/mount)
-internal/desktop    boot/attach microVMs (vfkit)
+internal/desktop    boot/attach microVMs (vfkit, qemu); images, boot modes
+internal/imagepack  pack/pull images as compressed tar.zst artifacts
 internal/volume     persistent volumes (chunked, content-addressed)
 internal/cloudstore shared chunk+manifest engine
 internal/catalog    SQLite metadata (volumes, desktops, snapshots, leases)
-internal/api        REST API, noVNC bridge, guest port proxy
+internal/api        REST API, noVNC bridge, guest port proxy, agent proxy
 internal/vnc        WebSocket→TCP VNC bridge
-deploy/guest        guest image (Dockerfile, init, overlay-init, apps)
-docs/               architecture, volumes, snapshots, oss-positioning, vision
+deploy/guest        built-in image (Dockerfile, init, overlay-init, apps, agent)
+deploy/omarchy      Omarchy image build + guest provisioning
+docs/               architecture, volumes, snapshots, agent-api, oss-positioning
 ```
 
 ## Docs
@@ -136,18 +209,22 @@ docs/               architecture, volumes, snapshots, oss-positioning, vision
 - [`docs/architecture.md`](docs/architecture.md) — the cloud-native design.
 - [`docs/volumes.md`](docs/volumes.md) — volumes, sizing, API.
 - [`docs/snapshots.md`](docs/snapshots.md) — snapshots & fast-resume plan.
+- [`docs/agent-api.md`](docs/agent-api.md) — the guest agent API and roadmap.
+- [`deploy/omarchy/README.md`](deploy/omarchy/README.md) — the Omarchy image.
 - [`docs/oss-positioning.md`](docs/oss-positioning.md) — what could be a shared primitive.
 - [`docs/vision.md`](docs/vision.md) — the original "Runmesh" vision.
 
 ## Help wanted
 
+- **Image distribution** — host packed images (OCI/R2) and make `warmbox image
+  pull` resolve a bare name, so nobody builds Omarchy locally.
+- **EFI on Linux** — OVMF support in the QEMU backend so image guests run there too.
 - **Cloud Hypervisor / Firecracker backend** — leaner boot and real memory
   snapshot/restore (the "~100 ms restore anywhere" story).
-- **Windows** — either a **WSL2 setup guide** (WSL2 is Linux + KVM, so it should
-  work as-is) or a native **WHPX** QEMU backend (`-accel whpx`). Unverified; the
-  seam is `internal/desktop/backend.go`.
-- **Agent API** — phase 1 (`exec` + `files`) works; sessions, streaming/background
-  exec, and the computer-use endpoints are next (`docs/agent-api.md`).
+- **Windows** — a **WSL2 setup guide** (WSL2 is Linux + KVM) or a native **WHPX**
+  QEMU backend. Unverified; the seam is `internal/desktop/backend.go`.
+- **Agent API** — streaming/background exec, `tty`, and computer-use
+  (`docs/agent-api.md`).
 - **WebRTC streaming** — replace noVNC/RFB for latency and bandwidth.
 - **macOS VNC bridge** — replace the `/usr/bin/nc` fallback with a signed helper.
 - **Tests** — API and VM lifecycle integration tests.
