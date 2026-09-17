@@ -4,11 +4,18 @@ WARMBOX_HOME ?= $(HOME)/.warmbox
 BROWSER ?= chromium
 BINARY ?= warmbox
 
-.PHONY: build guest-image setup daemon run test vet clean
+.PHONY: build guest-image setup daemon run test vet clean install
 
 ## build: compile the warmbox binary
 build:
 	go build -o $(BINARY) ./cmd/warmbox
+
+## install: build, install to ~/.local/bin, and re-sign (macOS kills an arm64
+## binary whose ad-hoc signature a plain copy invalidated)
+install: build
+	mkdir -p $(HOME)/.local/bin
+	install -m755 $(BINARY) $(HOME)/.local/bin/$(BINARY)
+	-codesign --force --sign - $(HOME)/.local/bin/$(BINARY)
 
 ## guest-image: build the guest rootfs and extract vmlinux + initramfs.zst
 guest-image:

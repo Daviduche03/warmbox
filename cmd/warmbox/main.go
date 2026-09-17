@@ -402,7 +402,19 @@ func withToken(rawURL, token string) string {
 	return rawURL + sep + "token=" + url.QueryEscape(token)
 }
 
-func tokenDefault() string { return os.Getenv("WARMBOX_TOKEN") }
+// tokenDefault resolves the daemon token: $WARMBOX_TOKEN, else the token file
+// the service writes (~/.warmbox/token), else empty.
+func tokenDefault() string {
+	if t := os.Getenv("WARMBOX_TOKEN"); t != "" {
+		return t
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		if b, err := os.ReadFile(filepath.Join(home, ".warmbox", "token")); err == nil {
+			return strings.TrimSpace(string(b))
+		}
+	}
+	return ""
+}
 
 func cmdCreate(args []string) {
 	addr := ":7070"
