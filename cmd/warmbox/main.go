@@ -28,6 +28,7 @@ import (
 	"runmesh/workspace/internal/catalog"
 	"runmesh/workspace/internal/config"
 	"runmesh/workspace/internal/desktop"
+	"runmesh/workspace/internal/imagepack"
 	"runmesh/workspace/internal/pool"
 	"runmesh/workspace/internal/volume"
 )
@@ -46,6 +47,8 @@ func main() {
 		cmdCreate(os.Args[2:])
 	case "images":
 		cmdImages(os.Args[2:])
+	case "image":
+		cmdImage(os.Args[2:])
 	case "list":
 		cmdList(os.Args[2:])
 	case "destroy":
@@ -68,6 +71,10 @@ Usage:
   warmbox setup             Check host prerequisites, fetch noVNC
   warmbox create            Provision a desktop, print its noVNC URL
   warmbox images            List the named guest images the daemon can boot
+  warmbox image pack <name> Pack an image to <name>.tar.zst (compressed)
+  warmbox image pull <name> <file|url>
+                            Expand a packed image into the images directory
+  warmbox image list        List the local images (offline)
   warmbox list              List desktops
   warmbox destroy <id>      Destroy a desktop
 
@@ -438,6 +445,58 @@ func cmdCreate(args []string) {
 	}
 	fmt.Fprintf(os.Stderr, "desktop %s ready\n", out.ID)
 	fmt.Printf("%s%s\n", apiBase(addr), out.VNC)
+}
+
+// cmdImage packs/pulls guest images and lists them offline.
+func cmdImage(args []string) {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "Usage: warmbox image <pack|pull|list>")
+		os.Exit(1)
+	}
+	cfg := desktop.DefaultConfig()
+	switch args[0] {
+	case "list":
+		entries, _ := os.ReadDir(cfg.ImageDir)
+		n := 0
+		for _, e := range entries {
+			if e.IsDir() {
+				if _, err := os.Stat(filepath.Join(cfg.ImageDir, e.Name(), "disk.raw")); err == nil {
+					fmt.Println(e.Name())
+					n++
+				}
+			}
+		}
+		if n == 0 {
+			fmt.Fprintln(os.Stderr, "(no images)")
+		}
+	case "pack":
+		fs := flag.NewFlagSet("image pack", flag.ExitOnError)
+		out := fs.String("o", "", "output path (default <images>/<name>.tar.zst)")
+		_ = fs.Parse(args[1:])
+		rest := fs.Args()
+		if len(rest) < 1 {
+			fatal("Usage: warmbox image pack <name> [-o out.tar.zst]")
+		}
+		p, err := imagepack.Pack(cfg.ImageDir, rest[0], *out)
+		if err != nil {
+			fatal("Error: %v", err)
+		}
+		fi, _ := os.Stat(p)
+		fmt.Fprintf(os.Stderr, "packed %s -> %s (%.2f GiB)\n", rest[0], p, float64(fi.Size())/(1<<30))
+	case "pull":
+		fs := flag.NewFlagSet("image pull", flag.ExitOnError)
+		_ = fs.Parse(args[1:])
+		rest := fs.Args()
+		if len(rest) < 2 {
+			fatal("Usage: warmbox image pull <name> <file|url>")
+		}
+		if err := imagepack.Pull(cfg.ImageDir, rest[0], rest[1]); err != nil {
+			fatal("Error: %v", err)
+		}
+		fmt.Fprintf(os.Stderr, "pulled %s into %s\n", rest[0], filepath.Join(cfg.ImageDir, rest[0]))
+	default:
+		fatal("unknown image command %q (pack|pull|list)", args[0])
+	}
 }
 
 func cmdImages(args []string) {

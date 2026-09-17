@@ -26,6 +26,24 @@ virtio-gpu device. Warmbox hands the guest its identity over a virtiofs share
 (tag `warmbox-config`) because EFI boot has no kernel cmdline — the image's
 `warmbox-ready` unit reads it and reports readiness back to the daemon.
 
+## Shipping an image
+
+Images are large raw disks, so they can be packed as a single compressed
+artifact and expanded on the destination:
+
+```
+warmbox image pack omarchy                 # -> ~/.warmbox/images/omarchy.tar.zst
+warmbox image pull omarchy <file-or-url>   # expand into ~/.warmbox/images/omarchy
+warmbox image list                         # local images (offline)
+```
+
+The Omarchy image packs from ~8.4 GiB on disk to ~3.9 GiB (zstd; the disk is
+mostly free space). `pull` writes sparsely, but note APFS only preserves *large*
+holes: this image's free space is fragmented by btrfs across the device, so an
+expanded copy can allocate closer to its full logical size. Pack/pull is
+therefore best for moving an image between hosts; for local disk economy prefer
+the built-in image (776 MB) or keep the packed artifact and expand on demand.
+
 ## Volumes
 
 A persistent volume (a raw ext4 disk attached as `/dev/vdb`) is mounted at
