@@ -90,5 +90,13 @@ if [[ ! -f /etc/systemd/zram-generator.conf ]] && command -v zram-generator >/de
   note "zram configured"
 fi
 
+# 7. Shrink the image. The package cache, hardware firmware (a VM has no such
+#    hardware) and old journals are pure weight in a guest image.
+pacman -Scc --noconfirm >/dev/null 2>&1 || true
+pacman -Rns --noconfirm linux-firmware linux-firmware-whence >/dev/null 2>&1 || true
+journalctl --vacuum-size=16M >/dev/null 2>&1 || true
+rm -rf /var/cache/pacman/pkg/* /root/aquamarine /root/install-omarchy.sh 2>/dev/null || true
+note "image slimmed (cache, firmware, journals)"
+
 chown -R "$USER_NAME:$USER_NAME" "$HOME_DIR/.config/hypr" "$HOME_DIR/.config/omarchy" 2>/dev/null || true
 note "done — reboot to start the session"
