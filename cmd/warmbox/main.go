@@ -343,6 +343,9 @@ func cmdService(args []string) {
 		_ = fs.Parse(args[1:])
 	}
 
+	setFlags := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { setFlags[f.Name] = true })
+
 	domain := fmt.Sprintf("gui/%d", os.Getuid())
 	target := domain + "/" + warmboxLabel
 	lc := func(a ...string) error {
@@ -370,29 +373,32 @@ func cmdService(args []string) {
 		}
 		return err
 	}
+	// Rewrite the plist when asked to (install), when flags are given, or when
+	// no plist exists yet — but not on a bare start/restart, which must keep
+	// the configured pool/image.
+	needWrite := sub == "install" || len(setFlags) > 0 || !stat(launchAgentPath())
 
 	switch sub {
-	case "install":
+	case "install", "start":
 		if err := cfg.EnsureDirs(); err != nil {
 			fatal("Error: %v", err)
 		}
-		if err := writeLaunchAgent(cfg, pool); err != nil {
-			fatal("Error: %v", err)
-		}
-		_ = lcQuiet("bootout", target) // ignore "not loaded"
-		if err := bootstrap(); err != nil {
-			fatal("Error: %v", err)
-		}
-		fmt.Fprintf(os.Stderr, "installed and started %s (pool=%d)\n", warmboxLabel, pool)
-	case "start":
-		if loaded() {
-			if err := lc("kickstart", target); err != nil {
+		if needWrite {
+			if err := writeLaunchAgent(cfg, pool); err != nil {
 				fatal("Error: %v", err)
 			}
-		} else if err := bootstrap(); err != nil {
-			fatal("Error (install first?): %v", err)
 		}
-		fmt.Fprintln(os.Stderr, "started")
+		if sub == "install" || !loaded() {
+			if sub == "install" {
+				_ = lcQuiet("bootout", target)
+			}
+			if err := bootstrap(); err != nil {
+				fatal("Error: %v", err)
+			}
+		} else if err := lc("kickstart", target); err != nil {
+			fatal("Error: %v", err)
+		}
+		fmt.Fprintf(os.Stderr, "started %s\n", warmboxLabel)
 	case "stop":
 		if !loaded() {
 			fmt.Fprintln(os.Stderr, "not running")
@@ -403,10 +409,13 @@ func cmdService(args []string) {
 		}
 		fmt.Fprintln(os.Stderr, "stopped")
 	case "restart":
-		if loaded() {
-			if err := lc("bootout", target); err != nil {
+		if needWrite {
+			if err := writeLaunchAgent(cfg, pool); err != nil {
 				fatal("Error: %v", err)
 			}
+		}
+		if loaded() {
+			_ = lcQuiet("bootout", target)
 		}
 		if err := bootstrap(); err != nil {
 			fatal("Error (install first?): %v", err)
