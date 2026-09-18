@@ -1,0 +1,5 @@
+[Desktop Entry]
+Type=Application
+Name=Ambiance wallpaper
+Exec=/usr/local/bin/warmbox-wallpaper.sh
+OnlyShowIn=LXQt;

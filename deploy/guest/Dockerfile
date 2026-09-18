@@ -5,6 +5,8 @@
 #     --build-arg BROWSER=epiphany deploy/guest
 #
 # BROWSER may be: none | netsurf | epiphany | firefox | chromium
+# DESKTOP may be: xfce | lxqt
+# THEME may be: default | win11 | ambiance (ambiance pairs with lxqt)
 # The resulting image contains /initramfs.zst (the whole rootfs, zstd) and
 # /boot/vmlinuz-virt (compressed kernel). See `warmbox setup` for extraction.
 #
@@ -25,22 +27,31 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /warmbox-agent .
 FROM alpine:3.22
 
 ARG BROWSER=chromium
+ARG DESKTOP=xfce
 ARG THEME=default
 
+# Base GUI stack: XFCE (default) or LXQt-Ambiance. Both share TigerVNC +
+# dbus + fonts; only the session layer differs so squashfs/overlay/VNC stay
+# identical across images.
 RUN set -eux; \
     apk add --no-cache \
         tigervnc \
         xsetroot xdpyinfo xprop \
-        xfce4 xfce4-terminal \
         dbus dbus-x11 \
-        adwaita-icon-theme hicolor-icon-theme \
+        adwaita-icon-theme hicolor-icon-theme papirus-icon-theme \
         shared-mime-info gdk-pixbuf \
         font-misc-misc font-dejavu \
         iproute2 socat bash procps coreutils \
         kmod linux-virt \
         xmessage \
         darkhttpd \
-        curl zstd
+        curl zstd; \
+    case "${DESKTOP}" in \
+        xfce) apk add --no-cache xfce4 xfce4-terminal ;; \
+        lxqt) apk add --no-cache lxqt-desktop qterminal \
+                kvantum lxqt-themes obconf-qt ;; \
+        *) echo "unknown DESKTOP=${DESKTOP}" >&2; exit 1 ;; \
+    esac
 
 # Optional browser.
 RUN set -eux; \
@@ -62,7 +73,9 @@ RUN set -eux; \
     if command -v chromium >/dev/null 2>&1; then \
         sed -i 's|^Exec=/usr/bin/chromium-browser|Exec=/usr/bin/chromium-browser --no-sandbox --disable-gpu --disable-dev-shm-usage|' /usr/share/applications/chromium.desktop; \
         rm -f /usr/share/applications/xfce4-web-browser.desktop; \
-        sed -i 's/^WebBrowser=.*/WebBrowser=chromium/' /etc/xdg/xfce4/helpers.rc; \
+        if [ -f /etc/xdg/xfce4/helpers.rc ]; then \
+            sed -i 's/^WebBrowser=.*/WebBrowser=chromium/' /etc/xdg/xfce4/helpers.rc; \
+        fi; \
         update-desktop-database /usr/share/applications 2>/dev/null || true; \
     fi
 
@@ -76,11 +89,21 @@ RUN set -eux; \
     /usr/local/bin/warmbox-app install /apps/dashboard; \
     rm -rf /apps
 
-# Win11 hand-rolled theme (THEME=win11): a dark, centered bottom taskbar with a
-# start menu and docklike app icons, Fluent-ish flat GTK theme, matching xfwm4
-# decorations, and a generated "bloom" wallpaper. THEME=default keeps stock XFCE.
+# Win11 hand-rolled theme (THEME=win11, xfce only): see below.
+# Ambiance theme (THEME=ambiance, lxqt): warm dark Lubuntu-style panel +
+# openbox decorations + Kvantum bridge + Papirus icons. Ships as
+# themes/ambiance/ (lxqt.conf, openbox/rc.xml, kvantum theme, autostart).
 COPY themes /themes
 RUN set -eux; \
+    if [ "${THEME}" = "ambiance" ]; then \
+        mkdir -p /etc/xdg/lxqt /etc/xdg/openbox \
+                  /usr/share/Kvantum /etc/xdg/autostart; \
+        cp -r /themes/ambiance/lxqt/* /etc/xdg/lxqt/ 2>/dev/null || true; \
+        cp /themes/ambiance/openbox/rc.xml /etc/xdg/openbox/rc.xml 2>/dev/null || true; \
+        cp -r /themes/ambiance/Kvantum/* /usr/share/Kvantum/ 2>/dev/null || true; \
+        cp /themes/ambiance/autostart/*.desktop /etc/xdg/autostart/ 2>/dev/null || true; \
+        gtk-update-icon-cache -qtf /usr/share/icons/Papirus 2>/dev/null || true; \
+    fi; \
     if [ "${THEME}" = "win11" ]; then \
         apk add --no-cache xfce4-whiskermenu-plugin xfce4-docklike-plugin; \
         # GTK + window-manager themes. The GTK theme imports Adwaita (GTK's

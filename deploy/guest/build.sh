@@ -16,7 +16,17 @@
 #
 # Env:
 #   BROWSER       none|netsurf|epiphany|firefox|chromium   (default epiphany)
-#   THEME         default|win11                             (default win11)
+#   DESKTOP       xfce|lxqt                                (default xfce)
+#   THEME         default|win11|ambiance                    (default win11;
+#                 ambiance pairs with DESKTOP=lxqt)
+#   VARIANT       output suffix for parallel images, e.g. lxqt-ambiance.
+#                 Empty (default) writes the classic filenames; set VARIANT to
+#                 keep 3 images side by side:
+#                   DESKTOP=xfce THEME=win11 VARIANT=xfce    -> rootfs-xfce.squashfs ...
+#                   DESKTOP=lxqt THEME=ambiance VARIANT=lxqt -> rootfs-lxqt.squashfs ...
+#                 Point a daemon at a variant with
+#                 --squash/--overlay-initrd/--disk/--boot-initrd/--image flags
+#                 (or a separate --workdir).
 #   IMAGE         docker image tag                          (default warmbox-guest:latest)
 #   WARMBOX_HOME  output directory                          (default ~/.warmbox)
 #   PLATFORM      docker build platform                     (default linux/arm64)
@@ -25,7 +35,12 @@ set -eu
 
 here=$(cd "$(dirname "$0")" && pwd)
 BROWSER="${BROWSER:-chromium}"
+DESKTOP="${DESKTOP:-xfce}"
 THEME="${THEME:-win11}"
+VARIANT="${VARIANT:-}"
+# Variant suffix: "-lxqt" etc, or "" for classic paths.
+SUFFIX=""
+[ -n "$VARIANT" ] && SUFFIX="-$VARIANT"
 IMAGE="${IMAGE:-warmbox-guest:latest}"
 WARMBOX_HOME="${WARMBOX_HOME:-$HOME/.warmbox}"
 PLATFORM="${PLATFORM:-linux/arm64}"
@@ -33,9 +48,10 @@ PLATFORM="${PLATFORM:-linux/arm64}"
 # volume can be; request larger with `warmbox volume create --size`.
 VOLUME_BASE_SIZE="${VOLUME_BASE_SIZE:-2G}"
 
-echo "==> building $IMAGE (BROWSER=$BROWSER, THEME=$THEME, platform=$PLATFORM)"
+echo "==> building $IMAGE (BROWSER=$BROWSER, DESKTOP=$DESKTOP, THEME=$THEME, platform=$PLATFORM, variant=${VARIANT:-default})"
 docker build --platform "$PLATFORM" -t "$IMAGE" \
     --build-arg "BROWSER=$BROWSER" \
+    --build-arg "DESKTOP=$DESKTOP" \
     --build-arg "THEME=$THEME" "$here"
 
 mkdir -p "$WARMBOX_HOME"
@@ -44,13 +60,13 @@ echo "==> extracting kernel + initramfs"
 cid=$(docker create --platform "$PLATFORM" "$IMAGE")
 trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT INT TERM
 
-docker cp "$cid:/initramfs.zst" "$WARMBOX_HOME/initramfs.zst"
-docker cp "$cid:/boot/initramfs-virt" "$WARMBOX_HOME/initramfs-virt"
+docker cp "$cid:/initramfs.zst" "$WARMBOX_HOME/initramfs$SUFFIX.zst"
+docker cp "$cid:/boot/initramfs-virt" "$WARMBOX_HOME/initramfs-virt$SUFFIX"
 
 tmpvmlinuz=$(mktemp /tmp/vmlinuz-XXXXXX)
 docker cp "$cid:/boot/vmlinuz-virt" "$tmpvmlinuz"
 # LC_ALL=C: BSD tr on macOS chokes on locales when scanning kernel bytes.
-LC_ALL=C "$here/extract-vmlinux" "$tmpvmlinuz" > "$WARMBOX_HOME/vmlinux"
+LC_ALL=C "$here/extract-vmlinux" "$tmpvmlinuz" > "$WARMBOX_HOME/vmlinux$SUFFIX"
 rm -f "$tmpvmlinuz"
 
 echo "==> building rootfs.squashfs + initramfs-overlay"
@@ -58,6 +74,7 @@ tmptar=$(mktemp /tmp/wb-rootfs-XXXXXX)
 docker export "$cid" -o "$tmptar"
 docker run --rm \
     -e VOLUME_BASE_SIZE="$VOLUME_BASE_SIZE" \
+    -e SUFFIX="$SUFFIX" \
     -v "$WARMBOX_HOME:/host" \
     -v "$here:/guest:ro" \
     -v "$tmptar:/rootfs.tar:ro" \
@@ -71,7 +88,7 @@ docker run --rm \
         rm -f /rootfs/initramfs.zst
 
         # --- read-only squashfs base ---
-        mksquashfs /rootfs /host/rootfs.squashfs \
+        mksquashfs /rootfs /host/rootfs$SUFFIX.squashfs \
             -comp zstd -noappend -all-root -no-progress -quiet
 
         # --- base volume image (cloned for each new persistent volume) ---
@@ -118,11 +135,11 @@ docker run --rm \
         done
         [ -e bin/sh ] || ln -sf busybox bin/sh
 
-        find . | cpio -o -H newc --quiet | zstd -19 -T0 -f --quiet -o /host/initramfs-overlay
+        find . | cpio -o -H newc --quiet | zstd -19 -T0 -f --quiet -o /host/initramfs-overlay$SUFFIX
     '
 rm -f "$tmptar"
 
-ls -lh "$WARMBOX_HOME/vmlinux" "$WARMBOX_HOME/initramfs.zst" \
-    "$WARMBOX_HOME/initramfs-virt" "$WARMBOX_HOME/rootfs.squashfs" \
-    "$WARMBOX_HOME/initramfs-overlay" "$WARMBOX_HOME/volume-base.img" 2>/dev/null || true
+ls -lh "$WARMBOX_HOME/vmlinux$SUFFIX" "$WARMBOX_HOME/initramfs$SUFFIX.zst" \
+    "$WARMBOX_HOME/initramfs-virt$SUFFIX" "$WARMBOX_HOME/rootfs$SUFFIX.squashfs" \
+    "$WARMBOX_HOME/initramfs-overlay$SUFFIX" "$WARMBOX_HOME/volume-base.img" 2>/dev/null || true
 echo "==> done. run: warmbox daemon --mem 768 --pool 2"

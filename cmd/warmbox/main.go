@@ -38,14 +38,16 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		usage()
-		os.Exit(1)
+		cmdHome()
+		return
 	}
 	switch os.Args[1] {
 	case "daemon":
 		cmdDaemon(os.Args[2:])
 	case "service":
 		cmdService(os.Args[2:])
+	case "help", "-h", "--help":
+		usage()
 	case "setup":
 		cmdSetup(os.Args[2:])
 	case "create":
@@ -63,9 +65,82 @@ func main() {
 	case "snapshot":
 		cmdSnapshot(os.Args[2:])
 	default:
-		usage()
-		os.Exit(1)
+		unknownCommand(os.Args[1])
 	}
+}
+
+// cmdHome is what a bare `warmbox` prints: where the daemon is and what to do
+// next, instead of a wall of usage.
+func cmdHome() {
+	base := apiBase(":7070")
+	fmt.Fprintln(os.Stderr, "warmbox — self-hosted GUI desktop microVMs")
+
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get(withToken(base+"/api/desktops", tokenDefault()))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "\ndaemon: not running (%s)\n", base)
+		fmt.Fprintln(os.Stderr, "  start it in the background:  warmbox service start")
+		fmt.Fprintln(os.Stderr, "  or in the foreground:        warmbox daemon")
+	} else {
+		defer resp.Body.Close()
+		var out struct {
+			Desktops []struct {
+				ID      string `json:"id"`
+				State   string `json:"state"`
+				GuestIP string `json:"guest_ip"`
+			} `json:"desktops"`
+		}
+		_ = json.NewDecoder(resp.Body).Decode(&out)
+		fmt.Fprintf(os.Stderr, "\ndaemon: running at %s\n", base)
+		if len(out.Desktops) == 0 {
+			fmt.Fprintln(os.Stderr, "desktops: none")
+		} else {
+			for _, d := range out.Desktops {
+				fmt.Fprintf(os.Stderr, "  %-14s %-6s %s%s\n", d.ID, d.State, base, "/d/"+d.ID)
+			}
+		}
+	}
+	fmt.Fprintln(os.Stderr, "\ncommands: create [--image NAME] · images · list · destroy · volume · snapshot · service")
+	fmt.Fprintln(os.Stderr, "          warmbox help for everything")
+}
+
+// unknownCommand prints a suggestion for a mistyped command (e.g. "deamon").
+func unknownCommand(cmd string) {
+	known := []string{"daemon", "service", "setup", "create", "images", "image",
+		"list", "destroy", "volume", "snapshot", "help"}
+	best, dist := "", 3
+	for _, k := range known {
+		if d := editDistance(cmd, k); d < dist {
+			best, dist = k, d
+		}
+	}
+	if best != "" {
+		fmt.Fprintf(os.Stderr, "unknown command %q — did you mean %q?\n", cmd, best)
+	} else {
+		fmt.Fprintf(os.Stderr, "unknown command %q\n", cmd)
+	}
+	fmt.Fprintln(os.Stderr, "run `warmbox help` for the list")
+	os.Exit(1)
+}
+
+func editDistance(a, b string) int {
+	prev := make([]int, len(b)+1)
+	for j := range prev {
+		prev[j] = j
+	}
+	for i := 1; i <= len(a); i++ {
+		cur := make([]int, len(b)+1)
+		cur[0] = i
+		for j := 1; j <= len(b); j++ {
+			cost := 1
+			if a[i-1] == b[j-1] {
+				cost = 0
+			}
+			cur[j] = min(cur[j-1]+1, prev[j]+1, prev[j-1]+cost)
+		}
+		prev = cur
+	}
+	return prev[len(b)]
 }
 
 func usage() {
