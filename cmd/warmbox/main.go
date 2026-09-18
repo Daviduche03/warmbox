@@ -13,6 +13,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -227,6 +228,37 @@ func launchAgentPath() string {
 	return filepath.Join(home, "Library", "LaunchAgents", warmboxLabel+".plist")
 }
 
+// launchdLoaded reports whether the warmbox background service is loaded.
+func launchdLoaded() bool {
+	if runtime.GOOS != "darwin" {
+		return false
+	}
+	domain := fmt.Sprintf("gui/%d", os.Getuid())
+	c := exec.Command("launchctl", "print", domain+"/"+warmboxLabel)
+	c.Stdout, c.Stderr = nil, nil
+	return c.Run() == nil
+}
+
+// preflightAddr refuses to start a daemon on an address another one holds: that
+// would silently run a second orchestrator (e.g. alongside the launchd service)
+// with different settings. A short retry covers a service handover.
+func preflightAddr(addr string) {
+	var lerr error
+	for i := 0; i < 6; i++ {
+		ln, err := net.Listen("tcp", addr)
+		if err == nil {
+			ln.Close()
+			return
+		}
+		lerr = err
+		time.Sleep(500 * time.Millisecond)
+	}
+	if launchdLoaded() {
+		fatal("another daemon is already listening on %s (the background service).\n  stop it first:  warmbox service stop\n  (or run this on a different --addr)", addr)
+	}
+	fatal("can't listen on %s: %v", addr, lerr)
+}
+
 // serviceToken returns the daemon token from ~/.warmbox/token, generating one
 // if it does not exist yet.
 func serviceToken() string {
@@ -400,6 +432,7 @@ func cmdDaemon(args []string) {
 	if err := cfg.EnsureDirs(); err != nil {
 		fatal("Error: %v", err)
 	}
+	preflightAddr(cfg.APIAddr)
 	mgr := desktop.NewManager(cfg, os.Stderr)
 	images := mgr.Images()
 
