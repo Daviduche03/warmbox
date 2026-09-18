@@ -85,23 +85,22 @@ func (m *Manager) start(id, volumeName, volumeImage, imageName string) (*VM, err
 	consolePath := filepath.Join(dir, "console.log")
 	pidPath := filepath.Join(dir, "vm.pid")
 
-	// Resolve the boot image. A named image (under ImageDir) or an EFIDisk
-	// boots as a full EFI disk; otherwise fall back to the built-in image
+	// Resolve the boot image. A named image is either an EFI disk or an overlay
+	// (squashfs) image; otherwise fall back to the built-in image
 	// (overlay > disk > initramfs).
-	var (
-		efiDisk, efiVars string
-		meta             ImageMeta
-	)
+	var img resolved
+	haveImg := false
 	switch {
 	case imageName != "" && !isBuiltinImage(imageName):
-		d, v, mm, err := m.resolveImage(imageName)
+		r, err := m.resolveImage(imageName)
 		if err != nil {
 			return nil, err
 		}
-		efiDisk, efiVars, meta = d, v, mm
+		img, haveImg = r, true
 	case !isBuiltinImage(imageName) && m.cfg.EFIDisk != "":
-		efiDisk, efiVars = m.cfg.EFIDisk, m.cfg.EFIVars
+		img, haveImg = resolved{kind: "efi", disk: m.cfg.EFIDisk, vars: m.cfg.EFIVars}, true
 	}
+	meta := img.meta
 
 	// Per-image overrides win over the daemon defaults.
 	cpus, mem := m.cfg.CPUs, m.cfg.MemMiB
@@ -144,19 +143,19 @@ func (m *Manager) start(id, volumeName, volumeImage, imageName string) (*VM, err
 		Input:   input,
 	}
 	switch {
-	case efiDisk != "":
-		if _, err := os.Stat(efiDisk); err != nil {
-			return nil, fmt.Errorf("efi disk %s: %w", efiDisk, err)
+	case haveImg && img.kind == "efi":
+		if _, err := os.Stat(img.disk); err != nil {
+			return nil, fmt.Errorf("efi disk %s: %w", img.disk, err)
 		}
 		diskPath := filepath.Join(dir, "disk.raw")
-		if err := cloneFile(efiDisk, diskPath); err != nil {
+		if err := cloneFile(img.disk, diskPath); err != nil {
 			return nil, fmt.Errorf("cloning efi disk: %w", err)
 		}
 		// Seed the boot entry from the machine that installed the disk when a
 		// variable store is provided; otherwise let vfkit create a fresh one.
 		varPath := filepath.Join(dir, "efi-vars.fd")
-		if efiVars != "" {
-			if err := copyFile(efiVars, varPath); err != nil {
+		if img.vars != "" {
+			if err := copyFile(img.vars, varPath); err != nil {
 				return nil, fmt.Errorf("seeding efi vars: %w", err)
 			}
 		} else {
@@ -185,6 +184,13 @@ func (m *Manager) start(id, volumeName, volumeImage, imageName string) (*VM, err
 			return nil, fmt.Errorf("writing config.json: %w", err)
 		}
 		spec.Shares = append(spec.Shares, Share{Dir: cfgDir, Tag: "warmbox-config"})
+	case haveImg && img.kind == "overlay":
+		// Startup is booted directly by warmbox, so the guest gets its identity
+		// on the kernel cmdline (as the built-in image does).
+		spec.Kernel = img.kernel
+		spec.Cmdline = cmdline
+		spec.Initrd = img.initrd
+		spec.Disks = append(spec.Disks, Disk{Path: img.squash, ReadOnly: true})
 	case m.overlayAvailable():
 		spec.Kernel = m.cfg.KernelPath
 		spec.Cmdline = cmdline

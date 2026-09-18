@@ -19,16 +19,36 @@ import (
 	"github.com/klauspost/compress/zstd"
 )
 
-// members are the files that make up a packed image. disk.raw is required;
-// the others are optional.
-var members = []string{"disk.raw", "efi-vars.fd", "meta.json"}
+// members are the files that make up a packed image: either an EFI disk
+// (disk.raw [+ efi-vars.fd]) or an overlay image (vmlinux + rootfs.squashfs +
+// initramfs-overlay), plus an optional meta.json. Missing members are skipped.
+var members = []string{
+	"disk.raw", "efi-vars.fd", "meta.json",
+	"vmlinux", "rootfs.squashfs", "initramfs-overlay",
+	"initramfs.zst", "initramfs-virt",
+}
+
+// isImage reports whether dir holds a bootable image.
+func isImage(dir string) bool {
+	if exists(filepath.Join(dir, "disk.raw")) {
+		return true
+	}
+	return exists(filepath.Join(dir, "vmlinux")) &&
+		exists(filepath.Join(dir, "rootfs.squashfs")) &&
+		exists(filepath.Join(dir, "initramfs-overlay"))
+}
+
+func exists(p string) bool {
+	_, err := os.Stat(p)
+	return err == nil
+}
 
 // Pack writes imageDir/name as a zstd-compressed tar archive. If out is empty
 // it defaults to imageDir/<name>.tar.zst.
 func Pack(imageDir, name, out string) (string, error) {
 	dir := filepath.Join(imageDir, name)
-	if _, err := os.Stat(filepath.Join(dir, "disk.raw")); err != nil {
-		return "", fmt.Errorf("image %q has no disk.raw at %s", name, dir)
+	if !isImage(dir) {
+		return "", fmt.Errorf("image %q has no disk.raw or squashfs set at %s", name, dir)
 	}
 	if out == "" {
 		out = filepath.Join(imageDir, name+".tar.zst")

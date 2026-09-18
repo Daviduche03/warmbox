@@ -95,7 +95,16 @@ startup and you choose one per desktop:
 | image | base | size on disk | boot |
 |---|---|---|---|
 | `default` | Alpine + XFCE | ~776 MB (compressed squashfs base) | ~1s, shared rootfs |
+| `lxqt` | Alpine + LXQt | ~800 MB (compressed squashfs base) | ~7s cold |
 | `omarchy` | Arch + Hyprland/Quickshell | 24 GB sparse, ~8.4 GB real | ~13s cold, instant if pooled |
+
+The built-in and `lxqt` images are *overlay* images (a shared read-only squashfs
+plus a writable upper); `omarchy` is an *EFI disk*. Both kinds are named images
+and are selected the same way. Build a variant with:
+
+```sh
+DESKTOP=lxqt THEME=ambiance VARIANT=lxqt ./deploy/guest/build.sh   # -> images/lxqt
+```
 
 Images travel as a single compressed artifact:
 
