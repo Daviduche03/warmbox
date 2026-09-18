@@ -102,6 +102,7 @@ RUN set -eux; \
         cp /themes/ambiance/openbox/rc.xml /etc/xdg/openbox/rc.xml 2>/dev/null || true; \
         cp -r /themes/ambiance/Kvantum/* /usr/share/Kvantum/ 2>/dev/null || true; \
         cp /themes/ambiance/autostart/*.desktop /etc/xdg/autostart/ 2>/dev/null || true; \
+        install -m 0755 /themes/ambiance/autostart/wallpaper.sh /usr/local/bin/warmbox-wallpaper.sh; \
         gtk-update-icon-cache -qtf /usr/share/icons/Papirus 2>/dev/null || true; \
     fi; \
     if [ "${THEME}" = "win11" ]; then \
