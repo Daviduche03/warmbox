@@ -77,6 +77,10 @@ func Open(path string) (*DB, error) {
 		db.Close()
 		return nil, err
 	}
+	if err := migrateAuth(d); err != nil {
+		db.Close()
+		return nil, err
+	}
 	return d, nil
 }
 

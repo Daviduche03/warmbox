@@ -82,6 +82,8 @@ export interface Desktop {
   guest_ip?: string;
   started: string;
   volume?: string;
+  allow?: string[];
+  deny?: string[];
 }
 
 export interface Volume {
@@ -133,10 +135,20 @@ export const api = {
   desktops: {
     list: () => request<{ desktops: Desktop[] | null }>("/api/desktops"),
     get: (id: string) => request<Desktop>(`/api/desktops/${id}`),
-    create: (opts: { volume?: string; image?: string } = {}) =>
+    create: (opts: {
+      volume?: string;
+      image?: string;
+      allow?: string[];
+      deny?: string[];
+    } = {}) =>
       request<{ id: string; vnc: string; ws: string; volume?: string }>(
         "/api/desktops",
         { method: "POST", ...json(opts) },
+      ),
+    setPolicy: (id: string, allow: string[], deny: string[]) =>
+      request<{ id: string; allow: string[]; deny: string[] }>(
+        `/api/desktops/${id}/policy`,
+        { method: "POST", ...json({ allow, deny }) },
       ),
     destroy: (id: string) =>
       request<{ status: string }>(`/api/desktops/${id}`, { method: "DELETE" }),

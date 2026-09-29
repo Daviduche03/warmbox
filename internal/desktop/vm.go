@@ -86,6 +86,9 @@ type Info struct {
 	GuestIP string    `json:"guest_ip,omitempty"`
 	Started time.Time `json:"started"`
 	Volume  string    `json:"volume,omitempty"`
+	// Allow and Deny are the desktop's egress policy (set by the API).
+	Allow []string `json:"allow,omitempty"`
+	Deny  []string `json:"deny,omitempty"`
 }
 
 // Info returns a copy safe for serialisation.

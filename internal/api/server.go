@@ -14,10 +14,12 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"runmesh/workspace/internal/catalog"
 	"runmesh/workspace/internal/desktop"
+	"runmesh/workspace/internal/egress"
 	"runmesh/workspace/internal/netutil"
 	"runmesh/workspace/internal/pool"
 	"runmesh/workspace/internal/vnc"
@@ -37,6 +39,9 @@ type Server struct {
 	started time.Time
 	info    StatusInfo
 	web     http.Handler
+
+	polMu    sync.Mutex
+	policies map[string]egress.Policy // per-desktop egress policy
 }
 
 // New builds a Server. volumes and cat may be nil when those are disabled.
@@ -44,7 +49,59 @@ func New(mgr *desktop.Manager, p *pool.Pool, cfg *desktop.Config, volumes *volum
 	if log == nil {
 		log = io.Discard
 	}
-	return &Server{mgr: mgr, pool: p, cfg: cfg, volumes: volumes, catalog: cat, log: log, started: time.Now(), web: web.Handler()}
+	return &Server{mgr: mgr, pool: p, cfg: cfg, volumes: volumes, catalog: cat, log: log, started: time.Now(), web: web.Handler(), policies: map[string]egress.Policy{}}
+}
+
+// effectivePolicy merges a request's allow/deny with the daemon defaults. A
+// request with neither inherits the daemon policy.
+func (s *Server) effectivePolicy(allow, deny []string) egress.Policy {
+	if len(allow) == 0 && len(deny) == 0 {
+		return egress.Policy{Allow: s.cfg.Allow, Deny: s.cfg.Deny}
+	}
+	return egress.Policy{Allow: allow, Deny: deny}
+}
+
+func (s *Server) setPolicy(id string, p egress.Policy) {
+	s.polMu.Lock()
+	s.policies[id] = p
+	s.polMu.Unlock()
+}
+
+func (s *Server) policyFor(id string) egress.Policy {
+	s.polMu.Lock()
+	defer s.polMu.Unlock()
+	return s.policies[id]
+}
+
+// EgressPolicyForIP resolves the policy for a guest by its address. The egress
+// proxy calls this for every connection, so a per-desktop policy is enforced
+// without the guest knowing anything about it.
+func (s *Server) EgressPolicyForIP(ip string) (egress.Policy, bool) {
+	for _, d := range s.mgr.List() {
+		if d.GuestIP == ip {
+			return s.policyFor(d.ID), true
+		}
+	}
+	return egress.Policy{}, false
+}
+
+// setDesktopPolicy updates a desktop's egress policy after creation.
+func (s *Server) setDesktopPolicy(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if _, ok := s.mgr.Get(id); !ok {
+		http.NotFound(w, r)
+		return
+	}
+	var req struct {
+		Allow []string `json:"allow"`
+		Deny  []string `json:"deny"`
+	}
+	if r.Body != nil {
+		_ = json.NewDecoder(r.Body).Decode(&req)
+	}
+	p := egress.Policy{Allow: req.Allow, Deny: req.Deny}
+	s.setPolicy(id, p)
+	writeJSON(w, http.StatusOK, map[string]any{"id": id, "allow": p.Allow, "deny": p.Deny})
 }
 
 // Handler returns the root HTTP handler.
@@ -57,6 +114,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/desktops", s.list)
 	mux.HandleFunc("GET /api/desktops/{id}", s.get)
 	mux.HandleFunc("DELETE /api/desktops/{id}", s.destroy)
+	mux.HandleFunc("POST /api/desktops/{id}/policy", s.setDesktopPolicy)
 
 	// Agent API: exec + files inside the guest (proxied to warmbox-agent).
 	mux.HandleFunc("POST /api/desktops/{id}/exec", s.agentExec)
@@ -78,6 +136,24 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/snapshots", s.snapshotList)
 	mux.HandleFunc("DELETE /api/snapshots/{id}", s.snapshotDelete)
 
+	// Identity: first-run setup, login, sessions, users, workspaces, API tokens.
+	// Setup/login are public by necessity (gated inside withAuth); the rest
+	// require a session or token with sufficient rank.
+	mux.HandleFunc("GET /api/setup/status", s.setupStatus)
+	mux.HandleFunc("POST /api/setup", s.setup)
+	mux.HandleFunc("POST /api/login", s.login)
+	mux.HandleFunc("POST /api/logout", s.logout)
+	mux.HandleFunc("GET /api/me", s.me)
+	mux.HandleFunc("PATCH /api/me/password", s.changePassword)
+	mux.HandleFunc("GET /api/users", s.listUsers)
+	mux.HandleFunc("POST /api/users", s.createUser)
+	mux.HandleFunc("PATCH /api/users/{id}", s.updateUser)
+	mux.HandleFunc("DELETE /api/users/{id}", s.deleteUser)
+	mux.HandleFunc("GET /api/workspaces", s.listWorkspaces)
+	mux.HandleFunc("GET /api/tokens", s.listTokens)
+	mux.HandleFunc("POST /api/tokens", s.createToken)
+	mux.HandleFunc("DELETE /api/tokens/{id}", s.deleteToken)
+
 	// Guest readiness callback (guest -> host).
 	mux.HandleFunc("GET /internal/ready", s.ready)
 
@@ -94,56 +170,80 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /vnc/{id}/", s.novnc)
 
 	mux.HandleFunc("GET /", s.webui)
-	if s.cfg.Token == "" {
-		return mux
-	}
+	// The middleware itself decides what is public (shell, setup, login,
+	// readiness) and what needs an identity, so it always wraps the mux —
+	// even with no shared token configured.
 	return s.withAuth(mux)
 }
 
-// withAuth gates every stateful route behind a shared token. Accepting the token
-// as a query parameter lets noVNC's autoconnect URL work; on first use we drop
-// an HttpOnly cookie so the WebSocket and console assets inherit it without the
-// token in every URL. The dashboard shell itself (index.html and its static
-// assets) stays public — it carries no data, and its client-side connect screen
-// is what asks a first-time visitor for the token.
+// withAuth gates every stateful route. The dashboard shell stays public — it
+// carries no data, and the client-side setup/login screens are what onboard a
+// first-time visitor. Setup and login are public by necessity (rate limited);
+// everything else needs an identity, and mutating or membership-changing routes
+// additionally need the rank minRoleFor assigns.
 func (s *Server) withAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/internal/ready" {
 			next.ServeHTTP(w, r)
 			return
 		}
-		token := r.URL.Query().Get("token")
-		if token == "" {
-			if a := r.Header.Get("Authorization"); strings.HasPrefix(a, "Bearer ") {
-				token = strings.TrimPrefix(a, "Bearer ")
-			}
-		}
-		if token == "" {
-			if c, err := r.Cookie("warmbox_token"); err == nil {
-				token = c.Value
-			}
-		}
-		valid := subtle.ConstantTimeCompare([]byte(token), []byte(s.cfg.Token)) == 1
-		// Stash the cookie before the shell exemption below so that `/?token=…`
-		// still logs the browser in for the WebSocket and console routes.
-		if valid && r.URL.Query().Get("token") != "" {
-			http.SetCookie(w, &http.Cookie{
-				Name:     "warmbox_token",
-				Value:    token,
-				Path:     "/",
-				HttpOnly: true,
-				SameSite: http.SameSiteLaxMode,
-			})
-		}
 		if isShellPath(r.URL.Path) {
+			// Pre-setup installs still bootstrap the old cookie from ?token=.
+			if !s.usersExist() {
+				s.maybeSetLegacyCookie(w, r)
+			}
 			next.ServeHTTP(w, r)
 			return
 		}
-		if !valid {
+		if r.URL.Path == "/api/setup/status" && r.Method == http.MethodGet {
+			s.setupStatus(w, r)
+			return
+		}
+		if r.URL.Path == "/api/setup" && r.Method == http.MethodPost {
+			if s.usersExist() {
+				http.NotFound(w, r)
+				return
+			}
+			s.setup(w, r)
+			return
+		}
+		if r.URL.Path == "/api/login" && r.Method == http.MethodPost {
+			s.login(w, r)
+			return
+		}
+		ac, ok := s.authenticate(r)
+		if !ok {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
-		next.ServeHTTP(w, r)
+		if ac.userID != "" && catalog.RoleRank(ac.role) < minRoleFor(r.Method, r.URL.Path) {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		if !checkOrigin(r, ac.via == "session") {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ctxKey{}, ac)))
+	})
+}
+
+// maybeSetLegacyCookie preserves the old ?token= bootstrap for installs that
+// have not completed setup yet. Once users exist the shared token is dead.
+func (s *Server) maybeSetLegacyCookie(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.Token == "" || r.URL.Query().Get("token") == "" {
+		return
+	}
+	token := r.URL.Query().Get("token")
+	if subtle.ConstantTimeCompare([]byte(token), []byte(s.cfg.Token)) != 1 {
+		return
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     legacyCookie,
+		Value:    token,
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
 	})
 }
 
@@ -172,18 +272,21 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 
 func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Volume string `json:"volume"`
-		Image  string `json:"image"`
+		Volume string   `json:"volume"`
+		Image  string   `json:"image"`
+		Allow  []string `json:"allow"`
+		Deny   []string `json:"deny"`
 	}
 	if r.Body != nil {
 		_ = json.NewDecoder(r.Body).Decode(&req)
 	}
+	pol := s.effectivePolicy(req.Allow, req.Deny)
 	if req.Volume != "" {
-		s.createWithVolume(w, r, req.Volume)
+		s.createWithVolume(w, r, req.Volume, pol)
 		return
 	}
 	if req.Image != "" {
-		s.createImage(w, r, req.Image)
+		s.createImage(w, r, req.Image, pol)
 		return
 	}
 
@@ -192,6 +295,7 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 		return
 	}
+	s.setPolicy(vm.ID, pol)
 	s.recordDesktop(vm.ID, "", "busy", "", 0)
 	writeJSON(w, http.StatusCreated, map[string]any{
 		"id":  vm.ID,
@@ -203,13 +307,14 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 // createImage provisions a desktop from a named image. If it is the daemon's
 // default image it can come from the warm pool (instant); other images boot on
 // demand (each is a different disk).
-func (s *Server) createImage(w http.ResponseWriter, r *http.Request, name string) {
+func (s *Server) createImage(w http.ResponseWriter, r *http.Request, name string, pol egress.Policy) {
 	if desktop.SameImage(name, s.cfg.Image) {
 		vm, err := s.pool.Acquire(r.Context())
 		if err != nil {
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 			return
 		}
+		s.setPolicy(vm.ID, pol)
 		s.recordDesktop(vm.ID, "", "busy", "", 0)
 		writeJSON(w, http.StatusCreated, map[string]any{
 			"id":  vm.ID,
@@ -225,6 +330,7 @@ func (s *Server) createImage(w http.ResponseWriter, r *http.Request, name string
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
+	s.setPolicy(id, pol)
 	s.recordDesktop(id, "", "booting", "", 0)
 	wctx, cancel := context.WithTimeout(r.Context(), 120*time.Second)
 	defer cancel()
@@ -248,7 +354,7 @@ func (s *Server) images(w http.ResponseWriter, r *http.Request) {
 // createWithVolume boots a VM whose writable layer is a persistent volume.
 // Volume-backed VMs cannot come from the warm pool (the disk must be attached
 // before boot), so they cold-boot.
-func (s *Server) createWithVolume(w http.ResponseWriter, r *http.Request, name string) {
+func (s *Server) createWithVolume(w http.ResponseWriter, r *http.Request, name string, pol egress.Policy) {
 	if !s.volumesEnabled(w) {
 		return
 	}
@@ -269,6 +375,7 @@ func (s *Server) createWithVolume(w http.ResponseWriter, r *http.Request, name s
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
+	s.setPolicy(id, pol)
 	s.recordDesktop(id, name, "booting", "", 0)
 	wctx, cancel := context.WithTimeout(ctx, 90*time.Second)
 	defer cancel()
@@ -313,15 +420,16 @@ iframe{border:0;width:100vw;height:100vh;display:block}</style></head>
 </body></html>`
 
 // dash serves the short desktop URL. A request that still carries ?token= is
-// redirected to the bare path (the auth cookie has been set by the middleware),
-// so the address bar ends up clean.
+// redirected to the bare path only when a login cookie already proves the
+// session — otherwise the query token IS the credential (API tokens don't set
+// cookies) and stripping it would lock the client out.
 func (s *Server) dash(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if _, ok := s.mgr.Get(id); !ok {
 		http.NotFound(w, r)
 		return
 	}
-	if r.URL.Query().Get("token") != "" {
+	if r.URL.Query().Get("token") != "" && s.hasLoginCookie(r) {
 		http.Redirect(w, r, "/d/"+id, http.StatusFound)
 		return
 	}
@@ -330,7 +438,12 @@ func (s *Server) dash(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) list(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"desktops": s.mgr.List()})
+	infos := s.mgr.List()
+	for i := range infos {
+		p := s.policyFor(infos[i].ID)
+		infos[i].Allow, infos[i].Deny = p.Allow, p.Deny
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"desktops": infos})
 }
 
 func (s *Server) get(w http.ResponseWriter, r *http.Request) {
@@ -340,7 +453,10 @@ func (s *Server) get(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown desktop"})
 		return
 	}
-	writeJSON(w, http.StatusOK, vm.Info())
+	info := vm.Info()
+	p := s.policyFor(id)
+	info.Allow, info.Deny = p.Allow, p.Deny
+	writeJSON(w, http.StatusOK, info)
 }
 
 func (s *Server) destroy(w http.ResponseWriter, r *http.Request) {

@@ -523,17 +523,17 @@ func cmdDaemon(args []string) {
 
 	go p.Run(ctx)
 
+	apiSrv := api.New(mgr, p, cfg, store, cat, os.Stderr)
+
 	if cfg.EgressAddr != "" {
 		policy := egress.Policy{Allow: cfg.Allow, Deny: cfg.Deny}
-		eg := egress.New(cfg.EgressAddr, policy, os.Stderr, nil)
+		eg := egress.New(cfg.EgressAddr, policy, os.Stderr, apiSrv.EgressPolicyForIP)
 		if err := eg.Start(); err != nil {
 			fatal("egress proxy: %v", err)
 		}
 		fmt.Fprintf(os.Stderr, "warmbox: egress policy on %s (default-deny=%v allow=%v deny=%v)\n",
 			cfg.EgressAddr, policy.DefaultDeny(), cfg.Allow, cfg.Deny)
 	}
-
-	apiSrv := api.New(mgr, p, cfg, store, cat, os.Stderr)
 	apiSrv.SetStatusInfo(api.StatusInfo{
 		Version:       version,
 		Backend:       cfg.Backend,

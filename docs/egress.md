@@ -37,6 +37,24 @@ through it:
 
 Every decision is logged: `egress: ALLOW api.openai.com:443`, `egress: DENY …`.
 
+## Configure per desktop
+
+A policy can be set **at creation** and **changed afterwards**, from the API or
+the dashboard:
+
+```sh
+# at creation (empty allow/deny inherits the daemon defaults)
+curl -X POST localhost:7070/api/desktops -d '{"allow":["api.openai.com","pypi.org"]}'
+
+# after creation
+curl -X POST localhost:7070/api/desktops/$ID/policy -d '{"allow":["example.com"]}'
+```
+
+`GET /api/desktops/{id}` reports the desktop's `allow`/`deny`. The proxy resolves
+the policy **per guest IP**, so a policy change takes effect on the next
+connection without touching the guest. In the dashboard: the *New desktop* row
+has allow/deny fields, and each desktop's ⋯ menu has **Egress policy…**.
+
 ## What this does and does not do
 
 **It does**: expose a single, host-side authority for where guests may connect,
