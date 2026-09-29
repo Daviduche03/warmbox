@@ -8,9 +8,10 @@ import (
 	"sort"
 )
 
-// BuiltinImage is the reserved name of the built-in image (the Alpine + XFCE
-// desktop built by deploy/guest/build.sh). "xfce" and "alpine" are aliases.
-const BuiltinImage = "default"
+// BuiltinImage is the name Images() reports for the built-in image: the Alpine +
+// XFCE desktop built by deploy/guest/build.sh. "default" and "alpine" stay
+// accepted as aliases so an existing --image keeps resolving.
+const BuiltinImage = "xfce"
 
 // ImageMeta optionally overrides boot parameters for a named image. It lives
 // at <ImageDir>/<name>/meta.json.
@@ -38,7 +39,7 @@ type resolved struct {
 // isBuiltinImage reports whether a name refers to the built-in image.
 func isBuiltinImage(name string) bool {
 	switch name {
-	case "", BuiltinImage, "xfce", "alpine":
+	case "", "default", BuiltinImage, "alpine":
 		return true
 	}
 	return false
@@ -52,6 +53,15 @@ func SameImage(a, b string) bool {
 		return true
 	}
 	return a == b
+}
+
+// CanonicalImage maps the built-in aliases onto the name Images() reports, so a
+// configured default always matches an entry in that list.
+func CanonicalImage(name string) string {
+	if isBuiltinImage(name) {
+		return BuiltinImage
+	}
+	return name
 }
 
 func fileExists(p string) bool {

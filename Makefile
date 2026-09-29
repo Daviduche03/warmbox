@@ -3,12 +3,26 @@
 WARMBOX_HOME ?= $(HOME)/.warmbox
 BROWSER ?= chromium
 BINARY ?= warmbox
+VERSION ?= v0.1.0
 
-.PHONY: build guest-image setup daemon run test vet clean install
+.PHONY: build build-all web web-dev guest-image setup daemon run test vet clean install
 
-## build: compile the warmbox binary
+## build: compile the warmbox binary (embeds the committed web/dist).
+## CGO off keeps it a static, portable binary (and avoids SDK/toolchain drift).
 build:
-	go build -o $(BINARY) ./cmd/warmbox
+	CGO_ENABLED=0 go build -ldflags "-X main.version=$(VERSION)" -o $(BINARY) ./cmd/warmbox
+
+## web: build the dashboard SPA into web/dist
+web:
+	cd web && npm install --no-audit --no-fund
+	cd web && npm run build
+
+## web-dev: run the dashboard dev server (proxies /api to :7070)
+web-dev:
+	cd web && npm run dev
+
+## build-all: rebuild the SPA, then the binary that embeds it
+build-all: web build
 
 ## install: build, install to ~/.local/bin, and re-sign (macOS kills an arm64
 ## binary whose ad-hoc signature a plain copy invalidated)

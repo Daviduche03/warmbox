@@ -22,6 +22,7 @@ import (
 	"runmesh/workspace/internal/pool"
 	"runmesh/workspace/internal/vnc"
 	"runmesh/workspace/internal/volume"
+	"runmesh/workspace/web"
 )
 
 // Server wires the manager, warm pool, volume store and VNC bridge into an
@@ -33,6 +34,9 @@ type Server struct {
 	volumes *volume.Store
 	catalog *catalog.DB
 	log     io.Writer
+	started time.Time
+	info    StatusInfo
+	web     http.Handler
 }
 
 // New builds a Server. volumes and cat may be nil when those are disabled.
@@ -40,7 +44,7 @@ func New(mgr *desktop.Manager, p *pool.Pool, cfg *desktop.Config, volumes *volum
 	if log == nil {
 		log = io.Discard
 	}
-	return &Server{mgr: mgr, pool: p, cfg: cfg, volumes: volumes, catalog: cat, log: log}
+	return &Server{mgr: mgr, pool: p, cfg: cfg, volumes: volumes, catalog: cat, log: log, started: time.Now(), web: web.Handler()}
 }
 
 // Handler returns the root HTTP handler.
@@ -48,6 +52,7 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("POST /api/desktops", s.create)
+	mux.HandleFunc("GET /api/status", s.status)
 	mux.HandleFunc("GET /api/images", s.images)
 	mux.HandleFunc("GET /api/desktops", s.list)
 	mux.HandleFunc("GET /api/desktops/{id}", s.get)
@@ -88,17 +93,19 @@ func (s *Server) Handler() http.Handler {
 	// Static noVNC assets, one namespace per VM.
 	mux.HandleFunc("GET /vnc/{id}/", s.novnc)
 
-	mux.HandleFunc("GET /", s.index)
+	mux.HandleFunc("GET /", s.webui)
 	if s.cfg.Token == "" {
 		return mux
 	}
 	return s.withAuth(mux)
 }
 
-// withAuth gates every route except the guest readiness callback behind a
-// shared token. Accepting the token as a query parameter lets noVNC's
-// autoconnect URL work; on first use we drop an HttpOnly cookie so the static
-// assets and the WebSocket inherit it without the token in every URL.
+// withAuth gates every stateful route behind a shared token. Accepting the token
+// as a query parameter lets noVNC's autoconnect URL work; on first use we drop
+// an HttpOnly cookie so the WebSocket and console assets inherit it without the
+// token in every URL. The dashboard shell itself (index.html and its static
+// assets) stays public — it carries no data, and its client-side connect screen
+// is what asks a first-time visitor for the token.
 func (s *Server) withAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/internal/ready" {
@@ -116,11 +123,10 @@ func (s *Server) withAuth(next http.Handler) http.Handler {
 				token = c.Value
 			}
 		}
-		if subtle.ConstantTimeCompare([]byte(token), []byte(s.cfg.Token)) != 1 {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
-			return
-		}
-		if r.URL.Query().Get("token") != "" {
+		valid := subtle.ConstantTimeCompare([]byte(token), []byte(s.cfg.Token)) == 1
+		// Stash the cookie before the shell exemption below so that `/?token=…`
+		// still logs the browser in for the WebSocket and console routes.
+		if valid && r.URL.Query().Get("token") != "" {
 			http.SetCookie(w, &http.Cookie{
 				Name:     "warmbox_token",
 				Value:    token,
@@ -129,8 +135,33 @@ func (s *Server) withAuth(next http.Handler) http.Handler {
 				SameSite: http.SameSiteLaxMode,
 			})
 		}
+		if isShellPath(r.URL.Path) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if !valid {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// isShellPath reports whether a request is for the dashboard bundle itself —
+// index.html or a file the build dropped next to it (assets, favicon). API,
+// WebSocket and console routes are pinned explicitly so a dotted name can
+// never slip through the gate.
+func isShellPath(p string) bool {
+	for _, prefix := range []string{"/api/", "/internal/", "/websockify/", "/p/", "/d/", "/vnc/"} {
+		if strings.HasPrefix(p, prefix) {
+			return false
+		}
+	}
+	if p == "/" || p == "/index.html" {
+		return true
+	}
+	base := p[strings.LastIndexByte(p, '/')+1:]
+	return strings.Contains(base, ".")
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
@@ -461,14 +492,21 @@ func (s *Server) novnc(w http.ResponseWriter, r *http.Request) {
 	http.StripPrefix(prefix, http.FileServer(http.Dir(s.cfg.NoVNCDir))).ServeHTTP(w, r)
 }
 
-func (s *Server) index(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/" {
+// webui serves the embedded dashboard (React SPA). Unknown non-API paths fall
+// back to index.html so the client router can resolve them. When the binary was
+// built without the web assets (dist absent), it degrades to a short text page.
+func (s *Server) webui(w http.ResponseWriter, r *http.Request) {
+	if strings.HasPrefix(r.URL.Path, "/api/") || strings.HasPrefix(r.URL.Path, "/internal/") {
 		http.NotFound(w, r)
 		return
 	}
-	idle, pending := s.pool.Stats()
-	fmt.Fprintf(w, "warmbox orchestrator\n\nwarm pool: %d idle, %d booting\n", idle, pending)
-	fmt.Fprintf(w, "POST /api/desktops to create a desktop\n")
+	if s.web == nil {
+		idle, pending := s.pool.Stats()
+		fmt.Fprintf(w, "warmbox orchestrator\n\nwarm pool: %d idle, %d booting\n", idle, pending)
+		fmt.Fprintf(w, "dashboard not built — run `make web` and rebuild\n")
+		return
+	}
+	s.web.ServeHTTP(w, r)
 }
 
 // --- volumes ---

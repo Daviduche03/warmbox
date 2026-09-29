@@ -21,6 +21,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -32,10 +33,15 @@ import (
 	"runmesh/workspace/internal/catalog"
 	"runmesh/workspace/internal/config"
 	"runmesh/workspace/internal/desktop"
+	"runmesh/workspace/internal/egress"
 	"runmesh/workspace/internal/imagepack"
 	"runmesh/workspace/internal/pool"
 	"runmesh/workspace/internal/volume"
 )
+
+// version is the release string reported by `warmbox version` and /api/status.
+// Override at build time: go build -ldflags "-X main.version=v1.2.3".
+var version = "v0.1.0"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -47,6 +53,8 @@ func main() {
 		cmdDaemon(os.Args[2:])
 	case "service":
 		cmdService(os.Args[2:])
+	case "version", "-v", "--version":
+		fmt.Println(version)
 	case "help", "-h", "--help":
 		usage()
 	case "setup":
@@ -93,6 +101,7 @@ func cmdHome() {
 		}
 		_ = json.NewDecoder(resp.Body).Decode(&out)
 		fmt.Fprintf(os.Stderr, "\ndaemon: running at %s\n", base)
+		fmt.Fprintf(os.Stderr, "dashboard: %s/\n", base)
 		if len(out.Desktops) == 0 {
 			fmt.Fprintln(os.Stderr, "desktops: none")
 		} else {
@@ -108,7 +117,7 @@ func cmdHome() {
 // unknownCommand prints a suggestion for a mistyped command (e.g. "deamon").
 func unknownCommand(cmd string) {
 	known := []string{"daemon", "service", "setup", "create", "images", "image",
-		"list", "destroy", "volume", "snapshot", "help"}
+		"list", "destroy", "volume", "snapshot", "version", "help"}
 	best, dist := "", 3
 	for _, k := range known {
 		if d := editDistance(cmd, k); d < dist {
@@ -148,7 +157,7 @@ func usage() {
 	fmt.Fprint(os.Stderr, `warmbox — self-hosted GUI desktop orchestrator (vfkit + noVNC)
 
 Usage:
-  warmbox daemon            Run the orchestrator (warm pool + REST API)
+  warmbox daemon            Run the orchestrator (web dashboard + REST API)
   warmbox service <cmd>     Manage the background daemon (macOS launchd):
                             install | start | stop | restart | status
   warmbox setup             Check host prerequisites, fetch noVNC
@@ -160,6 +169,7 @@ Usage:
   warmbox image list        List the local images (offline)
   warmbox list              List desktops
   warmbox destroy <id>      Destroy a desktop
+  warmbox version           Print the version
 
   warmbox volume create <name> [--size 8G] [--from <name>] [--from-snapshot <id>]
   warmbox volume list
@@ -219,6 +229,23 @@ func addCommonFlags(fs *flag.FlagSet, cfg *desktop.Config) {
 	fs.StringVar(&cfg.VolumeBase, "volume-base", cfg.VolumeBase, "base ext4 image cloned for new volumes")
 	fs.IntVar(&cfg.VolumeChunkMiB, "volume-chunk", cfg.VolumeChunkMiB, "volume transfer chunk size (MiB)")
 	fs.StringVar(&cfg.VolumePrefix, "volume-prefix", cfg.VolumePrefix, "remote prefix for volumes")
+	fs.StringVar(&cfg.EgressAddr, "egress", cfg.EgressAddr, "run the egress policy proxy on this address (e.g. :8099; empty = off)")
+	fs.Var(listFlag{&cfg.Allow}, "allow", "comma-separated allowed domains for guest egress (default-deny when set)")
+	fs.Var(listFlag{&cfg.Deny}, "deny", "comma-separated denied domains for guest egress")
+}
+
+// listFlag collects a comma-separated flag into a []string.
+type listFlag struct{ v *[]string }
+
+func (l listFlag) String() string {
+	if l.v == nil {
+		return ""
+	}
+	return strings.Join(*l.v, ",")
+}
+func (l listFlag) Set(s string) error {
+	*l.v = egress.ParseList(s)
+	return nil
 }
 
 const warmboxLabel = "com.warmbox.daemon"
@@ -460,7 +487,10 @@ func cmdDaemon(args []string) {
 		}
 	} else if len(images) > 0 {
 		fmt.Fprintf(os.Stderr, "warmbox: images: %v\n", images)
-		if cfg.Image != "" && !stat(filepath.Join(cfg.ImageDir, cfg.Image, "disk.raw")) {
+		// Any image the daemon lists may be the default — overlay images
+		// (vmlinux + squashfs) as much as EFI disks, so validate against that
+		// same list rather than looking for disk.raw.
+		if cfg.Image != "" && !slices.Contains(images, desktop.CanonicalImage(cfg.Image)) {
 			fatal("default image %q not found under %s", cfg.Image, cfg.ImageDir)
 		}
 	}
@@ -470,7 +500,7 @@ func cmdDaemon(args []string) {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	store := newVolumeStore(ctx, cfg)
+	store, backedBy := newVolumeStore(ctx, cfg)
 	cat := openCatalog(cfg)
 	if store != nil {
 		backfillCatalog(ctx, cat, store, cfg)
@@ -493,7 +523,24 @@ func cmdDaemon(args []string) {
 
 	go p.Run(ctx)
 
-	srv := &http.Server{Addr: cfg.APIAddr, Handler: api.New(mgr, p, cfg, store, cat, os.Stderr).Handler()}
+	if cfg.EgressAddr != "" {
+		policy := egress.Policy{Allow: cfg.Allow, Deny: cfg.Deny}
+		eg := egress.New(cfg.EgressAddr, policy, os.Stderr, nil)
+		if err := eg.Start(); err != nil {
+			fatal("egress proxy: %v", err)
+		}
+		fmt.Fprintf(os.Stderr, "warmbox: egress policy on %s (default-deny=%v allow=%v deny=%v)\n",
+			cfg.EgressAddr, policy.DefaultDeny(), cfg.Allow, cfg.Deny)
+	}
+
+	apiSrv := api.New(mgr, p, cfg, store, cat, os.Stderr)
+	apiSrv.SetStatusInfo(api.StatusInfo{
+		Version:       version,
+		Backend:       cfg.Backend,
+		VolumesBacked: backedBy,
+		DefaultImage:  desktop.CanonicalImage(cfg.Image),
+	})
+	srv := &http.Server{Addr: cfg.APIAddr, Handler: apiSrv.Handler()}
 	go func() {
 		fmt.Fprintf(os.Stderr, "warmbox: listening on %s (pool=%d)\n", cfg.APIAddr, cfg.PoolSize)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -512,14 +559,17 @@ func cmdDaemon(args []string) {
 
 // newVolumeStore builds a volume store backed by runmesh/R2 when credentials
 // are configured, otherwise by a local directory so volumes still work for
-// local development. Returns nil if no store can be created.
-func newVolumeStore(ctx context.Context, cfg *desktop.Config) *volume.Store {
+// local development. It returns the store and a short human description of
+// where volume bytes are kept (surfaced in the dashboard). The store is nil if
+// none could be created.
+func newVolumeStore(ctx context.Context, cfg *desktop.Config) (*volume.Store, string) {
 	chunk := int64(cfg.VolumeChunkMiB) << 20
 
 	if rc, err := config.LoadGlobal(); err == nil && rc != nil && rc.DefaultBucket != "" {
 		if f, err := rc.NewFs(ctx, rc.DefaultBucket, ""); err == nil {
 			fmt.Fprintf(os.Stderr, "warmbox: volumes backed by remote bucket %q\n", rc.DefaultBucket)
-			return volume.NewStore(f, cfg.VolumePrefix, cfg.VolumeDir, cfg.VolumeBase, chunk)
+			return volume.NewStore(f, cfg.VolumePrefix, cfg.VolumeDir, cfg.VolumeBase, chunk),
+				"rclone · " + rc.DefaultBucket
 		} else {
 			fmt.Fprintf(os.Stderr, "warmbox: volume remote unavailable (%v); using local storage\n", err)
 		}
@@ -528,15 +578,15 @@ func newVolumeStore(ctx context.Context, cfg *desktop.Config) *volume.Store {
 	local := filepath.Join(cfg.WorkDir, "volume-remote")
 	if err := os.MkdirAll(local, 0o755); err != nil {
 		fmt.Fprintf(os.Stderr, "warmbox: volumes disabled: %v\n", err)
-		return nil
+		return nil, "disabled"
 	}
 	f, err := rfs.NewFs(ctx, local)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "warmbox: volumes disabled: %v\n", err)
-		return nil
+		return nil, "disabled"
 	}
 	fmt.Fprintf(os.Stderr, "warmbox: volumes backed by local dir %s (no runmesh remote configured)\n", local)
-	return volume.NewStore(f, cfg.VolumePrefix, cfg.VolumeDir, cfg.VolumeBase, chunk)
+	return volume.NewStore(f, cfg.VolumePrefix, cfg.VolumeDir, cfg.VolumeBase, chunk), "local"
 }
 
 // openCatalog opens the SQLite catalog at <workdir>/warmbox.db.

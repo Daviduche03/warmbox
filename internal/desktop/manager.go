@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 )
@@ -132,6 +133,9 @@ func (m *Manager) start(id, volumeName, volumeImage, imageName string) (*VM, err
 	if volumeImage != "" {
 		cmdline += " warmbox.volume=1"
 	}
+	if m.cfg.EgressAddr != "" {
+		cmdline += fmt.Sprintf(" warmbox.proxy=%s:%s", hostAddr, portOf(m.cfg.EgressAddr))
+	}
 
 	spec := LaunchSpec{
 		ID:      id,
@@ -178,6 +182,9 @@ func (m *Manager) start(id, volumeName, volumeImage, imageName string) (*VM, err
 		}
 		if volumeImage != "" {
 			confMap["volume"] = "1"
+		}
+		if m.cfg.EgressAddr != "" {
+			confMap["proxy"] = hostAddr + ":" + portOf(m.cfg.EgressAddr)
 		}
 		conf, _ := json.Marshal(confMap)
 		if err := os.WriteFile(filepath.Join(cfgDir, "config.json"), conf, 0o644); err != nil {
@@ -293,7 +300,10 @@ func (m *Manager) Get(id string) (*VM, bool) {
 	return vm, ok
 }
 
-// List returns serialisable snapshots of all VMs.
+// List returns serialisable snapshots of all VMs, oldest first.
+//
+// The VMs live in a map, and Go randomises map iteration order on every pass —
+// without a sort the dashboard would see the rows reshuffle on every poll.
 func (m *Manager) List() []Info {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -301,6 +311,12 @@ func (m *Manager) List() []Info {
 	for _, vm := range m.vms {
 		out = append(out, vm.Info())
 	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Started.Equal(out[j].Started) {
+			return out[i].ID < out[j].ID
+		}
+		return out[i].Started.Before(out[j].Started)
+	})
 	return out
 }
 

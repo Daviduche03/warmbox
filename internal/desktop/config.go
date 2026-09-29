@@ -66,6 +66,15 @@ type Config struct {
 	// the disk fixes that.
 	EFIVars string
 
+	// EgressAddr, when non-empty, runs the egress policy proxy on this address
+	// (e.g. ":8099"). Guests are told to route through it.
+	EgressAddr string
+
+	// Allow and Deny are domain patterns for the egress proxy. A non-empty
+	// Allow makes the policy default-deny (only Allow matches pass).
+	Allow []string
+	Deny  []string
+
 	// GPU, when non-empty (e.g. "1440x900"), attaches a virtio-gpu device so a
 	// Wayland compositor in the guest has an output to render to. Empty leaves
 	// the guest headless (the default image streams Xvnc over VNC).

@@ -46,6 +46,7 @@ HOST_ADDR=""
 API_PORT="7070"
 SHARE_TAG=""
 HAVE_VOLUME=""
+PROXY=""
 for kv in $(cat /proc/cmdline); do
     case "$kv" in
         warmbox.id=*)     VM_ID="${kv#warmbox.id=}" ;;
@@ -53,8 +54,25 @@ for kv in $(cat /proc/cmdline); do
         warmbox.port=*)   API_PORT="${kv#warmbox.port=}" ;;
         warmbox.share=*)  SHARE_TAG="${kv#warmbox.share=}" ;;
         warmbox.volume=*) HAVE_VOLUME=1 ;;
+        warmbox.proxy=*)  PROXY="${kv#warmbox.proxy=}" ;;
     esac
 done
+
+# Egress policy: route all client traffic through the host's proxy so the
+# allow/deny decision is made outside the guest. Set for the agent (which passes
+# its environment to exec'd commands) and for interactive login shells.
+if [ -n "$PROXY" ]; then
+    export http_proxy="http://$PROXY" https_proxy="http://$PROXY" \
+           HTTP_PROXY="http://$PROXY" HTTPS_PROXY="http://$PROXY" \
+           all_proxy="http://$PROXY" ALL_PROXY="http://$PROXY" \
+           no_proxy="localhost,127.0.0.1,192.168.64.1" NO_PROXY="localhost,127.0.0.1,192.168.64.1"
+    cat > /etc/profile.d/warmbox-proxy.sh <<PROXYEOF
+export http_proxy="http://$PROXY" https_proxy="http://$PROXY"
+export HTTP_PROXY="http://$PROXY" HTTPS_PROXY="http://$PROXY"
+export no_proxy="localhost,127.0.0.1,192.168.64.1"
+PROXYEOF
+    log "egress proxy $PROXY"
+fi
 
 # --- network ---
 modprobe virtio_net 2>/dev/null
@@ -213,7 +231,11 @@ log "session log: $(tail -4 /var/log/xfce-session.log 2>&1 | tr '\n' '|')"
 if ss -ltn 2>/dev/null | grep -q ':5900'; then
     log "READY: vnc listening on 5900"
     if [ -n "$VM_ID" ] && [ -n "$HOST_ADDR" ]; then
-        wget -q -O /dev/null \
+        # The readiness callback is control-plane traffic: never through the
+        # egress proxy (busybox wget ignores no_proxy).
+        env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY \
+            -u all_proxy -u ALL_PROXY -u no_proxy -u NO_PROXY \
+            wget -q -O /dev/null \
             "http://${HOST_ADDR}:${API_PORT}/internal/ready?id=${VM_ID}&ip=${IP}" \
             && log "reported ready to ${HOST_ADDR}:${API_PORT}" \
             || log "WARN: readiness callback failed"
