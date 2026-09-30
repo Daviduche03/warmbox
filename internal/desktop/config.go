@@ -7,6 +7,7 @@ package desktop
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"time"
 )
 
@@ -159,10 +160,17 @@ func DefaultConfig() *Config {
 		home = "."
 	}
 	wd := filepath.Join(home, ".warmbox")
+	// vfkit wraps Apple's Virtualization.framework and only exists on macOS;
+	// everywhere else QEMU is what the host actually has, so nobody should have
+	// to pass --backend qemu just to start the daemon.
+	backend := "vfkit"
+	if runtime.GOOS != "darwin" {
+		backend = "qemu"
+	}
 	return &Config{
 		WorkDir:           wd,
 		VfkitPath:         "vfkit",
-		Backend:           "vfkit",
+		Backend:           backend,
 		KernelPath:        filepath.Join(wd, "vmlinux"),
 		InitrdPath:        filepath.Join(wd, "initramfs.zst"),
 		BootInitrdPath:    filepath.Join(wd, "initramfs-virt"),

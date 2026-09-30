@@ -129,8 +129,11 @@ esac
 cat <<'EOS'
 
 next:
-  warmbox setup                     # noVNC + the guest image (~800 MB, verified)
+  warmbox setup                     # check the host, then noVNC + the guest image
   warmbox service install --pool 1  # run the daemon in the background
 
-The dashboard is then on http://localhost:7070
+The dashboard binds 127.0.0.1:7070 — it is plaintext HTTP, so keep it off the
+network. On a remote machine, tunnel to it instead:
+
+  ssh -L 7070:127.0.0.1:7070 <user>@<this-host>     # then open http://localhost:7070
 EOS

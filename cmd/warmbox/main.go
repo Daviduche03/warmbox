@@ -525,6 +525,33 @@ func systemdActive() bool {
 	return cmd.Run() == nil
 }
 
+// systemdState is the unit's state as systemd sees it ("active", "activating",
+// "failed", …), for reporting honestly when it will not stay up.
+func systemdState() string {
+	out, err := exec.Command("systemctl", systemctlArgs("is-active", warmboxUnit)...).Output()
+	if err != nil && len(out) == 0 {
+		return "unknown"
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// systemdWaitActive waits briefly for the unit to settle. A daemon that is
+// missing QEMU or the guest image exits immediately, and with Restart=always
+// systemd reports "activating" — worth waiting to distinguish that from a
+// success.
+func systemdWaitActive(within time.Duration) bool {
+	deadline := time.Now().Add(within)
+	for {
+		if systemdState() == "active" {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+}
+
 // serviceRunning reports whether the background service is running: launchd on
 // macOS, systemd on Linux. Used to explain a port that is already taken.
 func serviceRunning() bool {
@@ -644,6 +671,20 @@ func serviceSystemd(args []string) {
 	setFlags := map[string]bool{}
 	fs.Visit(func(f *flag.Flag) { setFlags[f.Name] = true })
 
+	// Confirm the daemon actually stays up: systemd reports success as soon as
+	// the process is spawned, so a daemon that cannot start (no QEMU, no guest
+	// image) would otherwise look like a win while it crash-loops.
+	verifyUp := func() {
+		if systemdWaitActive(10 * time.Second) {
+			return
+		}
+		fmt.Fprintf(os.Stderr, "✗ %s is not staying up (systemd reports %q)\n", warmboxUnit, systemdState())
+		fmt.Fprintf(os.Stderr, "  the daemon exits immediately when something is missing; see why:\n")
+		fmt.Fprintf(os.Stderr, "    journalctl %s-u %s -n 20 --no-pager\n", systemctlOut(), warmboxUnit)
+		fmt.Fprintln(os.Stderr, "  then re-run:  warmbox setup")
+		os.Exit(1)
+	}
+
 	unitPath := systemdUnitPath()
 	sc := func(a ...string) error {
 		cmd := exec.Command("systemctl", systemctlArgs(a...)...)
@@ -681,6 +722,7 @@ func serviceSystemd(args []string) {
 			fatal("Error: %v", err)
 		}
 		fmt.Fprintf(os.Stderr, "started %s\n", warmboxUnit)
+		verifyUp()
 		fmt.Fprintf(os.Stderr, "unit: %s\nlogs: journalctl %s-u %s -f\n", unitPath, systemctlOut(), warmboxUnit)
 		if sub == "install" && systemdUserScope() {
 			lingerHint()
@@ -710,6 +752,7 @@ func serviceSystemd(args []string) {
 		if err := sc(verb, warmboxUnit); err != nil {
 			fatal("Error (install first?): %v", err)
 		}
+		verifyUp()
 		fmt.Fprintln(os.Stderr, "restarted")
 	case "status":
 		if !stat(unitPath) {
@@ -1010,16 +1053,17 @@ func cmdSetup(args []string) {
 	}
 
 	fmt.Fprintln(os.Stderr, "warmbox setup")
-	checkHypervisor(cfg)
+	ready := checkHypervisor(cfg)
 
 	switch {
 	case *noImage:
 		fmt.Fprintln(os.Stderr, "… skipping the guest image (--no-image)")
 	case !*force && builtinImagePresent(cfg):
-		fmt.Fprintf(os.Stderr, "✓ guest image in %s\n", cfg.WorkDir)
+		fmt.Fprintf(os.Stderr, "✓ guest image in %s\n", filepath.Dir(cfg.KernelPath))
 	default:
 		if err := installGuestImage(cfg, *imageURL, *imageSHA, *force); err != nil {
 			fmt.Fprintf(os.Stderr, "✗ guest image: %v\n", err)
+			ready = false
 		}
 	}
 
@@ -1029,47 +1073,71 @@ func cmdSetup(args []string) {
 		fmt.Fprintf(os.Stderr, "… fetching noVNC to %s\n", cfg.NoVNCDir)
 		if err := fetchNoVNC(cfg.NoVNCDir); err != nil {
 			fmt.Fprintf(os.Stderr, "✗ noVNC download failed: %v\n", err)
+			ready = false
 		} else {
 			fmt.Fprintf(os.Stderr, "✓ noVNC installed\n")
 		}
 	}
 
-	fmt.Fprintln(os.Stderr, "\nnext:")
-	fmt.Fprintln(os.Stderr, "  warmbox service install --pool 1   # run the daemon in the background")
-	fmt.Fprintln(os.Stderr, "  warmbox create                     # a desktop; prints its URL")
-}
-
-// checkHypervisor reports whether the hypervisor this host would actually use is
-// present. On Linux the default backend is still vfkit (macOS only), so say what
-// the daemon needs rather than checking a binary that cannot work there.
-func checkHypervisor(cfg *desktop.Config) {
-	switch {
-	case cfg.Backend == "qemu":
-		checkQEMU()
-	case runtime.GOOS == "darwin":
-		if _, err := exec.LookPath(cfg.VfkitPath); err != nil {
-			fmt.Fprintln(os.Stderr, "✗ vfkit not found — install it: brew install vfkit")
-		} else {
-			fmt.Fprintln(os.Stderr, "✓ vfkit found")
-		}
-	default:
-		fmt.Fprintln(os.Stderr, "! default backend is vfkit (macOS only) — run the daemon with --backend qemu")
-		checkQEMU()
+	if !ready {
+		// Say so plainly: the daemon cannot start, and telling someone to
+		// install the service here would just leave them with a unit that
+		// crash-loops.
+		fmt.Fprintln(os.Stderr, "\nnot ready: fix the ✗ lines above, then run `warmbox setup` again.")
+		os.Exit(1)
 	}
+
+	fmt.Fprintln(os.Stderr, "\nready. start the daemon:")
+	fmt.Fprintln(os.Stderr, "  warmbox service install --pool 1   # background service")
+	fmt.Fprintln(os.Stderr, "  warmbox create                     # a desktop; prints its URL")
+	fmt.Fprintf(os.Stderr, "\nthe dashboard is on %s\n", dashboardURL(cfg.APIAddr))
 }
 
-func checkQEMU() {
+// checkHypervisor reports whether the hypervisor this host will actually use is
+// present, so setup can refuse to call itself finished when it is not.
+func checkHypervisor(cfg *desktop.Config) bool {
+	if cfg.Backend == "qemu" {
+		return checkQEMU()
+	}
+	if _, err := exec.LookPath(cfg.VfkitPath); err != nil {
+		fmt.Fprintln(os.Stderr, "✗ vfkit not found — install it: brew install vfkit")
+		return false
+	}
+	fmt.Fprintln(os.Stderr, "✓ vfkit found")
+	return true
+}
+
+func checkQEMU() bool {
 	bin := desktop.QEMUSystemBinary()
 	if _, err := exec.LookPath(bin); err != nil {
 		fmt.Fprintf(os.Stderr, "✗ %s not found — install QEMU (e.g. apt install qemu-system-x86)\n", bin)
-		return
+		return false
 	}
 	fmt.Fprintf(os.Stderr, "✓ %s found\n", bin)
 	if _, err := os.Stat("/dev/kvm"); err != nil {
 		fmt.Fprintln(os.Stderr, "✗ /dev/kvm missing — enable virtualization (or join the kvm group)")
-	} else {
-		fmt.Fprintln(os.Stderr, "✓ /dev/kvm")
+		return false
 	}
+	fmt.Fprintln(os.Stderr, "✓ /dev/kvm")
+	return true
+}
+
+// dashboardURL says where to point a browser. The daemon binds loopback by
+// default, so on a remote host the useful instruction is a tunnel rather than
+// the machine's public address — and it is plaintext HTTP, so exposing it is a
+// poor idea.
+func dashboardURL(addr string) string {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil || port == "" {
+		port = "7070"
+	}
+	switch host {
+	case "", "0.0.0.0", "::":
+		return fmt.Sprintf("http://<this-host>:%s\n  (bound to every interface: reachable from the network, and plaintext — put a TLS proxy in front)", port)
+	case "127.0.0.1", "::1", "localhost":
+		return fmt.Sprintf("http://localhost:%s\n  from another machine, tunnel it:  ssh -L %s:127.0.0.1:%s <user>@<host>", port, port, port)
+	}
+	return "http://" + net.JoinHostPort(host, port)
 }
 
 // installGuestImage downloads the guest image archive and installs it into the
@@ -1096,7 +1164,23 @@ func installGuestImage(cfg *desktop.Config, url, sha string, force bool) error {
 	if sha == "" {
 		s, err := desktop.FetchChecksum(url + ".sha256")
 		if err != nil {
-			return fmt.Errorf("no prebuilt guest image for %s/%s:\n  %v\n  build one yourself:  ./deploy/guest/build.sh\n  (or pass --image-url and --image-sha256)", version, runtime.GOARCH, err)
+			platform := "linux/arm64"
+			if runtime.GOARCH == "amd64" {
+				platform = "linux/amd64"
+			}
+			return fmt.Errorf(`no prebuilt guest image for %s/%s:
+  %v
+
+Build one on this machine instead (needs Docker, ~15 minutes):
+
+    git clone https://github.com/%s && cd warmbox
+    PLATFORM=%s ./deploy/guest/build.sh
+    warmbox setup --no-image
+
+Or point setup at an archive you already have:
+
+    warmbox setup --image-url <url> --image-sha256 <hex>`,
+				version, runtime.GOARCH, err, releaseRepo, platform)
 		}
 		sha = s
 	}
