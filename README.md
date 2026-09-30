@@ -10,10 +10,11 @@ boots in ~1s from a shared read-only rootfs) and a full **Omarchy**
 (Arch + Hyprland, ~8.4 GB) built as an EFI disk. You pick the OS at create time.
 
 > **Status: experimental alpha.** macOS / Apple Silicon is the primary target;
-> Linux + KVM works for the built-in image. Not hardened: no TLS, guest VNC is
-> unauthenticated, the guest runs as root, the API token is optional. See
-> [Status](#status) and [Limitations](#limitations) before you run it on
-> anything shared.
+> Linux + KVM works for the built-in image. Not hardened: plaintext HTTP with no
+> TLS, the guest's VNC server accepts anyone who can reach it, and the guest runs
+> as **root**. The API itself *is* gated by accounts and workspaces — see
+> [Limitations](#limitations) — but the transport is unencrypted, so don't expose
+> it to an untrusted network.
 
 ## What it does
 
@@ -245,6 +246,7 @@ bucket up.
 | Grow a volume (`--size`) | ✅ works (grow-only) |
 | Disk snapshots + clone | ✅ works |
 | Image pack / pull (compressed artifacts) | ✅ works |
+| Install without Docker (`warmbox setup` fetches the image) | ✅ works (no release published yet) |
 | Agent API: exec + files | ✅ works |
 | Agent API: background/streaming runs + sessions | ✅ works |
 | Linux host (QEMU/KVM) | ✅ works (x86_64 verified; no EFI images) |
@@ -259,28 +261,36 @@ bucket up.
 
 ## Limitations
 
-- **Apple Silicon only** (for image guests). `vfkit` wraps Apple's
-  Virtualization.framework; ARM64 guests only. The Linux/QEMU backend boots the
-  built-in image but not EFI disks.
-- **Local-only security posture.** Off by default: no TLS, guest VNC is
-  `-SecurityTypes None`, the guest runs as **root**. Accounts and workspaces gate
-  the API, and every route that reaches a desktop — console streams (`/d/`,
-  `/websockify/`, `/vnc/`), the agent API, published guest ports (`/p/`) — is
-  scoped to the caller's workspace; warm-pool VMs are daemon capacity and are not
-  listed or controllable as desktops. The transport is still plaintext, so don't
-  expose it to an untrusted network.
+- **EFI disk images are macOS-only.** Omarchy is an EFI disk, and the QEMU
+  backend ships no OVMF firmware, so it cannot boot it. (vfkit wraps Apple's
+  Virtualization.framework, which is ARM64-only and handles the firmware itself.)
+  Overlay images — the built-in one and `lxqt` — need no firmware and take the
+  same path on both backends: the built-in image is verified on Linux/QEMU, a
+  *named* overlay image there is not.
+- **Authorised, but not encrypted.** The API is not open: accounts and workspaces
+  gate every stateful route, and everything that reaches a desktop — console
+  streams (`/d/`, `/websockify/`, `/vnc/`), the agent API, published guest ports
+  (`/p/`) — is scoped to the caller's workspace; warm-pool VMs are daemon
+  capacity and are never listed or controllable as desktops. What is missing is
+  confidentiality and guest hardening: there is still no TLS, the guest's VNC
+  server runs with `-SecurityTypes None`, and the guest is **root**. The guest
+  only sits behind the hypervisor's NAT, so its VNC port is reachable from the
+  host — and therefore through the authenticated daemon — rather than from the
+  LAN. All of it assumes a machine you trust; don't expose it to an untrusted
+  network.
 - **No memory snapshots.** Apple's framework exposes no VM state save/restore, so
   fast "restore anywhere" needs a Linux backend (see `docs/snapshots.md`). Pause
   is not a substitute: it freezes the guest's CPUs in place but its memory stays
   allocated. To actually reclaim RAM, destroy the desktop (its volume keeps your
   files) or let the warm pool drain.
-- **Guests have no GPU.** AVF exposes virtio-gpu without 3D, so a Wayland desktop
-  composites through Mesa `llvmpipe`; the Omarchy image is tuned for it (small
-  output, effects off). X11 is lighter for remote display.
-- **Images are big.** Arch + Omarchy is multi-GB; the packed artifact is ~3.9 GB,
-  but because btrfs fragments its free space and APFS only preserves large holes,
-  an expanded copy may not be as sparse as you'd like. The built-in image is the
-  small one.
+- **Guests have no GPU.** The hypervisor exposes virtio-gpu without 3D (AVF on
+  macOS, virtio on QEMU), so a Wayland desktop composites through Mesa
+  `llvmpipe`; the Omarchy image is tuned for it (small output, effects off). X11
+  is far lighter for remote display.
+- **Images are big.** The built-in image is ~800 MB compressed and `warmbox
+  setup` downloads it in one piece. Omarchy is the heavy one: ~8.4 GB on disk,
+  ~3.9 GB packed, and because btrfs fragments its free space and APFS only
+  preserves large holes, an expanded copy may not be as sparse as you'd like.
 - **Single writer.** A volume attaches to one VM at a time; the lock is
   in-process (fine for one host, not a fleet).
 - **Commit cost.** Committing hashes the changed extents; a commit is fast for
@@ -308,14 +318,17 @@ docs/               architecture, volumes, snapshots, agent-api, egress, oss-pos
 - [`docs/volumes.md`](docs/volumes.md) — volumes, sizing, API.
 - [`docs/snapshots.md`](docs/snapshots.md) — snapshots & fast-resume plan.
 - [`docs/agent-api.md`](docs/agent-api.md) — the guest agent API and roadmap.
+- [`docs/egress.md`](docs/egress.md) — the egress policy and what it does not do yet.
 - [`deploy/omarchy/README.md`](deploy/omarchy/README.md) — the Omarchy image.
 - [`docs/oss-positioning.md`](docs/oss-positioning.md) — what could be a shared primitive.
-- [`docs/vision.md`](docs/vision.md) — the original "Runmesh" vision.
 
 ## Help wanted
 
-- **Image distribution** — host packed images (OCI/R2) and make `warmbox image
-  pull` resolve a bare name, so nobody builds Omarchy locally.
+- **Named-image distribution** — the built-in image is a release artifact now
+  (`warmbox setup` downloads and verifies it), but *named* images are not:
+  `warmbox image pull` still wants a file or a URL, so Omarchy has to be built
+  locally. Publishing them, and letting `pull omarchy` resolve a bare name, is
+  the remaining half.
 - **EFI on Linux** — OVMF support in the QEMU backend so image guests run there too.
 - **Cloud Hypervisor / Firecracker backend** — leaner boot and real memory
   snapshot/restore (the "~100 ms restore anywhere" story).
