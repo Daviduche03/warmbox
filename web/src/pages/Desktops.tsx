@@ -1,13 +1,7 @@
 import { useState } from "react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import {
-	Card,
-	CardContent,
-	CardDescription,
-	CardHeader,
-	CardTitle,
-} from "@/components/ui/card";
+import { Card, CardContent } from "@/components/ui/card";
 import { DropdownMenuItem } from "@/components/ui/dropdown-menu";
 import {
 	Select,
@@ -35,6 +29,7 @@ import {
 } from "@/components/ui/table";
 import { ConfirmDialog } from "@/components/confirm-dialog";
 import { RowActions } from "@/components/row-actions";
+import { SectionHead } from "@/components/section-head";
 import { Spinner } from "@/components/spinner";
 import { StateBadge } from "@/components/state-badge";
 import { EmptyState } from "@/components/empty-state";
@@ -62,9 +57,11 @@ function joinList(a?: string[]): string {
 
 export function DesktopsPage() {
 	const { desktops, images, status, refresh } = useStore();
+	const [creating, setCreating] = useState(false);
 	const [image, setImage] = useState<string>("");
 	const [allow, setAllow] = useState<string>("");
 	const [deny, setDeny] = useState<string>("");
+	const [createError, setCreateError] = useState<string>();
 	const [error, setError] = useState<string>();
 	const [pendingDestroy, setPendingDestroy] = useState<string>();
 	const [policyFor, setPolicyFor] = useState<string>();
@@ -77,7 +74,7 @@ export function DesktopsPage() {
 
 	async function create() {
 		if (!canCreate) return;
-		setError(undefined);
+		setCreateError(undefined);
 		await run(async () => {
 			try {
 				await api.desktops.create({
@@ -85,9 +82,13 @@ export function DesktopsPage() {
 					allow: parseList(allow),
 					deny: parseList(deny),
 				});
+				setCreating(false);
+				setImage("");
+				setAllow("");
+				setDeny("");
 				await refresh();
 			} catch (e) {
-				setError(e instanceof Error ? e.message : "create failed");
+				setCreateError(e instanceof Error ? e.message : "create failed");
 			}
 		});
 	}
@@ -125,142 +126,208 @@ export function DesktopsPage() {
 	}
 
 	return (
-		<Card className="shadow-none dark:ring-0">
-			<CardHeader className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-				<div className="min-w-0 space-y-2">
-					<div className="flex flex-wrap items-center gap-2">
-						<CardTitle>Desktops</CardTitle>
-						<Badge variant="secondary">{desktops.length}</Badge>
-					</div>
-					<CardDescription>
-						MicroVMs managed by this daemon. Creating one boots it into the pool.
-					</CardDescription>
-				</div>
-				<div className="flex w-full flex-col gap-2 sm:w-auto sm:flex-row sm:items-center">
-					<Select disabled={busy} onValueChange={setImage} value={selected}>
-						<SelectTrigger
-							aria-label="Image for the new desktop"
-							className="w-full sm:w-40"
-							size="sm"
-						>
-							<SelectValue placeholder="Image" />
-						</SelectTrigger>
-						<SelectContent align="end">
-							{images.map((name) => (
-								<SelectItem key={name} value={name}>
-									{name}
-									{name === status?.default_image ? " · default" : ""}
-								</SelectItem>
-							))}
-						</SelectContent>
-					</Select>
-					<Input
-						aria-label="Allowed domains for the new desktop"
-						className="w-full sm:w-44"
-						disabled={busy}
-						onChange={(e) => setAllow(e.target.value)}
-						placeholder="allow: api.openai.com,…"
-						value={allow}
-					/>
-					<Input
-						aria-label="Denied domains for the new desktop"
-						className="w-full sm:w-40"
-						disabled={busy}
-						onChange={(e) => setDeny(e.target.value)}
-						placeholder="deny: …"
-						value={deny}
-					/>
-					<Button
-						aria-busy={busy}
-						disabled={!canCreate}
-						onClick={() => void create()}
-						size="sm"
-					>
-						{busy ? (
-							<>
-								<Spinner />
-								Booting…
-							</>
-						) : (
-							<>
-								<PlusIcon />
-								New desktop
-							</>
-						)}
+		<div className="space-y-6">
+			<SectionHead
+				action={
+					<Button onClick={() => setCreating(true)} size="sm">
+						<PlusIcon />
+						New desktop
 					</Button>
-				</div>
-			</CardHeader>
-			<CardContent className="p-0">
-				<NoticeLine message={error} />
-				{desktops.length === 0 ? (
-					<EmptyState
-						hint="Pick an image above and boot the first one."
-						title="No desktops running"
-					/>
-				) : (
-					<Table>
-						<TableHeader>
-							<TableRow className="hover:bg-transparent">
-								<TableHead className="pl-6">Desktop</TableHead>
-								<TableHead className="hidden sm:table-cell">Guest IP</TableHead>
-								<TableHead className="hidden md:table-cell">Uptime</TableHead>
-								<TableHead className="hidden lg:table-cell">Volume</TableHead>
-								<TableHead>State</TableHead>
-								<TableHead className="pr-6 text-right">Actions</TableHead>
-							</TableRow>
-						</TableHeader>
-						<TableBody>
-							{desktops.map((d) => (
-								<TableRow className="h-14 hover:bg-transparent" key={d.id}>
-									<TableCell className="max-w-40 truncate pl-6 font-mono font-medium text-sm">
-										{d.id}
-									</TableCell>
-									<TableCell className="hidden text-muted-foreground text-sm sm:table-cell">
-										<span className="tabular-nums">{d.guest_ip ?? "—"}</span>
-									</TableCell>
-									<TableCell className="hidden text-muted-foreground text-sm md:table-cell">
-										<span className="tabular-nums">{uptime(d.started)}</span>
-									</TableCell>
-									<TableCell className="hidden max-w-32 text-muted-foreground text-sm lg:table-cell">
-										<span className="line-clamp-1">{d.volume ?? "—"}</span>
-									</TableCell>
-									<TableCell>
-										<StateBadge state={d.state} />
-									</TableCell>
-									<TableCell className="pr-6 text-right">
-										<RowActions label={`Actions for ${d.id}`}>
-											<DropdownMenuItem
-												disabled={d.state === "dead"}
-												onSelect={() => open(d.id)}
-											>
-												<SquareArrowOutUpRightIcon />
-												Open console
-											</DropdownMenuItem>
-											<DropdownMenuItem
-												onSelect={() => {
-													setPolicyFor(d.id);
-													setPolicyAllow(joinList(d.allow));
-													setPolicyDeny(joinList(d.deny));
-												}}
-											>
-												<GlobeIcon />
-												Egress policy…
-											</DropdownMenuItem>
-											<DropdownMenuItem
-												onSelect={() => setPendingDestroy(d.id)}
-												variant="destructive"
-											>
-												<TrashIcon />
-												Destroy
-											</DropdownMenuItem>
-										</RowActions>
-									</TableCell>
+				}
+				badge={<Badge variant="secondary">{desktops.length}</Badge>}
+				desc="MicroVMs managed by this daemon. Creating one boots it into the pool."
+				title="Desktops"
+			/>
+			<Card className="shadow-none dark:ring-0">
+				<CardContent className="p-0">
+					<NoticeLine message={error} />
+					{desktops.length === 0 ? (
+						<EmptyState
+							hint="Pick an image in New desktop and boot the first one."
+							title="No desktops running"
+						/>
+					) : (
+						<Table>
+							<TableHeader>
+								<TableRow className="hover:bg-transparent">
+									<TableHead className="pl-6">Desktop</TableHead>
+									<TableHead className="hidden sm:table-cell">
+										Guest IP
+									</TableHead>
+									<TableHead className="hidden md:table-cell">
+										Uptime
+									</TableHead>
+									<TableHead className="hidden lg:table-cell">
+										Volume
+									</TableHead>
+									<TableHead>State</TableHead>
+									<TableHead className="pr-6 text-right">Actions</TableHead>
 								</TableRow>
-							))}
-						</TableBody>
-					</Table>
-				)}
-			</CardContent>
+							</TableHeader>
+							<TableBody>
+								{desktops.map((d) => (
+									<TableRow className="h-14 hover:bg-transparent" key={d.id}>
+										<TableCell className="max-w-40 truncate pl-6 font-mono font-medium text-sm">
+											{d.id}
+										</TableCell>
+										<TableCell className="hidden text-muted-foreground text-sm sm:table-cell">
+											<span className="tabular-nums">{d.guest_ip ?? "—"}</span>
+										</TableCell>
+										<TableCell className="hidden text-muted-foreground text-sm md:table-cell">
+											<span className="tabular-nums">{uptime(d.started)}</span>
+										</TableCell>
+										<TableCell className="hidden max-w-32 text-muted-foreground text-sm lg:table-cell">
+											<span className="line-clamp-1">{d.volume ?? "—"}</span>
+										</TableCell>
+										<TableCell>
+											<StateBadge state={d.state} />
+										</TableCell>
+										<TableCell className="pr-6 text-right">
+											<RowActions label={`Actions for ${d.id}`}>
+												<DropdownMenuItem
+													disabled={d.state === "dead"}
+													onSelect={() => open(d.id)}
+												>
+													<SquareArrowOutUpRightIcon />
+													Open console
+												</DropdownMenuItem>
+												<DropdownMenuItem
+													onSelect={() => {
+														setPolicyFor(d.id);
+														setPolicyAllow(joinList(d.allow));
+														setPolicyDeny(joinList(d.deny));
+													}}
+												>
+													<GlobeIcon />
+													Egress policy…
+												</DropdownMenuItem>
+												<DropdownMenuItem
+													onSelect={() => setPendingDestroy(d.id)}
+													variant="destructive"
+												>
+													<TrashIcon />
+													Destroy
+												</DropdownMenuItem>
+											</RowActions>
+										</TableCell>
+									</TableRow>
+								))}
+							</TableBody>
+						</Table>
+					)}
+				</CardContent>
+			</Card>
+			<Dialog
+				onOpenChange={(next) => {
+					if (busy) return;
+					setCreating(next);
+					if (!next) {
+						setCreateError(undefined);
+						setImage("");
+						setAllow("");
+						setDeny("");
+					}
+				}}
+				open={creating}
+			>
+				<DialogContent>
+					<DialogHeader>
+						<DialogTitle>New desktop</DialogTitle>
+						<DialogDescription>
+							Boot a microVM from a guest image. Egress lists are
+							comma-separated; an empty allow list means allow-all, a non-empty
+							one means default-deny. Deny always wins.
+						</DialogDescription>
+					</DialogHeader>
+					<form
+						className="space-y-4"
+						onSubmit={(e) => {
+							e.preventDefault();
+							void create();
+						}}
+					>
+						<div className="space-y-2">
+							<label className="text-sm" htmlFor="new-desktop-image">
+								Image
+							</label>
+							<Select disabled={busy} onValueChange={setImage} value={selected}>
+								<SelectTrigger
+									aria-label="Image for the new desktop"
+									className="w-full"
+									id="new-desktop-image"
+									size="sm"
+								>
+									<SelectValue placeholder="Image" />
+								</SelectTrigger>
+								<SelectContent>
+									{images.map((name) => (
+										<SelectItem key={name} value={name}>
+											{name}
+											{name === status?.default_image ? " · default" : ""}
+										</SelectItem>
+									))}
+								</SelectContent>
+							</Select>
+						</div>
+						<div className="space-y-2">
+							<label className="text-sm" htmlFor="new-desktop-allow">
+								Allow
+							</label>
+							<Input
+								disabled={busy}
+								id="new-desktop-allow"
+								onChange={(e) => setAllow(e.target.value)}
+								placeholder="api.openai.com, pypi.org"
+								value={allow}
+							/>
+							<p className="text-muted-foreground text-xs">
+								Optional — empty allows every domain; a list means
+								default-deny.
+							</p>
+						</div>
+						<div className="space-y-2">
+							<label className="text-sm" htmlFor="new-desktop-deny">
+								Deny
+							</label>
+							<Input
+								disabled={busy}
+								id="new-desktop-deny"
+								onChange={(e) => setDeny(e.target.value)}
+								placeholder="ads.example.com"
+								value={deny}
+							/>
+						</div>
+						<NoticeLine
+							className="border-b-0 px-0 py-0"
+							message={createError}
+						/>
+						<DialogFooter>
+							<Button
+								disabled={busy}
+								onClick={() => setCreating(false)}
+								size="sm"
+								type="button"
+								variant="outline"
+							>
+								Cancel
+							</Button>
+							<Button aria-busy={busy} disabled={!canCreate} size="sm" type="submit">
+								{busy ? (
+									<>
+										<Spinner />
+										Booting…
+									</>
+								) : (
+									<>
+										<PlusIcon />
+										Create desktop
+									</>
+								)}
+							</Button>
+						</DialogFooter>
+					</form>
+				</DialogContent>
+			</Dialog>
 			<Dialog
 				onOpenChange={(next) => {
 					if (!next) setPolicyFor(undefined);
@@ -324,6 +391,6 @@ export function DesktopsPage() {
 				open={!!pendingDestroy}
 				title="Destroy this desktop?"
 			/>
-		</Card>
+		</div>
 	);
 }

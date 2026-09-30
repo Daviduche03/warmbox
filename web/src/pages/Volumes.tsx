@@ -1,13 +1,7 @@
 import { useState } from "react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import {
-	Card,
-	CardContent,
-	CardDescription,
-	CardHeader,
-	CardTitle,
-} from "@/components/ui/card";
+import { Card, CardContent } from "@/components/ui/card";
 import {
 	Dialog,
 	DialogContent,
@@ -29,6 +23,7 @@ import {
 import { ConfirmDialog } from "@/components/confirm-dialog";
 import { NoticeLine } from "@/components/notice-line";
 import { RowActions } from "@/components/row-actions";
+import { SectionHead } from "@/components/section-head";
 import { Spinner } from "@/components/spinner";
 import { EmptyState } from "@/components/empty-state";
 import { useStore } from "@/lib/store";
@@ -101,79 +96,85 @@ export function VolumesPage() {
 	const total = volumes.reduce((sum, v) => sum + (v.size || 0), 0);
 
 	return (
-		<Card className="shadow-none dark:ring-0">
-			<CardHeader className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-				<div className="min-w-0 space-y-2">
-					<div className="flex flex-wrap items-center gap-2">
-						<CardTitle>Volumes</CardTitle>
-						<Badge variant="secondary">{volumes.length}</Badge>
-					</div>
-					<CardDescription>{bytes(total)} provisioned in total.</CardDescription>
-				</div>
-				<Button onClick={() => setOpen(true)} size="sm">
-					<PlusIcon />
-					New volume
-				</Button>
-			</CardHeader>
-			<CardContent className="p-0">
-				<NoticeLine message={error} />
-				<NoticeLine message={notice} tone="success" />
-				{volumes.length === 0 ? (
-					<EmptyState
-						hint="Create one and the daemon allocates it."
-						title="No volumes"
-					/>
-				) : (
-					<Table>
-						<TableHeader>
-							<TableRow className="hover:bg-transparent">
-								<TableHead className="pl-6">Name</TableHead>
-								<TableHead className="text-right">Size</TableHead>
-								<TableHead className="hidden md:table-cell">Chunk</TableHead>
-								<TableHead className="hidden lg:table-cell">Source</TableHead>
-								<TableHead className="hidden sm:table-cell">Updated</TableHead>
-								<TableHead className="pr-6 text-right">Actions</TableHead>
-							</TableRow>
-						</TableHeader>
-						<TableBody>
-							{volumes.map((v) => (
-								<TableRow className="h-14 hover:bg-transparent" key={v.name}>
-									<TableCell className="max-w-52 truncate pl-6 font-medium">
-										{v.name}
-									</TableCell>
-									<TableCell className="text-right text-muted-foreground text-sm tabular-nums">
-										{bytes(v.size)}
-									</TableCell>
-									<TableCell className="hidden text-muted-foreground text-sm md:table-cell tabular-nums">
-										{bytes(v.chunk_size)}
-									</TableCell>
-									<TableCell className="hidden text-muted-foreground text-sm lg:table-cell">
-										{v.from ?? v.remote ?? "—"}
-									</TableCell>
-									<TableCell className="hidden text-muted-foreground text-sm sm:table-cell">
-										{since(v.updated_at)}
-									</TableCell>
-									<TableCell className="pr-6 text-right">
-										<RowActions label={`Actions for ${v.name}`}>
-											<DropdownMenuItem onSelect={() => void snapshot(v.name)}>
-												<CameraIcon />
-												Take snapshot
-											</DropdownMenuItem>
-											<DropdownMenuItem
-												onSelect={() => setPendingDelete(v.name)}
-												variant="destructive"
-											>
-												<TrashIcon />
-												Delete
-											</DropdownMenuItem>
-										</RowActions>
-									</TableCell>
+		<div className="space-y-6">
+			<SectionHead
+				action={
+					<Button onClick={() => setOpen(true)} size="sm">
+						<PlusIcon />
+						New volume
+					</Button>
+				}
+				badge={<Badge variant="secondary">{volumes.length}</Badge>}
+				desc={`${bytes(total)} provisioned in total.`}
+				title="Volumes"
+			/>
+			<Card className="shadow-none dark:ring-0">
+				<CardContent className="p-0">
+					<NoticeLine message={error} />
+					<NoticeLine message={notice} tone="success" />
+					{volumes.length === 0 ? (
+						<EmptyState
+							hint="Create one and the daemon allocates it."
+							title="No volumes"
+						/>
+					) : (
+						<Table>
+							<TableHeader>
+								<TableRow className="hover:bg-transparent">
+									<TableHead className="pl-6">Name</TableHead>
+									<TableHead className="text-right">Size</TableHead>
+									<TableHead className="hidden md:table-cell">
+										Chunk
+									</TableHead>
+									<TableHead className="hidden lg:table-cell">
+										Source
+									</TableHead>
+									<TableHead className="hidden sm:table-cell">
+										Updated
+									</TableHead>
+									<TableHead className="pr-6 text-right">Actions</TableHead>
 								</TableRow>
-							))}
-						</TableBody>
-					</Table>
-				)}
-			</CardContent>
+							</TableHeader>
+							<TableBody>
+								{volumes.map((v) => (
+									<TableRow className="h-14 hover:bg-transparent" key={v.name}>
+										<TableCell className="max-w-52 truncate pl-6 font-medium">
+											{v.name}
+										</TableCell>
+										<TableCell className="text-right text-muted-foreground text-sm tabular-nums">
+											{bytes(v.size)}
+										</TableCell>
+										<TableCell className="hidden text-muted-foreground text-sm md:table-cell tabular-nums">
+											{bytes(v.chunk_size)}
+										</TableCell>
+										<TableCell className="hidden text-muted-foreground text-sm lg:table-cell">
+											{v.from ?? v.remote ?? "—"}
+										</TableCell>
+										<TableCell className="hidden text-muted-foreground text-sm sm:table-cell">
+											{since(v.updated_at)}
+										</TableCell>
+										<TableCell className="pr-6 text-right">
+											<RowActions label={`Actions for ${v.name}`}>
+												<DropdownMenuItem onSelect={() => void snapshot(v.name)}>
+													<CameraIcon />
+													Take snapshot
+												</DropdownMenuItem>
+												<DropdownMenuItem
+													onSelect={() => setPendingDelete(v.name)}
+													variant="destructive"
+												>
+													<TrashIcon />
+													Delete
+												</DropdownMenuItem>
+											</RowActions>
+										</TableCell>
+									</TableRow>
+								))}
+							</TableBody>
+						</Table>
+					)}
+				</CardContent>
+			</Card>
 
 			<Dialog
 				onOpenChange={(next) => {
@@ -226,7 +227,7 @@ export function VolumesPage() {
 								Optional — defaults to the daemon's volume size.
 							</p>
 						</div>
-						<NoticeLine message={error} />
+						<NoticeLine className="border-b-0 px-0 py-0" message={error} />
 						<DialogFooter>
 							<Button
 								disabled={creating}
@@ -270,6 +271,6 @@ export function VolumesPage() {
 				open={!!pendingDelete}
 				title="Delete this volume?"
 			/>
-		</Card>
+		</div>
 	);
 }

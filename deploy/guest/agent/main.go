@@ -40,6 +40,22 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "ok") })
 	mux.HandleFunc("POST /exec", handleExec)
+
+	// Runs: background/streaming exec (see runs.go).
+	mux.HandleFunc("POST /runs", handleRunsCreate)
+	mux.HandleFunc("GET /runs", handleRunsList)
+	mux.HandleFunc("GET /runs/{id}", handleRunGet)
+	mux.HandleFunc("GET /runs/{id}/stream", handleRunStream)
+	mux.HandleFunc("POST /runs/{id}/stdin", handleRunStdin)
+	mux.HandleFunc("DELETE /runs/{id}", handleRunKill)
+
+	// Sessions: a run of an interactive shell (cwd/env persist across inputs).
+	mux.HandleFunc("POST /sessions", handleSessionCreate)
+	mux.HandleFunc("POST /sessions/{id}/input", handleSessionInput)
+	mux.HandleFunc("GET /sessions/{id}/output", handleRunStream)
+	mux.HandleFunc("GET /sessions/{id}", handleRunGet)
+	mux.HandleFunc("DELETE /sessions/{id}", handleRunKill)
+
 	mux.HandleFunc("GET /files", handleList)
 	mux.HandleFunc("GET /file", handleRead)
 	mux.HandleFunc("PUT /file", handleWrite)

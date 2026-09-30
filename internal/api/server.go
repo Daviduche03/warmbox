@@ -120,6 +120,20 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /api/desktops/{id}/file", s.agentFileDelete)
 	mux.HandleFunc("POST /api/desktops/{id}/file/move", s.agentFileMove)
 
+	// Agent API: runs (background/streaming exec) and sessions.
+	mux.HandleFunc("POST /api/desktops/{id}/runs", s.agentRunCreate)
+	mux.HandleFunc("GET /api/desktops/{id}/runs", s.agentRunList)
+	mux.HandleFunc("GET /api/desktops/{id}/runs/{run}", s.agentRunGet)
+	mux.HandleFunc("GET /api/desktops/{id}/runs/{run}/stream", s.agentRunStream)
+	mux.HandleFunc("POST /api/desktops/{id}/runs/{run}/stdin", s.agentRunStdin)
+	mux.HandleFunc("DELETE /api/desktops/{id}/runs/{run}", s.agentRunKill)
+	mux.HandleFunc("POST /api/desktops/{id}/sessions", s.agentSessionCreate)
+	mux.HandleFunc("GET /api/desktops/{id}/sessions", s.agentRunList)
+	mux.HandleFunc("GET /api/desktops/{id}/sessions/{run}", s.agentRunGet)
+	mux.HandleFunc("GET /api/desktops/{id}/sessions/{run}/output", s.agentSessionOutput)
+	mux.HandleFunc("POST /api/desktops/{id}/sessions/{run}/input", s.agentSessionInput)
+	mux.HandleFunc("DELETE /api/desktops/{id}/sessions/{run}", s.agentRunKill)
+
 	// Volumes: portable, cloud-backed disks.
 	mux.HandleFunc("POST /api/volumes", s.volumeCreate)
 	mux.HandleFunc("GET /api/volumes", s.volumeList)
@@ -530,6 +544,9 @@ func (s *Server) agentProxy(w http.ResponseWriter, r *http.Request, id, agentPat
 	}
 	u := &url.URL{Scheme: "http", Host: target, Path: agentPath, RawQuery: r.URL.RawQuery}
 	proxy := &httputil.ReverseProxy{
+		// Flush immediately so Server-Sent Events (run/session output) stream
+		// instead of being buffered until the response ends.
+		FlushInterval: -1,
 		Director: func(req *http.Request) {
 			req.URL = u
 			req.Host = target
@@ -563,6 +580,36 @@ func (s *Server) agentFileDelete(w http.ResponseWriter, r *http.Request) {
 }
 func (s *Server) agentFileMove(w http.ResponseWriter, r *http.Request) {
 	s.agentProxy(w, r, r.PathValue("id"), "/file/move")
+}
+
+// --- runs / sessions: proxy to the guest agent, workspace-scoped via visibleVM ---
+
+func (s *Server) agentRunCreate(w http.ResponseWriter, r *http.Request) {
+	s.agentProxy(w, r, r.PathValue("id"), "/runs")
+}
+func (s *Server) agentRunList(w http.ResponseWriter, r *http.Request) {
+	s.agentProxy(w, r, r.PathValue("id"), "/runs")
+}
+func (s *Server) agentRunGet(w http.ResponseWriter, r *http.Request) {
+	s.agentProxy(w, r, r.PathValue("id"), "/runs/"+r.PathValue("run"))
+}
+func (s *Server) agentRunKill(w http.ResponseWriter, r *http.Request) {
+	s.agentProxy(w, r, r.PathValue("id"), "/runs/"+r.PathValue("run"))
+}
+func (s *Server) agentRunStdin(w http.ResponseWriter, r *http.Request) {
+	s.agentProxy(w, r, r.PathValue("id"), "/runs/"+r.PathValue("run")+"/stdin")
+}
+func (s *Server) agentRunStream(w http.ResponseWriter, r *http.Request) {
+	s.agentProxy(w, r, r.PathValue("id"), "/runs/"+r.PathValue("run")+"/stream")
+}
+func (s *Server) agentSessionCreate(w http.ResponseWriter, r *http.Request) {
+	s.agentProxy(w, r, r.PathValue("id"), "/sessions")
+}
+func (s *Server) agentSessionInput(w http.ResponseWriter, r *http.Request) {
+	s.agentProxy(w, r, r.PathValue("id"), "/sessions/"+r.PathValue("run")+"/input")
+}
+func (s *Server) agentSessionOutput(w http.ResponseWriter, r *http.Request) {
+	s.agentProxy(w, r, r.PathValue("id"), "/sessions/"+r.PathValue("run")+"/output")
 }
 
 // expose reverse-proxies an HTTP request to a port inside a guest, so a server

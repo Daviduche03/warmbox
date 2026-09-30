@@ -1,9 +1,9 @@
 # Agent API — design (for review)
 
-Status: **phase 1 landed — `exec` + `files`.** `warmbox-agent` runs in the guest
-and the daemon proxies `POST /api/desktops/{id}/exec` and the `/file(s)` routes to
-it. Remaining: streaming/background exec (phase 2), screenshot/input (phase 3),
-SDKs (phase 4).
+Status: **exec+e files, plus background/streaming runs and interactive sessions.**
+`warmbox-agent` runs in the guest; the daemon proxies `POST /api/desktops/{id}/exec`,
+the `/file(s)` routes, and the `/runs` + `/sessions` routes to it. Remaining:
+screenshot/input (computer-use), and the SDKs.
 
 Let an agent (or the host / an SDK) **run commands, move files, and (optionally)
 drive the screen** inside a warmbox VM — without noVNC and without SSH keys.
@@ -86,9 +86,45 @@ Thin clients over the host API: Go first, then Python/TypeScript.
 
 ## Phasing
 1. **Exec (one-shot) + files (list/read/write/delete/move).** The 80% for agents.
-2. **Streaming + background exec** (SSE stream, `detach:true` → runId). For servers.
+2. **Streaming + background runs, and sessions.** ✅ landed.
 3. **Screenshot + input.** Computer-use.
 4. **SDKs + a small jobs/tasks layer.**
+
+## Runs (background + streaming exec) — landed
+
+`exec` is one-shot and bounded; `runs` are for anything that outlives a call.
+The daemon proxies these to the guest agent (paths are the same, prefixed with
+`/api/desktops/{id}`):
+
+```
+POST   /runs                 {cmd|argv, cwd, env, shell, interactive, stdin, timeout_ms}
+                             -> {id}                     (starts, returns immediately)
+GET    /runs                 -> {runs:[status]}
+GET    /runs/{id}?tail=N     -> status (+ last N bytes of output)
+GET    /runs/{id}/stream?from=N -> SSE: data:{"out":"…"}* then data:{"exit":{…}}
+POST   /runs/{id}/stdin      -> write stdin
+DELETE /runs/{id}            -> kill the process group
+```
+
+Output is buffered (4 MiB of scrollback) so a client can attach late and still
+read the tail; `from=N` resumes a stream at an offset. A build that used to hit
+the 60s exec cap now runs for as long as it needs with live output.
+
+## Sessions — landed
+
+A session is a run of an interactive shell, so `cwd`/env/exports **persist
+across inputs** — the thing one-shot exec could never do.
+
+```
+POST /sessions               -> {id}            (interactive shell)
+POST /sessions/{id}/input    -> write a shell line (newline appended)
+GET  /sessions/{id}/output   -> SSE stream
+DELETE /sessions/{id}        -> kill
+```
+
+Both are scoped to the desktop (and therefore to the desktop's workspace): the
+daemon proxies them through the same `visibleVM` check as `exec`, and no new
+database rows are written — runs live and die with the guest.
 
 ## Decisions (phase 1)
 - **Transport:** HTTP — `warmbox-agent` binds the guest interface `:7077`; the
@@ -106,15 +142,14 @@ Thin clients over the host API: Go first, then Python/TypeScript.
 Today `exec` is one-shot. Planned, in priority order:
 
 **Tier 1**
-- **Persistent sessions** — a long-lived shell per desktop so `cwd`/env/exports
-  persist across calls (today every call is a fresh `sh -c` and loses state).
-  `POST /sessions`, `POST /sessions/{id}/input`, `GET /sessions/{id}/output`,
-  `DELETE /sessions/{id}`.
-- **Background + streaming exec** — every exec returns a `runId` immediately, with
-  a live output stream and status/kill/attach. Needed for anything outliving a
-  call (dev servers, builds). `POST /exec → {runId}`,
-  `GET /exec/{runId}/stream` (SSE), `DELETE /exec/{runId}`.
-- **Send stdin to a running process** — prompts and interactivity.
+- ✅ **Persistent sessions** — a long-lived shell per desktop so `cwd`/env/exports
+  persist across calls. `POST /sessions`, `POST /sessions/{id}/input`,
+  `GET /sessions/{id}/output`, `DELETE /sessions/{id}`.
+- ✅ **Background + streaming exec** — every run returns an `id` immediately, with a
+  live SSE output stream and status/kill. `POST /runs → {id}`,
+  `GET /runs/{id}/stream`, `DELETE /runs/{id}`.
+- ✅ **Send stdin to a running process** — `POST /runs/{id}/stdin`, and shell lines
+  to a session.
 
 **Tier 2**
 - `tty: true` (correct output for tools that check `isatty`).
