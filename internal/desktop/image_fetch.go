@@ -18,10 +18,23 @@ import (
 	"github.com/klauspost/compress/zstd"
 )
 
+// authHeader adds a GitHub token, for when the release lives in a private
+// repository. Public releases ignore it.
+func authHeader(req *http.Request, token string) {
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+}
+
 // FetchChecksum reads a "<hex>  <name>" checksum file (the format sha256sum and
 // goreleaser both write) and returns the hex digest.
-func FetchChecksum(url string) (string, error) {
-	resp, err := http.Get(url)
+func FetchChecksum(url, token string) (string, error) {
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return "", err
+	}
+	authHeader(req, token)
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -44,7 +57,7 @@ func FetchChecksum(url string) (string, error) {
 // left alone; otherwise a partial dst is resumed with a Range request (and a
 // server that ignores the range simply restarts from zero). A finished file that
 // fails the checksum is removed so the next attempt cannot resume from it.
-func Download(url, dst, wantSHA string, progress io.Writer) error {
+func Download(url, dst, wantSHA, token string, progress io.Writer) error {
 	if wantSHA != "" {
 		if got, err := SHA256File(dst); err == nil && strings.EqualFold(got, wantSHA) {
 			return nil // already have it
@@ -59,6 +72,7 @@ func Download(url, dst, wantSHA string, progress io.Writer) error {
 	if err != nil {
 		return err
 	}
+	authHeader(req, token)
 	if have > 0 {
 		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", have))
 	}
@@ -137,12 +151,13 @@ func Extract(archive, dir string) error {
 // only finished files are moved into place, so an interrupted run or a bad
 // checksum can never leave a half-written kernel for the daemon to boot. The
 // partial download is kept on failure so a retry resumes instead of restarting.
-func FetchBuiltin(workDir, url, wantSHA string, progress io.Writer) error {
+// token is only needed when the release is in a private repository.
+func FetchBuiltin(workDir, url, wantSHA, token string, progress io.Writer) error {
 	if err := os.MkdirAll(workDir, 0o755); err != nil {
 		return err
 	}
 	tmp := filepath.Join(workDir, ".image-download.tar.zst")
-	if err := Download(url, tmp, wantSHA, progress); err != nil {
+	if err := Download(url, tmp, wantSHA, token, progress); err != nil {
 		return err // keep tmp: the next run resumes
 	}
 

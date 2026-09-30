@@ -979,6 +979,17 @@ func defaultImageURL(version, arch string) string {
 		releaseRepo, version, fmt.Sprintf(imagePattern, version, arch))
 }
 
+// githubToken is used for release downloads, and only matters while the
+// repository is private. WARMBOX_GITHUB_TOKEN wins so a user can scope it.
+func githubToken() string {
+	for _, k := range []string{"WARMBOX_GITHUB_TOKEN", "GITHUB_TOKEN", "GH_TOKEN"} {
+		if v := strings.TrimSpace(os.Getenv(k)); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
 // builtinImagePresent reports whether the files the daemon needs to boot are
 // already in place.
 func builtinImagePresent(cfg *desktop.Config) bool {
@@ -1094,14 +1105,14 @@ func installGuestImage(cfg *desktop.Config, url, sha string, force bool) error {
 		_ = os.Remove(filepath.Join(dir, ".image-download.tar.zst"))
 	}
 	if sha == "" {
-		s, err := desktop.FetchChecksum(url + ".sha256")
+		s, err := desktop.FetchChecksum(url+".sha256", githubToken())
 		if err != nil {
-			return fmt.Errorf("no prebuilt guest image for %s/%s:\n  %v\n  build one yourself:  ./deploy/guest/build.sh\n  (or pass --image-url and --image-sha256)", version, runtime.GOARCH, err)
+			return fmt.Errorf("no prebuilt guest image for %s/%s:\n  %v\n  build one yourself:  ./deploy/guest/build.sh\n  (or pass --image-url and --image-sha256; if the release is in a private\n  repository, set GITHUB_TOKEN)", version, runtime.GOARCH, err)
 		}
 		sha = s
 	}
 	fmt.Fprintf(os.Stderr, "… fetching the guest image for %s (several hundred MB, resumable)\n  %s\n", runtime.GOARCH, url)
-	if err := desktop.FetchBuiltin(dir, url, sha, os.Stderr); err != nil {
+	if err := desktop.FetchBuiltin(dir, url, sha, githubToken(), os.Stderr); err != nil {
 		return fmt.Errorf("%v\n  (re-run to resume; pass --force to start clean)", err)
 	}
 	fmt.Fprintf(os.Stderr, "✓ guest image installed in %s\n", dir)
