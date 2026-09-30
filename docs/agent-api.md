@@ -122,9 +122,26 @@ GET  /sessions/{id}/output   -> SSE stream
 DELETE /sessions/{id}        -> kill
 ```
 
-Both are scoped to the desktop (and therefore to the desktop's workspace): the
-daemon proxies them through the same `visibleVM` check as `exec`, and no new
-database rows are written — runs live and die with the guest.
+**Sessions are runs**, not a separate mechanism: they live in the same registry,
+so a session's id also works everywhere a run id does. Concretely, the session
+routes are sugar over the run routes:
+
+| session route | is really |
+|---|---|
+| `POST /sessions/{id}/input` | `POST /runs/{id}/stdin` **+ a trailing `\n`** |
+| `GET /sessions/{id}/output` | `GET /runs/{id}/stream` (same handler) |
+| `GET /sessions/{id}` | `GET /runs/{id}` (same handler) |
+| `DELETE /sessions/{id}` | `DELETE /runs/{id}` (same handler) |
+
+So the only genuine difference is the newline (and that `POST /sessions` starts
+`/bin/sh` instead of your command). If you want raw bytes to a process, use
+`/runs/{id}/stdin`; if you want to *type at a shell*, use `/sessions/{id}/input`.
+Both are kept: the raw form is what a program's stdin needs, the line form is
+what a person means.
+
+Everything is scoped to the desktop (and therefore to the desktop's workspace):
+the daemon proxies it through the same `visibleVM` check as `exec`, and no new
+database rows are written — runs and sessions live and die with the guest.
 
 ## Decisions (phase 1)
 - **Transport:** HTTP — `warmbox-agent` binds the guest interface `:7077`; the
