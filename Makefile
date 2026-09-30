@@ -5,7 +5,7 @@ BROWSER ?= chromium
 BINARY ?= warmbox
 VERSION ?= v0.1.0
 
-.PHONY: build build-all web web-dev guest-image setup daemon run test vet clean install
+.PHONY: build build-all web web-dev guest-image setup daemon run test vet clean install image-pack release-snapshot
 
 ## build: compile the warmbox binary (embeds the committed web/dist).
 ## CGO off keeps it a static, portable binary (and avoids SDK/toolchain drift).
@@ -58,3 +58,11 @@ vet:
 ## clean: remove local build artifacts (not the guest image)
 clean:
 	rm -f $(BINARY)
+
+## image-pack: pack the built-in image as a release artifact (also writes .sha256)
+image-pack: build
+	./$(BINARY) image pack --builtin -o warmbox-image-$(VERSION)-$(shell go env GOARCH).tar.zst
+
+## release-snapshot: dry-run a release locally (builds every target, publishes nothing)
+release-snapshot:
+	goreleaser release --snapshot --clean

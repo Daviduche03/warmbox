@@ -1012,9 +1012,8 @@ function StorageSection() {
 	);
 }
 
-/** Storage backing and the per-workspace desktop ceiling. */
-function StorageSection() {
-	const { status } = useStore();
+/** The daemon-wide desktop ceiling: how much memory one workspace may hold. */
+function DesktopLimitSection() {
 	const [limit, setLimit] = useState("");
 	const [usage, setUsage] = useState<number>();
 	const [error, setError] = useState<string>();
@@ -1029,7 +1028,7 @@ function StorageSection() {
 				setUsage(res.desktops_in_workspace);
 			} catch (err) {
 				setError(
-					err instanceof ApiError ? err.message : "could not load settings",
+					err instanceof ApiError ? err.message : "could not load the limit",
 				);
 			}
 		})();
@@ -1055,80 +1054,59 @@ function StorageSection() {
 				setDone("Saved.");
 			} catch (err) {
 				setError(
-					err instanceof ApiError ? err.message : "could not save settings",
+					err instanceof ApiError ? err.message : "could not save the limit",
 				);
 			}
 		});
 	}
 
 	return (
-		<div className="max-w-2xl space-y-8">
-			<section className="space-y-4">
-				<SectionHead
-					desc="Where volume bytes live, and how much they add up to."
-					title="Storage"
-				/>
-				<Card className="shadow-none dark:ring-0">
-					<CardContent className="p-0">
-						<Row label="Backing" value={status?.volumes_backed ?? "—"} />
-						<Row label="Volumes" value={String(status?.volumes ?? 0)} />
-						<Row label="Snapshots" value={String(status?.snapshots ?? 0)} />
-					</CardContent>
-				</Card>
-			</section>
-
-			<Separator />
-
-			<section className="space-y-4">
-				<SectionHead
-					as="h2"
-					desc="Each running desktop holds its memory until it is destroyed, so the cap keeps one workspace from eating the host."
-					title="Desktop limit"
-				/>
-				<Card className="shadow-none dark:ring-0">
-					<CardContent className="px-6 py-2">
-						<form className="space-y-4" onSubmit={(e) => void save(e)}>
-							<div className="space-y-2">
-								<label className="text-sm" htmlFor="max-desktops">
-									Desktops per workspace
-								</label>
-								<Input
-									disabled={pending}
-									id="max-desktops"
-									inputMode="numeric"
-									min={0}
-									onChange={(e) => setLimit(e.target.value)}
-									type="number"
-									value={limit}
-								/>
-								<p className="text-muted-foreground text-xs">
-									0 means unlimited. This workspace is running {usage ?? 0}.
-								</p>
-							</div>
-							<NoticeLine
-								className="border-b-0 px-0 py-0"
-								message={error}
+		<section className="max-w-2xl space-y-4">
+			<SectionHead
+				as="h2"
+				desc="Every running desktop holds its memory until it is destroyed. The cap keeps one workspace from eating the host."
+				title="Desktop limit"
+			/>
+			<Card className="shadow-none dark:ring-0">
+				<CardContent className="px-6 py-2">
+					<form className="space-y-4" onSubmit={(e) => void save(e)}>
+						<div className="space-y-2">
+							<label className="text-sm" htmlFor="max-desktops">
+								Desktops per workspace
+							</label>
+							<Input
+								disabled={pending}
+								id="max-desktops"
+								inputMode="numeric"
+								min={0}
+								onChange={(e) => setLimit(e.target.value)}
+								type="number"
+								value={limit}
 							/>
-							<NoticeLine
-								className="border-b-0 px-0 py-0"
-								message={done}
-								tone="success"
-							/>
-							<Button aria-busy={pending} disabled={pending} size="sm" type="submit">
-								{pending ? (
-									<>
-										<Spinner />
-										Saving…
-									</>
-								) : (
-									"Save limit"
-								)}
-							</Button>
-						</form>
-					</CardContent>
-				</Card>
-			</section>
-		</div>
+							<p className="text-muted-foreground text-xs">
+								0 means unlimited. This workspace is running {usage ?? 0}.
+							</p>
+						</div>
+						<NoticeLine className="border-b-0 px-0 py-0" message={error} />
+						<NoticeLine
+							className="border-b-0 px-0 py-0"
+							message={done}
+							tone="success"
+						/>
+						<Button aria-busy={pending} disabled={pending} size="sm" type="submit">
+							{pending ? (
+								<>
+									<Spinner />
+									Saving…
+								</>
+							) : (
+								"Save limit"
+							)}
+						</Button>
+					</form>
+				</CardContent>
+			</Card>
+		</section>
 	);
 }
 
@@ -1213,8 +1191,8 @@ function DaemonSection() {
  * Settings as tabs — account, team, machine credentials, storage, daemon
  * health. Each tab lays its heading straight on the page (setup's split-screen
  * language); tables and row lists sit in a card below it, and every create
- * flow (invite, token) opens in a modal. The Team and Storage tabs only exist
- * for admins; everyone else simply never sees them.
+ * flow (invite, token) opens in a modal. Team is admin-only and Storage is
+ * owners-only: everyone else simply never sees them.
  */
 export function SettingsPage() {
 	const { me } = useStore();
@@ -1227,7 +1205,6 @@ export function SettingsPage() {
 				<TabsTrigger value="account">Account</TabsTrigger>
 				{canManage && <TabsTrigger value="team">Team</TabsTrigger>}
 				<TabsTrigger value="tokens">API tokens</TabsTrigger>
-				{canManage && <TabsTrigger value="storage">Storage</TabsTrigger>}
 				{isOwner && <TabsTrigger value="storage">Storage</TabsTrigger>}
 				<TabsTrigger value="daemon">Daemon</TabsTrigger>
 			</TabsList>
@@ -1248,13 +1225,10 @@ export function SettingsPage() {
 
 			{isOwner && (
 				<TabsContent value="storage">
-					<StorageSection />
-				</TabsContent>
-			)}
-
-			{canManage && (
-				<TabsContent value="storage">
-					<StorageSection />
+					<div className="space-y-8">
+						<StorageSection />
+						<DesktopLimitSection />
+					</div>
 				</TabsContent>
 			)}
 

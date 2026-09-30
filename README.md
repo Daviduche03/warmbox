@@ -52,9 +52,9 @@ To **build from source** you also need **Docker** (for the guest image) and
 Prebuilt binaries ship with a prebuilt guest image, so there is no Docker step:
 
 ```sh
-brew install Daviduche03/warmbox/warmbox   # macOS, or Linuxbrew
-warmbox setup                              # fetch noVNC + the guest image
-warmbox service install --pool 1           # run the daemon in the background
+brew install --cask Daviduche03/warmbox/warmbox   # macOS, or Linuxbrew
+warmbox setup                                     # fetch noVNC + the guest image
+warmbox service install --pool 1                  # run the daemon in the background
 ```
 
 Then open <http://localhost:7070> (or `warmbox create` for a desktop and its
@@ -95,6 +95,25 @@ go build -o warmbox ./cmd/warmbox
 
 Maintainers publish an image with `warmbox image pack --builtin -o <file>`,
 which also writes the `.sha256` that `setup` verifies.
+
+### Releasing
+
+Push a tag (`git tag v0.2.0 && git push origin v0.2.0`). The release workflow
+builds the binaries for darwin/arm64 and linux/{amd64,arm64}, publishes them with
+`checksums.txt`, and updates the Homebrew cask.
+
+The guest image is published separately by the **guest image** workflow, which is
+manual on purpose — it takes ~15 minutes per architecture and a failure there
+should not block a binary release. Run it with the tag as input and it attaches
+`warmbox-image-<tag>-<arch>.tar.zst` plus its `.sha256` to that release. Those
+names are exactly what `warmbox setup` looks for, so the tag and the asset must
+agree.
+
+Two things must exist before the first release:
+
+- a `homebrew-warmbox` tap repository, and
+- a `HOMEBREW_TAP_GITHUB_TOKEN` secret — a PAT with write access to that repo,
+  because the default `GITHUB_TOKEN` cannot push to a different repository.
 
 Each desktop gets a short URL (`http://localhost:7070/d/<id>`); open it and
 noVNC fills the page. The token is dropped from the address bar after the first

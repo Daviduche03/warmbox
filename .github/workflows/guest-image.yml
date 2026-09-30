@@ -1,0 +1,68 @@
+name: guest image
+
+# Publishes the guest image to an existing release, one asset per architecture.
+#
+# Manual on purpose: the image takes ~15 minutes to build per arch (Docker +
+# squashfs), and a failure here should never block a binary release. The asset
+# name has to match what `warmbox setup` looks for:
+#
+#   warmbox-image-<tag>-<goarch>.tar.zst  (+ .sha256)
+#
+# Run it after the release workflow has created the release.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to attach the image to (e.g. v0.2.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  image:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The guest has to match the hypervisor, so there is one image per
+          # host arch. ubuntu-24.04-arm is the free arm64 runner for public
+          # repos; on a private repo use ubuntu-24.04-arm-private (paid).
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+            platform: linux/arm64
+          - runner: ubuntu-24.04
+            arch: amd64
+            platform: linux/amd64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # Builds vmlinux + initramfs.zst + rootfs.squashfs (+ overlay initramfs
+      # and volume-base.img) into ~/.warmbox.
+      - name: Build the guest image
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: ./deploy/guest/build.sh
+
+      - name: Pack it (adds a .sha256 beside the archive)
+        run: |
+          go build -o warmbox ./cmd/warmbox
+          ./warmbox image pack --builtin \
+            -o "warmbox-image-${{ inputs.tag }}-${{ matrix.arch }}.tar.zst"
+
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ inputs.tag }}" \
+            "warmbox-image-${{ inputs.tag }}-${{ matrix.arch }}.tar.zst" \
+            "warmbox-image-${{ inputs.tag }}-${{ matrix.arch }}.tar.zst.sha256" \
+            --clobber
