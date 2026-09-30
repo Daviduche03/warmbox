@@ -68,11 +68,14 @@ warmbox service install --pool 1                  # run the daemon in the backgr
 Then open <http://localhost:7070> (or `warmbox create` for a desktop and its
 URL). `warmbox setup` prints what it found and what to do next.
 
-`setup` downloads the guest image for your host architecture — the guest has to
-match the hypervisor, so there is one image per arch — verifies it against the
-published sha256, and installs it. It is resumable: an interrupted download
-picks up where it left off, and re-running it is safe. Point it somewhere else
-with `--image-url` (plus `--image-sha256` if you don't publish a `.sha256`).
+`setup` **installs what is missing** rather than handing you a list of chores. It
+installs the hypervisor for your host (`brew install vfkit`, or QEMU from your
+distro's package manager) when it isn't there, then gets the guest image: it
+downloads the published one for your architecture — verified against its sha256,
+resumable, safe to re-run — or, if none is published for the platform, fetches the
+source and builds it locally (installing Docker first if necessary). `--no-install`
+turns the installing off and just reports; `--image-url`/`--image-sha256` point at
+an archive of your own.
 
 <details>
 <summary>Without Homebrew (Linux servers, or by hand)</summary>
@@ -126,12 +129,12 @@ Push a tag (`git tag v0.2.0 && git push origin v0.2.0`). The release workflow
 builds the binaries for darwin/arm64 and linux/{amd64,arm64}, publishes them with
 `checksums.txt`, and updates the Homebrew cask.
 
-The guest image is published separately by the **guest image** workflow, which is
-manual on purpose — it takes ~15 minutes per architecture and a failure there
-should not block a binary release. Run it with the tag as input and it attaches
-`warmbox-image-<tag>-<arch>.tar.zst` plus its `.sha256` to that release. Those
-names are exactly what `warmbox setup` looks for, so the tag and the asset must
-agree.
+The guest images live in their own release, tagged **`images`**, as
+`warmbox-image-<arch>.tar.zst` plus its `.sha256` — deliberately **not** tied to
+the CLI's version, because the guest changes far less often and a new release
+should not need 800 MB re-uploaded. The **guest image** workflow builds and
+publishes them; it is manual because it takes ~15 minutes per architecture and
+must never be able to block a binary release.
 
 Two things must exist before the first release:
 
@@ -144,16 +147,19 @@ missing, so a release can never fail on it.
 
 Two things worth knowing:
 
-- The workflow builds **both** architectures: amd64 on a standard runner, arm64 on
-  GitHub's free `ubuntu-24.04-arm` runner (public repositories get it at no cost).
-  If that runner is ever unavailable, build the arm64 image on an Apple Silicon
-  Mac, where the image already is:
+- The image workflow builds both architectures: amd64 on a standard runner, arm64
+  on GitHub's free `ubuntu-24.04-arm` runner. If that runner is ever unavailable,
+  build the arm64 image on an Apple Silicon Mac, where it already lives:
 
   ```sh
-  make image-pack VERSION=v0.2.1
-  gh release upload v0.2.1 warmbox-image-v0.2.1-arm64.tar.zst \
-      warmbox-image-v0.2.1-arm64.tar.zst.sha256
+  make image-pack
+  gh release upload images warmbox-image-arm64.tar.zst \
+      warmbox-image-arm64.tar.zst.sha256
   ```
+
+- Neither is required for `warmbox setup` to work: when no image is published for
+  the platform it fetches the source and builds one locally, installing Docker
+  first if it has to. The published images are a shortcut, not a dependency.
 
 Each desktop gets a short URL (`http://localhost:7070/d/<id>`); open it and
 noVNC fills the page. The token is dropped from the address bar after the first

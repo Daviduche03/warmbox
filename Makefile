@@ -59,9 +59,9 @@ vet:
 clean:
 	rm -f $(BINARY)
 
-## image-pack: pack the built-in image as a release artifact (also writes .sha256)
+## image-pack: pack the built-in image for the "images" release (also writes .sha256)
 image-pack: build
-	./$(BINARY) image pack --builtin -o warmbox-image-$(VERSION)-$(shell go env GOARCH).tar.zst
+	./$(BINARY) image pack --builtin -o warmbox-image-$(shell go env GOARCH).tar.zst
 
 ## release-snapshot: dry-run a release locally (builds every target, publishes nothing)
 release-snapshot:

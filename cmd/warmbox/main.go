@@ -173,7 +173,7 @@ Usage:
   warmbox service <cmd>     Manage the background daemon (launchd on macOS,
                             systemd on Linux):
                             install | start | stop | restart | status
-  warmbox setup             Check prerequisites, then fetch noVNC and the guest image
+  warmbox setup             Install what's missing: hypervisor, guest image, noVNC
   warmbox login             Sign in as a user (stores a session)
   warmbox logout            End the CLI session
   warmbox create            Provision a desktop, print its noVNC URL
@@ -1012,14 +1012,19 @@ func backfillCatalog(ctx context.Context, cat *catalog.DB, store *volume.Store, 
 // Where the prebuilt guest image comes from. The image is built per host arch —
 // the guest has to match the hypervisor the host can offer — and published under
 // the same tag as the binary, next to its .sha256.
+// Guest images live under a fixed release tag, not the binary's version: the
+// guest changes far less often than the CLI, and tying the two together meant
+// re-uploading ~800 MB on every release. `warmbox setup` asks for this tag, so
+// a new binary finds the image that is already published.
 const (
 	releaseRepo  = "Daviduche03/warmbox"
-	imagePattern = "warmbox-image-%s-%s.tar.zst" // version, GOARCH
+	imageRelease = "images"
+	imagePattern = "warmbox-image-%s.tar.zst" // GOARCH
 )
 
-func defaultImageURL(version, arch string) string {
+func defaultImageURL(arch string) string {
 	return fmt.Sprintf("https://github.com/%s/releases/download/%s/%s",
-		releaseRepo, version, fmt.Sprintf(imagePattern, version, arch))
+		releaseRepo, imageRelease, fmt.Sprintf(imagePattern, arch))
 }
 
 // builtinImagePresent reports whether the files the daemon needs to boot are
@@ -1031,6 +1036,158 @@ func builtinImagePresent(cfg *desktop.Config) bool {
 		}
 	}
 	return true
+}
+
+// --- making the host ready ---------------------------------------------------
+//
+// `setup` should leave a working machine, not a list of chores: when the
+// hypervisor or the guest image is missing it installs or builds it, unless
+// --no-install says otherwise.
+
+func have(name string) bool {
+	_, err := exec.LookPath(name)
+	return err == nil
+}
+
+// runCmd runs a command with its output attached, so the user can see what is
+// being installed.
+func runCmd(dir string, env []string, name string, args ...string) error {
+	cmd := exec.Command(name, args...)
+	cmd.Dir = dir
+	cmd.Env = env
+	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+	fmt.Fprintf(os.Stderr, "    $ %s %s\n", name, strings.Join(args, " "))
+	return cmd.Run()
+}
+
+// installPackages installs host packages with whichever package manager this
+// distro uses, as root (through sudo when needed).
+func installPackages(names []string) bool {
+	asRoot := func(bin string, args ...string) error {
+		if os.Geteuid() == 0 {
+			return runCmd("", os.Environ(), bin, args...)
+		}
+		if !have("sudo") {
+			return fmt.Errorf("%s needs root and sudo is not installed", bin)
+		}
+		return runCmd("", os.Environ(), "sudo", append([]string{bin}, args...)...)
+	}
+	switch {
+	case have("apt-get"):
+		_ = asRoot("apt-get", "update", "-qq") // a fresh machine has no package index
+		return asRoot("apt-get", append([]string{"install", "-y"}, names...)...) == nil
+	case have("dnf"):
+		return asRoot("dnf", append([]string{"install", "-y"}, names...)...) == nil
+	case have("yum"):
+		return asRoot("yum", append([]string{"install", "-y"}, names...)...) == nil
+	case have("zypper"):
+		return asRoot("zypper", append([]string{"install", "-y"}, names...)...) == nil
+	case have("pacman"):
+		return asRoot("pacman", append([]string{"-S", "--noconfirm"}, names...)...) == nil
+	case have("apk"):
+		return asRoot("apk", append([]string{"add"}, names...)...) == nil
+	}
+	return false
+}
+
+// ensureHypervisor makes sure the backend this host will actually use is
+// installed.
+func ensureHypervisor(cfg *desktop.Config, allowInstall bool) bool {
+	if cfg.Backend != "qemu" {
+		if have(cfg.VfkitPath) {
+			fmt.Fprintln(os.Stderr, "✓ vfkit found")
+			return true
+		}
+		if !allowInstall {
+			fmt.Fprintln(os.Stderr, "✗ vfkit not found (--no-install)")
+			return false
+		}
+		if !have("brew") {
+			fmt.Fprintln(os.Stderr, "✗ vfkit not found, and Homebrew is not installed — see https://brew.sh")
+			return false
+		}
+		fmt.Fprintln(os.Stderr, "… installing vfkit")
+		if runCmd("", os.Environ(), "brew", "install", "vfkit") != nil || !have(cfg.VfkitPath) {
+			fmt.Fprintln(os.Stderr, "✗ could not install vfkit")
+			return false
+		}
+		fmt.Fprintln(os.Stderr, "✓ vfkit installed")
+		return true
+	}
+
+	bin := desktop.QEMUSystemBinary()
+	if !have(bin) {
+		if !allowInstall {
+			fmt.Fprintf(os.Stderr, "✗ %s not found (--no-install)\n", bin)
+			return false
+		}
+		// Package names differ across distros, so try the usual suspects.
+		candidates := [][]string{{"qemu-system-x86"}, {"qemu-kvm"}}
+		if runtime.GOARCH == "arm64" {
+			candidates = [][]string{{"qemu-system-arm"}, {"qemu-system-aarch64"}}
+		}
+		fmt.Fprintf(os.Stderr, "… installing %s\n", bin)
+		for _, c := range candidates {
+			if installPackages(c) && have(bin) {
+				break
+			}
+		}
+		if !have(bin) {
+			fmt.Fprintf(os.Stderr, "✗ could not install %s — install it yourself, then re-run `warmbox setup`\n", bin)
+			return false
+		}
+		fmt.Fprintf(os.Stderr, "✓ %s installed\n", bin)
+	} else {
+		fmt.Fprintf(os.Stderr, "✓ %s found\n", bin)
+	}
+
+	if _, err := os.Stat("/dev/kvm"); err != nil {
+		// Virtualisation is sometimes just not loaded yet; try the module once.
+		_ = runCmd("", os.Environ(), "modprobe", "kvm")
+		if _, err := os.Stat("/dev/kvm"); err != nil {
+			fmt.Fprintln(os.Stderr, "✗ /dev/kvm missing — enable virtualisation (BIOS/VM settings, or the kvm group)")
+			return false
+		}
+	}
+	fmt.Fprintln(os.Stderr, "✓ /dev/kvm")
+	return true
+}
+
+// buildGuestImage builds the guest image on this machine — there is no artifact
+// to download for this platform, so it fetches the source for this version and
+// runs its build. Needs Docker, and about fifteen minutes.
+func buildGuestImage(allowInstall bool) error {
+	if !have("docker") {
+		if !allowInstall {
+			return fmt.Errorf("Docker is needed to build the guest image (--no-install given)")
+		}
+		fmt.Fprintln(os.Stderr, "… Docker is required to build the image; installing it")
+		if !installPackages([]string{"docker.io"}) && !installPackages([]string{"docker"}) {
+			return fmt.Errorf("could not install Docker — install it, then re-run `warmbox setup`")
+		}
+		if !have("docker") {
+			return fmt.Errorf("Docker is installed but not on PATH — start it and re-run `warmbox setup`")
+		}
+	}
+
+	dir, err := os.MkdirTemp("", "warmbox-src-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(dir)
+
+	fmt.Fprintf(os.Stderr, "… fetching the source for %s\n", version)
+	url := fmt.Sprintf("https://github.com/%s/archive/refs/tags/%s.tar.gz", releaseRepo, version)
+	if err := fetchTarball(url, dir); err != nil {
+		return fmt.Errorf("%v\n  (or build it by hand: ./deploy/guest/build.sh in a checkout)", err)
+	}
+
+	fmt.Fprintln(os.Stderr, "… building the guest image (about 15 minutes; the build prints its own progress)")
+	env := append(os.Environ(), "PLATFORM=linux/"+runtime.GOARCH)
+	if err := runCmd(dir, env, "./deploy/guest/build.sh"); err != nil {
+		return fmt.Errorf("the guest image build failed: %v", err)
+	}
+	return nil
 }
 
 func cmdSetup(args []string) {
@@ -1046,14 +1203,16 @@ func cmdSetup(args []string) {
 	imageSHA := fs.String("image-sha256", "", "expected sha256 (default: fetched from <url>.sha256)")
 	force := fs.Bool("force", false, "re-download the guest image even if it is already installed")
 	noImage := fs.Bool("no-image", false, "skip the guest image; check everything else")
+	noInstall := fs.Bool("no-install", false, "don't install missing prerequisites, just report them")
 	_ = fs.Parse(args)
+	allowInstall := !*noInstall
 
 	if err := cfg.EnsureDirs(); err != nil {
 		fatal("Error: %v", err)
 	}
 
 	fmt.Fprintln(os.Stderr, "warmbox setup")
-	ready := checkHypervisor(cfg)
+	ready := ensureHypervisor(cfg, allowInstall)
 
 	switch {
 	case *noImage:
@@ -1061,7 +1220,7 @@ func cmdSetup(args []string) {
 	case !*force && builtinImagePresent(cfg):
 		fmt.Fprintf(os.Stderr, "✓ guest image in %s\n", filepath.Dir(cfg.KernelPath))
 	default:
-		if err := installGuestImage(cfg, *imageURL, *imageSHA, *force); err != nil {
+		if err := installGuestImage(cfg, *imageURL, *imageSHA, *force, allowInstall); err != nil {
 			fmt.Fprintf(os.Stderr, "✗ guest image: %v\n", err)
 			ready = false
 		}
@@ -1093,35 +1252,6 @@ func cmdSetup(args []string) {
 	fmt.Fprintf(os.Stderr, "\nthe dashboard is on %s\n", dashboardURL(cfg.APIAddr))
 }
 
-// checkHypervisor reports whether the hypervisor this host will actually use is
-// present, so setup can refuse to call itself finished when it is not.
-func checkHypervisor(cfg *desktop.Config) bool {
-	if cfg.Backend == "qemu" {
-		return checkQEMU()
-	}
-	if _, err := exec.LookPath(cfg.VfkitPath); err != nil {
-		fmt.Fprintln(os.Stderr, "✗ vfkit not found — install it: brew install vfkit")
-		return false
-	}
-	fmt.Fprintln(os.Stderr, "✓ vfkit found")
-	return true
-}
-
-func checkQEMU() bool {
-	bin := desktop.QEMUSystemBinary()
-	if _, err := exec.LookPath(bin); err != nil {
-		fmt.Fprintf(os.Stderr, "✗ %s not found — install QEMU (e.g. apt install qemu-system-x86)\n", bin)
-		return false
-	}
-	fmt.Fprintf(os.Stderr, "✓ %s found\n", bin)
-	if _, err := os.Stat("/dev/kvm"); err != nil {
-		fmt.Fprintln(os.Stderr, "✗ /dev/kvm missing — enable virtualization (or join the kvm group)")
-		return false
-	}
-	fmt.Fprintln(os.Stderr, "✓ /dev/kvm")
-	return true
-}
-
 // dashboardURL says where to point a browser. The daemon binds loopback by
 // default, so on a remote host the useful instruction is a tunnel rather than
 // the machine's public address — and it is plaintext HTTP, so exposing it is a
@@ -1143,7 +1273,9 @@ func dashboardURL(addr string) string {
 // installGuestImage downloads the guest image archive and installs it into the
 // directory the daemon will read the image from, verifying the published
 // checksum first.
-func installGuestImage(cfg *desktop.Config, url, sha string, force bool) error {
+// installGuestImage gets the guest image onto this machine: it downloads the
+// published artifact when there is one, and builds it here when there is not.
+func installGuestImage(cfg *desktop.Config, url, sha string, force, allowInstall bool) error {
 	// The image files live next to the kernel. Use that directory rather than
 	// WorkDir: a custom --workdir does not move the image paths, and installing
 	// somewhere the daemon never looks would look like success and then fail at
@@ -1151,39 +1283,39 @@ func installGuestImage(cfg *desktop.Config, url, sha string, force bool) error {
 	dir := filepath.Dir(cfg.KernelPath)
 	for _, p := range []string{cfg.InitrdPath, cfg.SquashPath} {
 		if filepath.Dir(p) != dir {
-			return fmt.Errorf("image paths span two directories (%s and %s);\n  point --kernel/--initrd/--squash at one directory, or install the image yourself", dir, filepath.Dir(p))
+			return fmt.Errorf("image paths span two directories (%s and %s);\n  point --kernel/--initrd/--squash at one directory", dir, filepath.Dir(p))
 		}
 	}
 
-	if url == "" {
-		url = defaultImageURL(version, runtime.GOARCH)
+	explicit := url != ""
+	if !explicit {
+		url = defaultImageURL(runtime.GOARCH)
 	}
 	if force {
 		_ = os.Remove(filepath.Join(dir, ".image-download.tar.zst"))
 	}
+
 	if sha == "" {
 		s, err := desktop.FetchChecksum(url + ".sha256")
 		if err != nil {
-			platform := "linux/arm64"
-			if runtime.GOARCH == "amd64" {
-				platform = "linux/amd64"
+			if explicit {
+				return fmt.Errorf("could not read %s.sha256: %v", url, err)
 			}
-			return fmt.Errorf(`no prebuilt guest image for %s/%s:
-  %v
-
-Build one on this machine instead (needs Docker, ~15 minutes):
-
-    git clone https://github.com/%s && cd warmbox
-    PLATFORM=%s ./deploy/guest/build.sh
-    warmbox setup --no-image
-
-Or point setup at an archive you already have:
-
-    warmbox setup --image-url <url> --image-sha256 <hex>`,
-				version, runtime.GOARCH, err, releaseRepo, platform)
+			// Nothing published for this platform, so make one here rather than
+			// leaving the user to do it.
+			fmt.Fprintf(os.Stderr, "… no published guest image for %s/%s\n", runtime.GOOS, runtime.GOARCH)
+			if err := buildGuestImage(allowInstall); err != nil {
+				return err
+			}
+			if !builtinImagePresent(cfg) {
+				return fmt.Errorf("the build finished but %s is still empty", dir)
+			}
+			fmt.Fprintf(os.Stderr, "✓ guest image built in %s\n", dir)
+			return nil
 		}
 		sha = s
 	}
+
 	fmt.Fprintf(os.Stderr, "… fetching the guest image for %s (several hundred MB, resumable)\n  %s\n", runtime.GOARCH, url)
 	if err := desktop.FetchBuiltin(dir, url, sha, os.Stderr); err != nil {
 		return fmt.Errorf("%v\n  (re-run to resume; pass --force to start clean)", err)
@@ -1194,14 +1326,19 @@ Or point setup at an archive you already have:
 
 const noVNCTarball = "https://github.com/novnc/noVNC/archive/refs/tags/v1.6.0.tar.gz"
 
-func fetchNoVNC(dest string) error {
-	resp, err := http.Get(noVNCTarball)
+// fetchNoVNC is a thin wrapper: noVNC ships as a GitHub source archive.
+func fetchNoVNC(dest string) error { return fetchTarball(noVNCTarball, dest) }
+
+// fetchTarball downloads a gzipped tar and unpacks it into dest, stripping the
+// single leading directory that GitHub wraps source archives in.
+func fetchTarball(url, dest string) error {
+	resp, err := http.Get(url)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("download: %s", resp.Status)
+		return fmt.Errorf("download %s: %s", url, resp.Status)
 	}
 	gz, err := gzip.NewReader(resp.Body)
 	if err != nil {
@@ -1220,7 +1357,7 @@ func fetchNoVNC(dest string) error {
 		if err != nil {
 			return err
 		}
-		// Strip the leading "noVNC-<version>/" path component.
+		// Strip the leading "<name>-<version>/" path component.
 		name := hdr.Name
 		if i := strings.IndexByte(name, '/'); i >= 0 {
 			name = name[i+1:]

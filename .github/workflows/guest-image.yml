@@ -1,29 +1,26 @@
 name: guest image
 
-# Publishes the guest image to an existing release, one asset per architecture.
+# Publishes the guest images to a fixed "images" release, one asset per
+# architecture:
 #
-#   warmbox-image-<tag>-<goarch>.tar.zst  (+ .sha256)
+#   warmbox-image-<goarch>.tar.zst  (+ .sha256)
 #
-# Those names are exactly what `warmbox setup` looks for, so the tag and the
-# asset must agree.
+# The tag is deliberately not the version: the guest changes far less often than
+# the CLI, and `warmbox setup` looks for these exact names, so a new release does
+# not need ~800 MB re-uploaded. Run this only when the guest actually changes.
 #
 # Manual on purpose: the build takes ~15 minutes per architecture and a failure
-# here must never be able to block a binary release. Run it after the release
-# workflow has created the release.
+# here must never be able to block a binary release.
 
 on:
   workflow_dispatch:
     inputs:
-      tag:
-        description: "Release tag to attach the image to (e.g. v0.2.0)"
-        required: true
-        type: string
       arch:
         description: "Which guest image(s) to build"
         required: true
-        default: amd64
+        default: both
         type: choice
-        options: [amd64, arm64, both]
+        options: [both, amd64, arm64]
 
 permissions:
   contents: write
@@ -51,15 +48,19 @@ jobs:
       - name: Pack it (adds the .sha256 beside the archive)
         run: |
           go build -o warmbox ./cmd/warmbox
-          ./warmbox image pack --builtin -o "warmbox-image-${{ inputs.tag }}-amd64.tar.zst"
+          ./warmbox image pack --builtin -o warmbox-image-amd64.tar.zst
 
-      - name: Attach to the release
+      - name: Publish to the images release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release upload "${{ inputs.tag }}" \
-            "warmbox-image-${{ inputs.tag }}-amd64.tar.zst" \
-            "warmbox-image-${{ inputs.tag }}-amd64.tar.zst.sha256" \
+          gh release create images \
+            --title "Guest images" \
+            --notes "Guest images for \`warmbox setup\`, one per host architecture. Not versioned with the CLI: they change only when the guest does." \
+            2>/dev/null || true
+          gh release upload images \
+            warmbox-image-amd64.tar.zst \
+            warmbox-image-amd64.tar.zst.sha256 \
             --clobber
 
   arm64:
@@ -67,9 +68,9 @@ jobs:
     # repositories. If it is ever unavailable, build the arm64 image on an Apple
     # Silicon Mac instead — which is where the guest image already lives:
     #
-    #   make image-pack VERSION=v0.2.1
-    #   gh release upload v0.2.1 warmbox-image-v0.2.1-arm64.tar.zst \
-    #       warmbox-image-v0.2.1-arm64.tar.zst.sha256
+    #   make image-pack VERSION=unused
+    #   gh release upload images warmbox-image-arm64.tar.zst \
+    #       warmbox-image-arm64.tar.zst.sha256
     if: ${{ inputs.arch == 'arm64' || inputs.arch == 'both' }}
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 90
@@ -89,13 +90,17 @@ jobs:
       - name: Pack it (adds the .sha256 beside the archive)
         run: |
           go build -o warmbox ./cmd/warmbox
-          ./warmbox image pack --builtin -o "warmbox-image-${{ inputs.tag }}-arm64.tar.zst"
+          ./warmbox image pack --builtin -o warmbox-image-arm64.tar.zst
 
-      - name: Attach to the release
+      - name: Publish to the images release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release upload "${{ inputs.tag }}" \
-            "warmbox-image-${{ inputs.tag }}-arm64.tar.zst" \
-            "warmbox-image-${{ inputs.tag }}-arm64.tar.zst.sha256" \
+          gh release create images \
+            --title "Guest images" \
+            --notes "Guest images for \`warmbox setup\`, one per host architecture. Not versioned with the CLI: they change only when the guest does." \
+            2>/dev/null || true
+          gh release upload images \
+            warmbox-image-arm64.tar.zst \
+            warmbox-image-arm64.tar.zst.sha256 \
             --clobber
