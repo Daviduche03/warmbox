@@ -1,16 +1,45 @@
-import { useState } from "react";
+import { useEffect, useState, type FormEvent } from "react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Card, CardAction, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { StatusIndicator } from "@/components/indicator";
+import {
+	Card,
+	CardAction,
+	CardContent,
+	CardDescription,
+	CardHeader,
+	CardTitle,
+} from "@/components/ui/card";
+import { DropdownMenuItem } from "@/components/ui/dropdown-menu";
+import { Input } from "@/components/ui/input";
+import {
+	Select,
+	SelectContent,
+	SelectItem,
+	SelectTrigger,
+	SelectValue,
+} from "@/components/ui/select";
+import {
+	Table,
+	TableBody,
+	TableCell,
+	TableHead,
+	TableHeader,
+	TableRow,
+} from "@/components/ui/table";
+import { ConfirmDialog } from "@/components/confirm-dialog";
+import { NoticeLine } from "@/components/notice-line";
+import { RowActions } from "@/components/row-actions";
 import { Spinner } from "@/components/spinner";
+import { StatusIndicator } from "@/components/indicator";
 import { useStore } from "@/lib/store";
-import { getToken } from "@/lib/api";
+import { api, roleRank, ApiError, type Member } from "@/lib/api";
 import { usePending } from "@/lib/use-pending";
 import {
 	ArrowsClockwise,
 	Check as CheckIcon,
 	Copy as CopyIcon,
+	Plus as PlusIcon,
+	Trash as TrashIcon,
 } from "@phosphor-icons/react";
 
 function Row({ label, value }: { label: string; value: string }) {
@@ -22,27 +51,512 @@ function Row({ label, value }: { label: string; value: string }) {
 	);
 }
 
-export function SettingsPage() {
-	const { status, loading, error, refresh } = useStore();
+function useCopy(): [boolean, (text: string) => Promise<void>] {
 	const [copied, setCopied] = useState(false);
-	const { pending: refreshing, run } = usePending();
-
-	async function copyToken() {
-		const token = getToken();
-		if (!token) return;
+	async function copy(text: string) {
+		if (!text) return;
 		try {
-			await navigator.clipboard.writeText(token);
+			await navigator.clipboard.writeText(text);
 			setCopied(true);
 			window.setTimeout(() => setCopied(false), 1600);
 		} catch {
 			/* clipboard unavailable */
 		}
 	}
+	return [copied, copy];
+}
 
-	const token = getToken();
-	const masked = token
-		? `${token.slice(0, 6)}${"•".repeat(12)}${token.slice(-4)}`
-		: "not set";
+function AccountCard() {
+	const { me, refresh } = useStore();
+	const [current, setCurrent] = useState("");
+	const [next, setNext] = useState("");
+	const [confirm, setConfirm] = useState("");
+	const [error, setError] = useState<string>();
+	const [done, setDone] = useState<string>();
+	const { pending, run } = usePending();
+
+	async function signOut() {
+		try {
+			await api.auth.logout();
+		} catch {
+			/* session may already be gone */
+		}
+		await refresh();
+	}
+
+	async function changePassword(e: FormEvent) {
+		e.preventDefault();
+		if (next !== confirm) {
+			setError("New passwords do not match.");
+			return;
+		}
+		setError(undefined);
+		setDone(undefined);
+		await run(async () => {
+			try {
+				await api.auth.changePassword({ current, next });
+				setCurrent("");
+				setNext("");
+				setConfirm("");
+				setDone("Password updated.");
+			} catch (err) {
+				setError(err instanceof ApiError ? err.message : "update failed");
+			}
+		});
+	}
+
+	return (
+		<Card className="shadow-none dark:ring-0">
+			<CardHeader className="border-b">
+				<CardTitle>Account</CardTitle>
+				<CardDescription>
+					{me ? (
+						<>
+							Signed in as <span className="text-foreground">{me.user.name}</span>{" "}
+							({me.user.email}) · {me.role} of {me.workspace.name}.
+						</>
+					) : (
+						"Your session."
+					)}
+				</CardDescription>
+				<CardAction>
+					<Button onClick={() => void signOut()} size="sm" variant="outline">
+						Sign out
+					</Button>
+				</CardAction>
+			</CardHeader>
+			<CardContent>
+				<form className="space-y-3" onSubmit={(e) => void changePassword(e)}>
+					<p className="text-muted-foreground text-sm">Change password</p>
+					<Input
+						aria-label="Current password"
+						autoComplete="current-password"
+						disabled={pending}
+						onChange={(e) => setCurrent(e.target.value)}
+						placeholder="Current password"
+						type="password"
+						value={current}
+					/>
+					<div className="flex flex-col gap-3 sm:flex-row">
+						<Input
+							aria-label="New password"
+							autoComplete="new-password"
+							disabled={pending}
+							onChange={(e) => setNext(e.target.value)}
+							placeholder="New password (8+ characters)"
+							type="password"
+							value={next}
+						/>
+						<Input
+							aria-label="Confirm new password"
+							autoComplete="new-password"
+							disabled={pending}
+							onChange={(e) => setConfirm(e.target.value)}
+							placeholder="Confirm"
+							type="password"
+							value={confirm}
+						/>
+					</div>
+					<NoticeLine message={error} />
+					<NoticeLine message={done} tone="success" />
+					<Button
+						aria-busy={pending}
+						disabled={!current || next.length < 8 || pending}
+						size="sm"
+						type="submit"
+						variant="outline"
+					>
+						{pending ? (
+							<>
+								<Spinner />
+								Updating…
+							</>
+						) : (
+							"Update password"
+						)}
+					</Button>
+				</form>
+			</CardContent>
+		</Card>
+	);
+}
+
+function TokensCard() {
+	const [tokens, setTokens] = useState<Array<{
+		id: string;
+		name: string;
+		prefix: string;
+		created_at: string;
+		last_used_at: string | null;
+	}>>([]);
+	const [name, setName] = useState("");
+	const [created, setCreated] = useState<{ token: string; id: string } | null>(null);
+	const [error, setError] = useState<string>();
+	const [copied, copy] = useCopy();
+	const [pendingDelete, setPendingDelete] = useState<string>();
+	const { pending, run } = usePending();
+
+	async function load() {
+		try {
+			const res = await api.tokens.list();
+			setTokens(res.tokens);
+		} catch {
+			/* listed on mount; failures surface on action */
+		}
+	}
+
+	useEffect(() => {
+		void load();
+	}, []);
+
+	async function create(e: FormEvent) {
+		e.preventDefault();
+		if (!name.trim() || pending) return;
+		setError(undefined);
+		await run(async () => {
+			try {
+				const res = await api.tokens.create(name.trim());
+				setCreated({ token: res.token, id: res.id });
+				setName("");
+				await load();
+			} catch (err) {
+				setError(err instanceof ApiError ? err.message : "create failed");
+			}
+		});
+	}
+
+	async function revoke(id: string) {
+		setError(undefined);
+		try {
+			await api.tokens.revoke(id);
+			await load();
+		} catch (err) {
+			setError(err instanceof ApiError ? err.message : "revoke failed");
+		}
+	}
+
+	return (
+		<Card className="shadow-none dark:ring-0">
+			<CardHeader className="border-b">
+				<CardTitle>API tokens</CardTitle>
+				<CardDescription>
+					Long-lived credentials for CLI and scripts. Send one as{" "}
+					<code className="font-mono">Authorization: Bearer &lt;token&gt;</code>.
+				</CardDescription>
+			</CardHeader>
+			<CardContent className="space-y-4">
+				<form className="flex flex-col gap-2 sm:flex-row" onSubmit={(e) => void create(e)}>
+					<Input
+						aria-label="Token name"
+						className="sm:max-w-64"
+						disabled={pending}
+						onChange={(e) => setName(e.target.value)}
+						placeholder="e.g. deploy script"
+						value={name}
+					/>
+					<Button aria-busy={pending} disabled={!name.trim() || pending} size="sm" type="submit">
+						{pending ? (
+							<>
+								<Spinner />
+								Creating…
+							</>
+						) : (
+							<>
+								<PlusIcon />
+								New token
+							</>
+						)}
+					</Button>
+				</form>
+				{created ? (
+					<div className="space-y-2">
+						<p className="text-muted-foreground text-sm">
+							Copy it now — it is never shown again.
+						</p>
+						<div className="flex items-center gap-2">
+							<code className="min-w-0 flex-1 truncate rounded-md border bg-muted px-3 py-2 font-mono text-sm">
+								{created.token}
+							</code>
+							<Button onClick={() => void copy(created.token)} size="sm" variant="outline">
+								{copied ? <CheckIcon /> : <CopyIcon />}
+								{copied ? "Copied" : "Copy"}
+							</Button>
+						</div>
+					</div>
+				) : null}
+				<NoticeLine message={error} />
+				{tokens.length === 0 ? (
+					<p className="text-muted-foreground text-sm">No tokens yet.</p>
+				) : (
+					<ul className="divide-y divide-border">
+						{tokens.map((t) => (
+							<li className="flex items-center gap-3 py-2.5" key={t.id}>
+								<div className="min-w-0 flex-1">
+									<p className="truncate font-medium text-sm">{t.name || "Untitled"}</p>
+									<p className="font-mono text-muted-foreground text-xs">
+										{t.prefix}…{t.last_used_at ? ` · used ${t.last_used_at}` : " · never used"}
+									</p>
+								</div>
+								<RowActions label={`Actions for token ${t.name || t.id}`}>
+									<DropdownMenuItem
+										onSelect={() => setPendingDelete(t.id)}
+										variant="destructive"
+									>
+										<TrashIcon />
+										Revoke
+									</DropdownMenuItem>
+								</RowActions>
+							</li>
+						))}
+					</ul>
+				)}
+			</CardContent>
+			<ConfirmDialog
+				description="Scripts using it stop authenticating immediately."
+				onConfirm={async () => {
+					if (pendingDelete) await revoke(pendingDelete);
+				}}
+				onOpenChange={(next) => {
+					if (!next) setPendingDelete(undefined);
+				}}
+				open={!!pendingDelete}
+				title="Revoke this token?"
+			/>
+		</Card>
+	);
+}
+
+const MANAGEABLE_ROLES = ["viewer", "member", "admin", "owner"] as const;
+
+function TeamCard() {
+	const { me, refresh } = useStore();
+	const [members, setMembers] = useState<Member[]>([]);
+	const [name, setName] = useState("");
+	const [email, setEmail] = useState("");
+	const [password, setPassword] = useState("");
+	const [role, setRole] = useState<string>("member");
+	const [error, setError] = useState<string>();
+	const [notice, setNotice] = useState<string>();
+	const [pendingDelete, setPendingDelete] = useState<string>();
+	const { pending, run } = usePending();
+
+	const myRank = roleRank(me?.role);
+	const canManage = myRank >= roleRank("admin");
+
+	async function load() {
+		try {
+			const res = await api.users.list();
+			setMembers(res.users);
+		} catch (err) {
+			setError(err instanceof ApiError ? err.message : "could not load team");
+		}
+	}
+
+	useEffect(() => {
+		if (canManage) void load();
+	}, [canManage]);
+
+	if (!canManage) return null;
+
+	async function invite(e: FormEvent) {
+		e.preventDefault();
+		if (pending) return;
+		setError(undefined);
+		setNotice(undefined);
+		await run(async () => {
+			try {
+				await api.users.create({
+					name: name.trim(),
+					email: email.trim(),
+					password,
+					role: role as "viewer" | "member" | "admin" | "owner",
+				});
+				setName("");
+				setEmail("");
+				setPassword("");
+				setRole("member");
+				setNotice("Account created.");
+				await load();
+			} catch (err) {
+				setError(err instanceof ApiError ? err.message : "invite failed");
+			}
+		});
+	}
+
+	async function setMemberRole(id: string, next: string) {
+		setError(undefined);
+		setNotice(undefined);
+		try {
+			await api.users.setRole(id, next as "viewer" | "member" | "admin" | "owner");
+			await load();
+			await refresh();
+		} catch (err) {
+			setError(err instanceof ApiError ? err.message : "role change failed");
+		}
+	}
+
+	async function remove(id: string) {
+		setError(undefined);
+		setNotice(undefined);
+		try {
+			await api.users.remove(id);
+			await load();
+		} catch (err) {
+			setError(err instanceof ApiError ? err.message : "remove failed");
+		}
+	}
+
+	return (
+		<Card className="shadow-none dark:ring-0">
+			<CardHeader className="border-b">
+				<div className="flex flex-wrap items-center gap-2">
+					<CardTitle>Team</CardTitle>
+					<Badge variant="secondary">{members.length}</Badge>
+				</div>
+				<CardDescription>
+					Accounts in {me?.workspace.name}. Owners manage owners; admins manage
+					members and viewers.
+				</CardDescription>
+			</CardHeader>
+			<CardContent className="space-y-4">
+				<form className="grid gap-2 sm:grid-cols-[1fr_1fr_1fr_auto_auto]" onSubmit={(e) => void invite(e)}>
+					<Input
+						aria-label="Name"
+						disabled={pending}
+						onChange={(e) => setName(e.target.value)}
+						placeholder="Name"
+						value={name}
+					/>
+					<Input
+						aria-label="Email"
+						disabled={pending}
+						onChange={(e) => setEmail(e.target.value)}
+						placeholder="Email"
+						type="email"
+						value={email}
+					/>
+					<Input
+						aria-label="Temporary password"
+						autoComplete="new-password"
+						disabled={pending}
+						onChange={(e) => setPassword(e.target.value)}
+						placeholder="Temp password (8+)"
+						type="password"
+						value={password}
+					/>
+					<Select disabled={pending} onValueChange={setRole} value={role}>
+						<SelectTrigger aria-label="Role" size="sm">
+							<SelectValue />
+						</SelectTrigger>
+						<SelectContent align="end">
+							{MANAGEABLE_ROLES.filter(
+								(r) => roleRank(r) < myRank || me?.role === "owner"
+							).map((r) => (
+								<SelectItem key={r} value={r}>
+									{r}
+								</SelectItem>
+							))}
+						</SelectContent>
+					</Select>
+					<Button aria-busy={pending} disabled={pending} size="sm" type="submit">
+						{pending ? <Spinner /> : <PlusIcon />}
+						Invite
+					</Button>
+				</form>
+				<NoticeLine message={error} />
+				<NoticeLine message={notice} tone="success" />
+				<Table>
+					<TableHeader>
+						<TableRow className="hover:bg-transparent">
+							<TableHead className="pl-0">Account</TableHead>
+							<TableHead>Role</TableHead>
+							<TableHead className="pr-0 text-right">Actions</TableHead>
+						</TableRow>
+					</TableHeader>
+					<TableBody>
+						{members.map((m) => {
+							const canTouch =
+								m.id !== me?.user.id && roleRank(m.role) < myRank;
+							return (
+								<TableRow className="hover:bg-transparent" key={m.id}>
+									<TableCell className="pl-0">
+										<p className="font-medium text-sm">{m.name}</p>
+										<p className="text-muted-foreground text-xs">{m.email}</p>
+									</TableCell>
+									<TableCell>
+										{canTouch ? (
+											<Select
+												onValueChange={(next) => void setMemberRole(m.id, next)}
+												value={m.role}
+											>
+												<SelectTrigger aria-label={`Role for ${m.email}`} size="sm">
+													<SelectValue />
+												</SelectTrigger>
+												<SelectContent>
+													{MANAGEABLE_ROLES.filter(
+														(r) => roleRank(r) < myRank
+													).map((r) => (
+														<SelectItem key={r} value={r}>
+															{r}
+														</SelectItem>
+													))}
+												</SelectContent>
+											</Select>
+										) : (
+											<Badge variant="secondary">
+												{m.role}
+												{m.id === me?.user.id ? " · you" : ""}
+											</Badge>
+										)}
+									</TableCell>
+									<TableCell className="pr-0 text-right">
+										{canTouch ? (
+											<RowActions label={`Actions for ${m.email}`}>
+												<DropdownMenuItem
+													onSelect={() => setPendingDelete(m.id)}
+													variant="destructive"
+												>
+													<TrashIcon />
+													Remove
+												</DropdownMenuItem>
+											</RowActions>
+										) : (
+											<span className="text-muted-foreground text-xs">—</span>
+										)}
+									</TableCell>
+								</TableRow>
+							);
+						})}
+					</TableBody>
+				</Table>
+			</CardContent>
+			<ConfirmDialog
+				description="Their sessions and tokens stop working immediately."
+				onConfirm={async () => {
+					if (pendingDelete) await remove(pendingDelete);
+				}}
+				onOpenChange={(next) => {
+					if (!next) setPendingDelete(undefined);
+				}}
+				open={!!pendingDelete}
+				title="Remove this account?"
+			/>
+		</Card>
+	);
+}
+
+export function SettingsPage() {
+	const { me, status, loading, error, refresh } = useStore();
+	const [refreshing, setRefreshing] = useState(false);
+
+	async function runRefresh() {
+		setRefreshing(true);
+		try {
+			await refresh();
+		} finally {
+			setRefreshing(false);
+		}
+	}
 
 	return (
 		<div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
@@ -68,7 +582,7 @@ export function SettingsPage() {
 						<Button
 							aria-busy={refreshing}
 							disabled={refreshing}
-							onClick={() => void run(refresh)}
+							onClick={() => void runRefresh()}
 							size="sm"
 							variant="outline"
 						>
@@ -100,68 +614,62 @@ export function SettingsPage() {
 					/>
 					<Row label="Default image" value={status?.default_image ?? "—"} />
 					<Row
-						label="Token required"
-						value={status ? (status.token_required ? "yes" : "no") : "—"}
+						label="Signed in"
+						value={
+							me ? `${me.user.email} · ${me.role}` : "—"
+						}
 					/>
 				</CardContent>
 			</Card>
 
-			<Card className="shadow-none dark:ring-0">
+			<div className="grid content-start gap-4">
+				<AccountCard />
+				<TokensCard />
+			</div>
+
+			<div className="lg:col-span-2">
+				<TeamCard />
+			</div>
+
+			<Card className="shadow-none dark:ring-0 lg:col-span-2">
 				<CardHeader className="border-b">
 					<CardTitle>API access</CardTitle>
+					<CardDescription>
+						Every endpoint below needs a session cookie or a personal token
+						from the card above.
+					</CardDescription>
 				</CardHeader>
-				<CardContent className="space-y-4 p-6">
-					<div className="space-y-2">
-						<p className="text-muted-foreground text-sm">Access token</p>
-						<div className="flex items-center gap-2">
-							<code className="min-w-0 flex-1 truncate rounded-md border bg-muted px-3 py-2 font-mono text-sm">
-								{masked}
-							</code>
-							<Button
-								disabled={!token}
-								onClick={() => void copyToken()}
-								size="sm"
-								variant="outline"
-							>
-								{copied ? <CheckIcon /> : <CopyIcon />}
-								{copied ? "Copied" : "Copy"}
-							</Button>
-						</div>
-						<p className="text-muted-foreground text-xs">
-							Stored on this machine at{" "}
-							<code className="font-mono">~/.warmbox/token</code>. Send it as{" "}
-							<code className="font-mono">Authorization: Bearer &lt;token&gt;</code>{" "}
-							or append <code className="font-mono">?token=</code> to a URL when a
-							page needs it (the noVNC frames do).
-						</p>
-					</div>
-					<div className="space-y-2">
-						<p className="text-muted-foreground text-sm">Endpoints</p>
-						<ul className="space-y-1 font-mono text-xs">
-							<li>
-								<span className="text-muted-foreground">GET </span>/api/status
-							</li>
-							<li>
-								<span className="text-muted-foreground">GET </span>/api/desktops
-							</li>
-							<li>
-								<span className="text-muted-foreground">POST </span>/api/desktops
-							</li>
-							<li>
-								<span className="text-muted-foreground">GET </span>/api/volumes
-							</li>
-							<li>
-								<span className="text-muted-foreground">GET </span>/api/snapshots
-							</li>
-							<li>
-								<span className="text-muted-foreground">GET </span>/api/images
-							</li>
-							<li>
-								<span className="text-muted-foreground">POST </span>
-								/api/desktops/&#123;id&#125;/exec
-							</li>
-						</ul>
-					</div>
+				<CardContent className="space-y-2">
+					<p className="text-muted-foreground text-sm">
+						Send it as{" "}
+						<code className="font-mono">Authorization: Bearer &lt;token&gt;</code>{" "}
+						or append <code className="font-mono">?token=</code> to a console URL
+						(the noVNC frames do).
+					</p>
+					<ul className="space-y-1 font-mono text-xs">
+						<li>
+							<span className="text-muted-foreground">GET </span>/api/status
+						</li>
+						<li>
+							<span className="text-muted-foreground">GET </span>/api/desktops
+						</li>
+						<li>
+							<span className="text-muted-foreground">POST </span>/api/desktops
+						</li>
+						<li>
+							<span className="text-muted-foreground">GET </span>/api/volumes
+						</li>
+						<li>
+							<span className="text-muted-foreground">GET </span>/api/snapshots
+						</li>
+						<li>
+							<span className="text-muted-foreground">GET </span>/api/images
+						</li>
+						<li>
+							<span className="text-muted-foreground">POST </span>
+							/api/desktops/&#123;id&#125;/exec
+						</li>
+					</ul>
 				</CardContent>
 			</Card>
 		</div>

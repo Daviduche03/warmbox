@@ -26,6 +26,8 @@ import (
 	"syscall"
 	"time"
 
+	"golang.org/x/term"
+
 	_ "github.com/rclone/rclone/backend/all"
 	rfs "github.com/rclone/rclone/fs"
 
@@ -34,8 +36,6 @@ import (
 	"runmesh/workspace/internal/config"
 	"runmesh/workspace/internal/desktop"
 	"runmesh/workspace/internal/egress"
-	"runmesh/workspace/internal/imagepack"
-	"runmesh/workspace/internal/pool"
 	"runmesh/workspace/internal/volume"
 )
 
@@ -59,6 +59,10 @@ func main() {
 		usage()
 	case "setup":
 		cmdSetup(os.Args[2:])
+	case "login":
+		cmdLogin(os.Args[2:])
+	case "logout":
+		cmdLogout(os.Args[2:])
 	case "create":
 		cmdCreate(os.Args[2:])
 	case "images":
@@ -85,11 +89,19 @@ func cmdHome() {
 	fmt.Fprintln(os.Stderr, "warmbox — self-hosted GUI desktop microVMs")
 
 	client := &http.Client{Timeout: 2 * time.Second}
-	resp, err := client.Get(withToken(base+"/api/desktops", tokenDefault()))
+	homeReq, _ := http.NewRequest(http.MethodGet, withToken(base+"/api/desktops", tokenDefault()), nil)
+	if s := sessionCookieValue(); s != "" {
+		homeReq.AddCookie(&http.Cookie{Name: "warmbox_session", Value: s})
+	}
+	resp, err := client.Do(homeReq)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "\ndaemon: not running (%s)\n", base)
 		fmt.Fprintln(os.Stderr, "  start it in the background:  warmbox service start")
 		fmt.Fprintln(os.Stderr, "  or in the foreground:        warmbox daemon")
+	} else if resp.StatusCode == http.StatusUnauthorized {
+		resp.Body.Close()
+		fmt.Fprintf(os.Stderr, "\ndaemon: running at %s, but no session\n", base)
+		fmt.Fprintln(os.Stderr, "  sign in first:  warmbox login")
 	} else {
 		defer resp.Body.Close()
 		var out struct {
@@ -110,13 +122,13 @@ func cmdHome() {
 			}
 		}
 	}
-	fmt.Fprintln(os.Stderr, "\ncommands: create [--image NAME] · images · list · destroy · volume · snapshot · service")
+	fmt.Fprintln(os.Stderr, "\ncommands: login · logout · create [--image NAME] · images · list · destroy · volume · snapshot · service")
 	fmt.Fprintln(os.Stderr, "          warmbox help for everything")
 }
 
 // unknownCommand prints a suggestion for a mistyped command (e.g. "deamon").
 func unknownCommand(cmd string) {
-	known := []string{"daemon", "service", "setup", "create", "images", "image",
+	known := []string{"daemon", "service", "setup", "login", "logout", "create", "images", "image",
 		"list", "destroy", "volume", "snapshot", "version", "help"}
 	best, dist := "", 3
 	for _, k := range known {
@@ -161,6 +173,8 @@ Usage:
   warmbox service <cmd>     Manage the background daemon (macOS launchd):
                             install | start | stop | restart | status
   warmbox setup             Check host prerequisites, fetch noVNC
+  warmbox login             Sign in as a user (stores a session)
+  warmbox logout            End the CLI session
   warmbox create            Provision a desktop, print its noVNC URL
   warmbox images            List the named guest images the daemon can boot
   warmbox image pack <name> Pack an image to <name>.tar.zst (compressed)
@@ -224,7 +238,7 @@ func addCommonFlags(fs *flag.FlagSet, cfg *desktop.Config) {
 	fs.IntVar(&cfg.PoolSize, "pool", cfg.PoolSize, "warm pool size")
 	fs.StringVar(&cfg.ShareDir, "share", cfg.ShareDir, "host directory shared with guests via virtiofs (mounted at /workspace)")
 	fs.StringVar(&cfg.ShareTag, "share-tag", cfg.ShareTag, "virtiofs mount tag")
-	fs.StringVar(&cfg.Token, "token", cfg.Token, "require this token on API/UI routes (empty = no auth)")
+	fs.StringVar(&cfg.Token, "token", cfg.Token, "deprecated and ignored; use account login")
 	fs.StringVar(&cfg.VolumeDir, "volume-dir", cfg.VolumeDir, "local cache dir for volume images")
 	fs.StringVar(&cfg.VolumeBase, "volume-base", cfg.VolumeBase, "base ext4 image cloned for new volumes")
 	fs.IntVar(&cfg.VolumeChunkMiB, "volume-chunk", cfg.VolumeChunkMiB, "volume transfer chunk size (MiB)")
@@ -465,6 +479,9 @@ func cmdDaemon(args []string) {
 	addCommonFlags(fs, cfg)
 	_ = fs.Parse(args)
 
+	if cfg.Token != "" {
+		fmt.Fprintln(os.Stderr, "warmbox: --token is deprecated and ignored; sign in through setup or `warmbox login`")
+	}
 	if err := cfg.EnsureDirs(); err != nil {
 		fatal("Error: %v", err)
 	}
@@ -495,7 +512,7 @@ func cmdDaemon(args []string) {
 		}
 	}
 
-	p := pool.New(mgr, cfg.PoolSize, os.Stderr)
+	p := desktop.NewPool(mgr, cfg.PoolSize, os.Stderr)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -747,8 +764,9 @@ func withToken(rawURL, token string) string {
 	return rawURL + sep + "token=" + url.QueryEscape(token)
 }
 
-// tokenDefault resolves the daemon token: $WARMBOX_TOKEN, else the token file
-// the service writes (~/.warmbox/token), else empty.
+// tokenDefault resolves a user API token: $WARMBOX_TOKEN, else the legacy
+// token file (~/.warmbox/token) if one exists. Prefer `warmbox login`, which
+// stores a session cookie instead.
 func tokenDefault() string {
 	if t := os.Getenv("WARMBOX_TOKEN"); t != "" {
 		return t
@@ -761,6 +779,180 @@ func tokenDefault() string {
 	return ""
 }
 
+// sessionFile is where `warmbox login` keeps the session cookie (0600).
+func sessionFile() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".warmbox", "session")
+}
+
+func sessionCookieValue() string {
+	p := sessionFile()
+	if p == "" {
+		return ""
+	}
+	b, err := os.ReadFile(p)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
+}
+
+// doAuthed executes a request with the login session attached. An explicit
+// --token still travels as ?token= (user API tokens work there); the session
+// cookie takes precedence server-side. A 401 means login is missing or
+// expired, never a transient error, so it explains itself.
+func doAuthed(req *http.Request) (*http.Response, error) {
+	if s := sessionCookieValue(); s != "" {
+		req.AddCookie(&http.Cookie{Name: "warmbox_session", Value: s})
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err == nil && resp.StatusCode == http.StatusUnauthorized {
+		resp.Body.Close()
+		fatal("not logged in — run `warmbox login` (or pass --token with a user API token)")
+	}
+	return resp, err
+}
+
+func getAuthed(rawURL string) (*http.Response, error) {
+	req, err := http.NewRequest(http.MethodGet, rawURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	return doAuthed(req)
+}
+
+func postAuthed(rawURL, contentType string, body io.Reader) (*http.Response, error) {
+	req, err := http.NewRequest(http.MethodPost, rawURL, body)
+	if err != nil {
+		return nil, err
+	}
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
+	return doAuthed(req)
+}
+
+// readPassword prompts without echoing when a TTY is available.
+func readPassword(prompt string) string {
+	fmt.Fprintf(os.Stderr, "%s: ", prompt)
+	if f, err := os.OpenFile("/dev/tty", os.O_RDONLY, 0); err == nil {
+		if pw, err := term.ReadPassword(int(f.Fd())); err == nil {
+			f.Close()
+			fmt.Fprintln(os.Stderr)
+			return strings.TrimSpace(string(pw))
+		}
+		f.Close()
+	}
+	fmt.Fprintln(os.Stderr, "(warning: input will echo)")
+	var line string
+	_, _ = fmt.Scanln(&line)
+	return strings.TrimSpace(line)
+}
+
+// cmdLogin authenticates as a user and stores the session cookie for later
+// commands. `warmbox login --email a@b.c` prompts for the password;
+// --password-stdin reads it (for scripts).
+func cmdLogin(args []string) {
+	addr := ":7070"
+	email := ""
+	passwordStdin := false
+	fs := flag.NewFlagSet("login", flag.ExitOnError)
+	fs.StringVar(&addr, "addr", addr, "daemon API address")
+	fs.StringVar(&email, "email", email, "account email")
+	fs.BoolVar(&passwordStdin, "password-stdin", false, "read the password from stdin")
+	_ = fs.Parse(args)
+	if email == "" {
+		fmt.Fprint(os.Stderr, "email: ")
+		_, _ = fmt.Scanln(&email)
+		email = strings.TrimSpace(email)
+	}
+	var password string
+	if passwordStdin {
+		b, _ := io.ReadAll(os.Stdin)
+		password = strings.TrimSpace(string(b))
+	} else {
+		password = readPassword("password")
+	}
+	if email == "" || password == "" {
+		fatal("email and password are required")
+	}
+	body, _ := json.Marshal(map[string]string{"email": email, "password": password})
+	resp, err := http.Post(apiBase(addr)+"/api/login", "application/json", strings.NewReader(string(body)))
+	if err != nil {
+		fatal("Error: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		var msg struct {
+			Error string `json:"error"`
+		}
+		_ = json.Unmarshal(b, &msg)
+		if msg.Error == "" {
+			msg.Error = resp.Status
+		}
+		fatal("login failed: %s", msg.Error)
+	}
+	var session string
+	for _, c := range resp.Cookies() {
+		if c.Name == "warmbox_session" {
+			session = c.Value
+		}
+	}
+	if session == "" {
+		fatal("login failed: daemon returned no session")
+	}
+	p := sessionFile()
+	if p == "" {
+		fatal("cannot determine home directory")
+	}
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		fatal("Error: %v", err)
+	}
+	if err := os.WriteFile(p, []byte(session+"\n"), 0o600); err != nil {
+		fatal("Error: %v", err)
+	}
+	var me struct {
+		User struct {
+			Name  string `json:"name"`
+			Email string `json:"email"`
+		} `json:"user"`
+		Role      string `json:"role"`
+		Workspace struct {
+			Name string `json:"name"`
+		} `json:"workspace"`
+	}
+	req, _ := http.NewRequest(http.MethodGet, apiBase(addr)+"/api/me", nil)
+	req.AddCookie(&http.Cookie{Name: "warmbox_session", Value: session})
+	if res, err := doAuthed(req); err == nil {
+		defer res.Body.Close()
+		_ = json.NewDecoder(res.Body).Decode(&me)
+	}
+	fmt.Fprintf(os.Stderr, "logged in as %s (%s · %s)\n", me.User.Email, me.Role, me.Workspace.Name)
+}
+
+// cmdLogout ends the session and deletes the stored credential.
+func cmdLogout(args []string) {
+	addr := ":7070"
+	fs := flag.NewFlagSet("logout", flag.ExitOnError)
+	fs.StringVar(&addr, "addr", addr, "daemon API address")
+	_ = fs.Parse(args)
+	if s := sessionCookieValue(); s != "" {
+		req, _ := http.NewRequest(http.MethodPost, apiBase(addr)+"/api/logout", nil)
+		req.AddCookie(&http.Cookie{Name: "warmbox_session", Value: s})
+		if resp, err := http.DefaultClient.Do(req); err == nil {
+			resp.Body.Close()
+		}
+	}
+	if p := sessionFile(); p != "" {
+		_ = os.Remove(p)
+	}
+	fmt.Fprintln(os.Stderr, "logged out")
+}
+
 func cmdCreate(args []string) {
 	addr := ":7070"
 	token := tokenDefault()
@@ -768,7 +960,7 @@ func cmdCreate(args []string) {
 	image := ""
 	fs := flag.NewFlagSet("create", flag.ExitOnError)
 	fs.StringVar(&addr, "addr", addr, "daemon API address")
-	fs.StringVar(&token, "token", token, "daemon token (default $WARMBOX_TOKEN)")
+	fs.StringVar(&token, "token", token, "user API token (or `warmbox login` first)")
 	fs.StringVar(&vol, "volume", "", "attach a persistent volume by name")
 	fs.StringVar(&image, "image", "", "boot from a named image (e.g. omarchy)")
 	_ = fs.Parse(args)
@@ -785,7 +977,7 @@ func cmdCreate(args []string) {
 		b, _ := json.Marshal(req)
 		body = strings.NewReader(string(b))
 	}
-	resp, err := http.Post(withToken(apiBase(addr)+"/api/desktops", token), "application/json", body)
+	resp, err := postAuthed(withToken(apiBase(addr)+"/api/desktops", token), "application/json", body)
 	if err != nil {
 		fatal("Error: %v", err)
 	}
@@ -834,7 +1026,7 @@ func cmdImage(args []string) {
 		if len(rest) < 1 {
 			fatal("Usage: warmbox image pack <name> [-o out.tar.zst]")
 		}
-		p, err := imagepack.Pack(cfg.ImageDir, rest[0], *out)
+		p, err := desktop.Pack(cfg.ImageDir, rest[0], *out)
 		if err != nil {
 			fatal("Error: %v", err)
 		}
@@ -847,7 +1039,7 @@ func cmdImage(args []string) {
 		if len(rest) < 2 {
 			fatal("Usage: warmbox image pull <name> <file|url>")
 		}
-		if err := imagepack.Pull(cfg.ImageDir, rest[0], rest[1]); err != nil {
+		if err := desktop.Pull(cfg.ImageDir, rest[0], rest[1]); err != nil {
 			fatal("Error: %v", err)
 		}
 		fmt.Fprintf(os.Stderr, "pulled %s into %s\n", rest[0], filepath.Join(cfg.ImageDir, rest[0]))
@@ -861,10 +1053,10 @@ func cmdImages(args []string) {
 	token := tokenDefault()
 	fs := flag.NewFlagSet("images", flag.ExitOnError)
 	fs.StringVar(&addr, "addr", addr, "daemon API address")
-	fs.StringVar(&token, "token", token, "daemon token (default $WARMBOX_TOKEN)")
+	fs.StringVar(&token, "token", token, "user API token (or `warmbox login` first)")
 	_ = fs.Parse(args)
 
-	resp, err := http.Get(withToken(apiBase(addr)+"/api/images", token))
+	resp, err := getAuthed(withToken(apiBase(addr)+"/api/images", token))
 	if err != nil {
 		fatal("Error: %v", err)
 	}
@@ -889,10 +1081,10 @@ func cmdList(args []string) {
 	token := tokenDefault()
 	fs := flag.NewFlagSet("list", flag.ExitOnError)
 	fs.StringVar(&addr, "addr", addr, "daemon API address")
-	fs.StringVar(&token, "token", token, "daemon token (default $WARMBOX_TOKEN)")
+	fs.StringVar(&token, "token", token, "user API token (or `warmbox login` first)")
 	_ = fs.Parse(args)
 
-	resp, err := http.Get(withToken(apiBase(addr)+"/api/desktops", token))
+	resp, err := getAuthed(withToken(apiBase(addr)+"/api/desktops", token))
 	if err != nil {
 		fatal("Error: %v", err)
 	}
@@ -921,13 +1113,13 @@ func cmdDestroy(args []string) {
 	token := tokenDefault()
 	fs := flag.NewFlagSet("destroy", flag.ExitOnError)
 	fs.StringVar(&addr, "addr", addr, "daemon API address")
-	fs.StringVar(&token, "token", token, "daemon token (default $WARMBOX_TOKEN)")
+	fs.StringVar(&token, "token", token, "user API token (or `warmbox login` first)")
 	rest := parseInterspersed(fs, args)
 	if len(rest) < 1 {
 		fatal("Usage: warmbox destroy <id>")
 	}
 	req, _ := http.NewRequest(http.MethodDelete, withToken(apiBase(addr)+"/api/desktops/"+rest[0], token), nil)
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := doAuthed(req)
 	if err != nil {
 		fatal("Error: %v", err)
 	}
@@ -983,7 +1175,7 @@ func cmdVolume(args []string) {
 	case "create":
 		fs := flag.NewFlagSet("volume create", flag.ExitOnError)
 		fs.StringVar(&addr, "addr", addr, "daemon API address")
-		fs.StringVar(&token, "token", token, "daemon token (default $WARMBOX_TOKEN)")
+		fs.StringVar(&token, "token", token, "user API token (or `warmbox login` first)")
 		size := fs.String("size", "", "volume size, e.g. 8G (default: base image size)")
 		from := fs.String("from", "", "clone from an existing volume")
 		fromSnap := fs.String("from-snapshot", "", "create from a snapshot id")
@@ -992,16 +1184,16 @@ func cmdVolume(args []string) {
 			fatal("Usage: warmbox volume create <name> [--size 8G] [--from <name>] [--from-snapshot <id>]")
 		}
 		payload, _ := json.Marshal(map[string]string{"name": rest[0], "size": *size, "from": *from, "from_snapshot": *fromSnap})
-		resp, err := http.Post(withToken(apiBase(addr)+"/api/volumes", token),
+		resp, err := postAuthed(withToken(apiBase(addr)+"/api/volumes", token),
 			"application/json", strings.NewReader(string(payload)))
 		doVolume(resp, err)
 
 	case "list":
 		fs := flag.NewFlagSet("volume list", flag.ExitOnError)
 		fs.StringVar(&addr, "addr", addr, "daemon API address")
-		fs.StringVar(&token, "token", token, "daemon token (default $WARMBOX_TOKEN)")
+		fs.StringVar(&token, "token", token, "user API token (or `warmbox login` first)")
 		_ = fs.Parse(args[1:])
-		resp, err := http.Get(withToken(apiBase(addr)+"/api/volumes", token))
+		resp, err := getAuthed(withToken(apiBase(addr)+"/api/volumes", token))
 		if err != nil {
 			fatal("Error: %v", err)
 		}
@@ -1027,26 +1219,26 @@ func cmdVolume(args []string) {
 	case "clone":
 		fs := flag.NewFlagSet("volume clone", flag.ExitOnError)
 		fs.StringVar(&addr, "addr", addr, "daemon API address")
-		fs.StringVar(&token, "token", token, "daemon token (default $WARMBOX_TOKEN)")
+		fs.StringVar(&token, "token", token, "user API token (or `warmbox login` first)")
 		rest := parseInterspersed(fs, args[1:])
 		if len(rest) < 2 {
 			fatal("Usage: warmbox volume clone <name> <new>")
 		}
 		payload, _ := json.Marshal(map[string]string{"name": rest[1]})
-		resp, err := http.Post(withToken(apiBase(addr)+"/api/volumes/"+rest[0]+"/clone", token),
+		resp, err := postAuthed(withToken(apiBase(addr)+"/api/volumes/"+rest[0]+"/clone", token),
 			"application/json", strings.NewReader(string(payload)))
 		doVolume(resp, err)
 
 	case "rm":
 		fs := flag.NewFlagSet("volume rm", flag.ExitOnError)
 		fs.StringVar(&addr, "addr", addr, "daemon API address")
-		fs.StringVar(&token, "token", token, "daemon token (default $WARMBOX_TOKEN)")
+		fs.StringVar(&token, "token", token, "user API token (or `warmbox login` first)")
 		rest := parseInterspersed(fs, args[1:])
 		if len(rest) < 1 {
 			fatal("Usage: warmbox volume rm <name>")
 		}
 		req, _ := http.NewRequest(http.MethodDelete, withToken(apiBase(addr)+"/api/volumes/"+rest[0], token), nil)
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := doAuthed(req)
 		doVolume(resp, err)
 
 	default:
@@ -1105,23 +1297,23 @@ func cmdSnapshot(args []string) {
 	case "create":
 		fs := flag.NewFlagSet("snapshot create", flag.ExitOnError)
 		fs.StringVar(&addr, "addr", addr, "daemon API address")
-		fs.StringVar(&token, "token", token, "daemon token (default $WARMBOX_TOKEN)")
+		fs.StringVar(&token, "token", token, "user API token (or `warmbox login` first)")
 		name := fs.String("name", "", "snapshot id (default: random)")
 		rest := parseInterspersed(fs, args[1:])
 		if len(rest) < 1 {
 			fatal("Usage: warmbox snapshot create <volume> [--name <id>]")
 		}
 		payload, _ := json.Marshal(map[string]string{"volume": rest[0], "name": *name})
-		resp, err := http.Post(withToken(apiBase(addr)+"/api/snapshots", token),
+		resp, err := postAuthed(withToken(apiBase(addr)+"/api/snapshots", token),
 			"application/json", strings.NewReader(string(payload)))
 		doVolume(resp, err)
 
 	case "list":
 		fs := flag.NewFlagSet("snapshot list", flag.ExitOnError)
 		fs.StringVar(&addr, "addr", addr, "daemon API address")
-		fs.StringVar(&token, "token", token, "daemon token (default $WARMBOX_TOKEN)")
+		fs.StringVar(&token, "token", token, "user API token (or `warmbox login` first)")
 		_ = fs.Parse(args[1:])
-		resp, err := http.Get(withToken(apiBase(addr)+"/api/snapshots", token))
+		resp, err := getAuthed(withToken(apiBase(addr)+"/api/snapshots", token))
 		if err != nil {
 			fatal("Error: %v", err)
 		}
@@ -1148,13 +1340,13 @@ func cmdSnapshot(args []string) {
 	case "rm":
 		fs := flag.NewFlagSet("snapshot rm", flag.ExitOnError)
 		fs.StringVar(&addr, "addr", addr, "daemon API address")
-		fs.StringVar(&token, "token", token, "daemon token (default $WARMBOX_TOKEN)")
+		fs.StringVar(&token, "token", token, "user API token (or `warmbox login` first)")
 		rest := parseInterspersed(fs, args[1:])
 		if len(rest) < 1 {
 			fatal("Usage: warmbox snapshot rm <id>")
 		}
 		req, _ := http.NewRequest(http.MethodDelete, withToken(apiBase(addr)+"/api/snapshots/"+rest[0], token), nil)
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := doAuthed(req)
 		doVolume(resp, err)
 
 	default:

@@ -40,7 +40,7 @@ import { StateBadge } from "@/components/state-badge";
 import { EmptyState } from "@/components/empty-state";
 import { NoticeLine } from "@/components/notice-line";
 import { useStore } from "@/lib/store";
-import { api, getToken } from "@/lib/api";
+import { api } from "@/lib/api";
 import { uptime } from "@/lib/format";
 import { usePending } from "@/lib/use-pending";
 import {
@@ -121,9 +121,7 @@ export function DesktopsPage() {
 	}
 
 	function open(id: string) {
-		const token = getToken();
-		const qs = token ? `?token=${encodeURIComponent(token)}` : "";
-		window.open(`/d/${id}${qs}`, "_blank", "noopener");
+		window.open(`/d/${id}`, "_blank", "noopener");
 	}
 
 	return (

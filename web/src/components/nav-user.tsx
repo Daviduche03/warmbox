@@ -1,6 +1,5 @@
 "use client";
 
-import { useState } from "react";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Button } from "@/components/ui/button";
 import {
@@ -12,18 +11,16 @@ import {
 	DropdownMenuSeparator,
 	DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { LogoIcon } from "@/components/logo";
-import { getToken } from "@/lib/api";
 import { useStore } from "@/lib/store";
-import { Check as CheckIcon, Copy as CopyIcon, GearSix as SettingsIcon } from "@phosphor-icons/react";
+import { api } from "@/lib/api";
+import { GearSix as SettingsIcon, SignOut } from "@phosphor-icons/react";
 
 /**
- * Host identity in the header. warmbox has no accounts — this is the daemon
- * behind the UI, so the menu reports what it is rather than who is signed in.
+ * Who is signed in, plus the daemon behind the UI. The menu reports identity
+ * first (name, role) and daemon detail second.
  */
 export function NavUser() {
-	const { status } = useStore();
-	const [copied, setCopied] = useState(false);
+	const { me, status, refresh } = useStore();
 
 	const rows: Array<[string, string]> = [
 		["Version", status?.version ?? "—"],
@@ -33,25 +30,29 @@ export function NavUser() {
 		["Storage", status?.volumes_backed ?? "—"],
 	];
 
-	async function copyToken() {
-		const token = getToken();
-		if (!token) return;
+	async function signOut() {
 		try {
-			await navigator.clipboard.writeText(token);
-			setCopied(true);
-			window.setTimeout(() => setCopied(false), 1600);
+			await api.auth.logout();
 		} catch {
-			/* clipboard unavailable */
+			/* session may already be gone */
 		}
+		await refresh();
 	}
+
+	const initials = (me?.user.name ?? me?.user.email ?? "?")
+		.split(/[\s@]+/)
+		.filter(Boolean)
+		.slice(0, 2)
+		.map((w) => w[0]?.toUpperCase() ?? "")
+		.join("");
 
 	return (
 		<DropdownMenu>
 			<DropdownMenuTrigger asChild>
-				<Button aria-label="Daemon details" size="icon" variant="ghost">
+				<Button aria-label="Account details" size="icon" variant="ghost">
 					<Avatar className="size-8 border">
-						<AvatarFallback className="bg-muted text-muted-foreground">
-							<LogoIcon className="size-4" />
+						<AvatarFallback className="bg-muted text-muted-foreground text-xs font-medium">
+							{initials || "?"}
 						</AvatarFallback>
 					</Avatar>
 				</Button>
@@ -59,14 +60,17 @@ export function NavUser() {
 			<DropdownMenuContent align="end" className="w-64">
 				<DropdownMenuLabel className="flex items-center gap-3">
 					<Avatar className="size-9 border">
-						<AvatarFallback className="bg-muted text-muted-foreground">
-							<LogoIcon className="size-4" />
+						<AvatarFallback className="bg-muted text-muted-foreground text-xs font-medium">
+							{initials || "?"}
 						</AvatarFallback>
 					</Avatar>
 					<div className="min-w-0">
-						<span className="font-medium text-foreground">warmbox daemon</span>
+						<span className="font-medium text-foreground">
+							{me?.user.name || "Signed in"}
+						</span>
 						<div className="truncate text-muted-foreground text-xs">
-							{status ? `${status.backend} · ${status.addr}` : "connecting…"}
+							{[me?.user.email, me?.role].filter(Boolean).join(" · ") ||
+								"connecting…"}
 						</div>
 					</div>
 				</DropdownMenuLabel>
@@ -80,14 +84,13 @@ export function NavUser() {
 					))}
 				</DropdownMenuGroup>
 				<DropdownMenuSeparator />
-				<DropdownMenuItem onSelect={() => void copyToken()}>
-					{copied ? <CheckIcon /> : <CopyIcon />}
-					{copied ? "Token copied" : "Copy API token"}
-				</DropdownMenuItem>
-				<DropdownMenuSeparator />
 				<DropdownMenuItem onSelect={() => (window.location.hash = "/settings")}>
 					<SettingsIcon />
 					Settings
+				</DropdownMenuItem>
+				<DropdownMenuItem onSelect={() => void signOut()}>
+					<SignOut />
+					Sign out
 				</DropdownMenuItem>
 			</DropdownMenuContent>
 		</DropdownMenu>

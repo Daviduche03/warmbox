@@ -6,8 +6,6 @@ import (
 	"net/http"
 
 	"github.com/gorilla/websocket"
-
-	"runmesh/workspace/internal/netutil"
 )
 
 // Upgrader negotiates the "binary" subprotocol used by noVNC.
@@ -27,7 +25,7 @@ func Proxy(w http.ResponseWriter, r *http.Request, target string) {
 	}
 	defer ws.Close()
 
-	conn, err := netutil.Dial(target)
+	conn, err := Dial(target)
 	if err != nil {
 		return
 	}

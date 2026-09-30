@@ -9,6 +9,7 @@ require (
 	github.com/klauspost/compress v1.18.5
 	github.com/rclone/rclone v1.74.3
 	github.com/sabhiram/go-gitignore v0.0.0-20210923224102-525f6e181f06
+	golang.org/x/crypto v0.52.0
 	golang.org/x/sys v0.47.0
 	modernc.org/sqlite v1.58.0
 )
@@ -207,7 +208,6 @@ require (
 	go.opentelemetry.io/otel/metric v1.43.0 // indirect
 	go.opentelemetry.io/otel/trace v1.43.0 // indirect
 	go.yaml.in/yaml/v2 v2.4.3 // indirect
-	golang.org/x/crypto v0.52.0 // indirect
 	golang.org/x/exp v0.0.0-20260410095643-746e56fc9e2f // indirect
 	golang.org/x/image v0.41.0 // indirect
 	golang.org/x/net v0.55.0 // indirect

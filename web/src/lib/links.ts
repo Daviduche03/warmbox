@@ -1,11 +1,7 @@
-import { getToken } from "./api";
-
-// desktopUrl is the short noVNC URL for a guest. When token auth is on we
-// append it once: the daemon sets the auth cookie and redirects to the clean
-// path, so the iframe/websocket afterwards inherit auth without the token.
+// desktopUrl is the short noVNC URL for a guest. The browser's session cookie
+// authenticates the page, the iframe and the websocket alike.
 export function desktopUrl(id: string): string {
-  const t = getToken();
-  return `/d/${id}${t ? `?token=${encodeURIComponent(t)}` : ""}`;
+  return `/d/${id}`;
 }
 
 export function publishUrl(id: string, port: number | string): string {

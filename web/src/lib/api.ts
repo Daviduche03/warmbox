@@ -1,24 +1,10 @@
 // Typed client for the warmbox daemon. Mirrors the JSON shapes in
 // internal/api/server.go, internal/catalog and internal/desktop.
 
-const TOKEN_KEY = "warmbox.token";
-
-export function getToken(): string {
-  try {
-    return localStorage.getItem(TOKEN_KEY) ?? "";
-  } catch {
-    return "";
-  }
-}
-
-export function setToken(token: string) {
-  try {
-    if (token) localStorage.setItem(TOKEN_KEY, token);
-    else localStorage.removeItem(TOKEN_KEY);
-  } catch {
-    /* ignore */
-  }
-}
+// Auth is session-cookie based (see internal/api/auth.go). The browser sends
+// the cookie automatically — credentials: "include" below — so there is no
+// token to store. CLI and scripts use per-user API tokens as Bearer credentials,
+// managed from Settings.
 
 export class ApiError extends Error {
   status: number;
@@ -34,9 +20,6 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   if (init.body && !headers.has("Content-Type")) {
     headers.set("Content-Type", "application/json");
   }
-  const token = getToken();
-  if (token) headers.set("Authorization", `Bearer ${token}`);
-
   let res: Response;
   try {
     res = await fetch(path, { ...init, headers, credentials: "include" });
@@ -108,7 +91,6 @@ export interface DaemonStatus {
   version: string;
   backend: string;
   addr: string;
-  token_required: boolean;
   up: string;
   pool: { size: number; idle: number; booting: number };
   desktops: number;
@@ -125,6 +107,53 @@ export interface ExecResult {
   stderr: string;
   duration_ms: number;
   timed_out?: boolean;
+}
+
+export interface AuthUser {
+  id: string;
+  name: string;
+  email: string;
+}
+
+export interface WorkspaceRef {
+  id: string;
+  name: string;
+}
+
+export interface Me {
+  user: AuthUser;
+  workspace: WorkspaceRef;
+  role: string;
+  workspaces: WorkspaceRef[];
+}
+
+export interface Member extends AuthUser {
+  role: string;
+}
+
+export interface ApiToken {
+  id: string;
+  name: string;
+  prefix: string;
+  created_at: string;
+  last_used_at: string | null;
+}
+
+export type Role = "viewer" | "member" | "admin" | "owner";
+
+export function roleRank(role?: string): number {
+  switch (role) {
+    case "owner":
+      return 4;
+    case "admin":
+      return 3;
+    case "member":
+      return 2;
+    case "viewer":
+      return 1;
+    default:
+      return 0;
+  }
 }
 
 // ── calls ────────────────────────────────────────────────────────────────
@@ -192,4 +221,44 @@ export const api = {
   },
 
   images: () => request<{ images: string[] | null }>("/api/images"),
+
+  auth: {
+    setupStatus: () => request<{ needs_setup: boolean }>("/api/setup/status"),
+    setup: (body: { name: string; email: string; password: string; workspace: string }) =>
+      request<Me>("/api/setup", { method: "POST", ...json(body) }),
+    login: (body: { email: string; password: string }) =>
+      request<Me>("/api/login", { method: "POST", ...json(body) }),
+    logout: () => request<{ status: string }>("/api/logout", { method: "POST" }),
+    me: () => request<Me>("/api/me"),
+    changePassword: (body: { current: string; next: string }) =>
+      request<{ status: string }>("/api/me/password", { method: "PATCH", ...json(body) }),
+  },
+
+  users: {
+    list: () => request<{ users: Member[] }>("/api/users"),
+    create: (body: { name: string; email: string; password: string; role: Role }) =>
+      request<{ user: Member }>("/api/users", { method: "POST", ...json(body) }),
+    setRole: (id: string, role: Role) =>
+      request<{ status: string; role: string }>(`/api/users/${id}`, {
+        method: "PATCH",
+        ...json({ role }),
+      }),
+    remove: (id: string) =>
+      request<{ status: string }>(`/api/users/${id}`, { method: "DELETE" }),
+  },
+
+  workspaces: {
+    list: () => request<{ workspaces: Array<WorkspaceRef & { role: string }> }>("/api/workspaces"),
+  },
+
+  tokens: {
+    list: () => request<{ tokens: ApiToken[] }>("/api/tokens"),
+    create: (name: string) =>
+      request<ApiToken & { token: string }>("/api/tokens", {
+        method: "POST",
+        ...json({ name }),
+      }),
+    revoke: (id: string) =>
+      request<{ status: string }>(`/api/tokens/${id}`, { method: "DELETE" }),
+  },
 };

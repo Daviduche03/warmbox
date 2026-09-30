@@ -3,7 +3,6 @@ package api
 import (
 	"crypto/rand"
 	"crypto/sha256"
-	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"net"
@@ -20,14 +19,11 @@ import (
 
 // Authentication model.
 //
-//   - Fresh installs have no users. Until the first account is created the
-//     daemon behaves exactly as before (shared token from cfg.Token), and the
-//     setup endpoints are public.
-//   - The first account is created through POST /api/setup with an
-//     organisation/workspace name. That user becomes owner, and from then on
-//     the shared token is ignored everywhere.
+//   - Fresh installs have no users. Until the first account is created, the
+//     only public routes are the shell, setup status, setup and login —
+//     everything else is 401.
 //   - Browsers authenticate with an opaque session cookie (the WebSocket and
-//     console routes cannot send headers, so they inherit it like before).
+//     console routes cannot send headers, so they inherit it).
 //     CLI and scripts use per-user API tokens as Bearer credentials, which
 //     also work as ?token= on console URLs.
 //
@@ -36,7 +32,6 @@ import (
 // needs owner.
 const (
 	sessionCookie   = "warmbox_session"
-	legacyCookie    = "warmbox_token"
 	sessionTTL      = 30 * 24 * time.Hour
 	minPasswordLen  = 8
 	bcryptCost      = 12
@@ -51,7 +46,7 @@ type authCtx struct {
 	name        string
 	role        string
 	workspaceID string
-	// via is "session", "token" or "legacy".
+	// via is "session" or "token".
 	via string
 }
 
@@ -76,12 +71,14 @@ func (s *Server) usersExist() bool {
 	return n > 0
 }
 
-// authenticate resolves who is calling. It returns false when nobody valid did.
+// authenticate resolves who is calling via session cookie or API token.
+// There is no fallback: without users the only public routes are setup,
+// login and the shell, and without credentials everything else is 401.
 func (s *Server) authenticate(r *http.Request) (*authCtx, bool) {
-	if s.catalog != nil && s.usersExist() {
-		return s.authenticateUsers(r)
+	if s.catalog == nil {
+		return nil, false
 	}
-	return s.authenticateLegacy(r)
+	return s.authenticateUsers(r)
 }
 
 // authenticateUsers validates session cookies and per-user API tokens.
@@ -158,27 +155,6 @@ func (s *Server) ctxForUser(r *http.Request, userID, workspaceID string) (*authC
 	}, true
 }
 
-// authenticateLegacy is the pre-setup behaviour: the shared token from query,
-// header or cookie. An empty configured token leaves the daemon open, as before.
-func (s *Server) authenticateLegacy(r *http.Request) (*authCtx, bool) {
-	if s.cfg.Token == "" {
-		return &authCtx{via: "legacy"}, true
-	}
-	token := r.URL.Query().Get("token")
-	if token == "" {
-		token = bearerToken(r)
-	}
-	if token == "" {
-		if c, err := r.Cookie(legacyCookie); err == nil {
-			token = c.Value
-		}
-	}
-	if subtle.ConstantTimeCompare([]byte(token), []byte(s.cfg.Token)) != 1 {
-		return nil, false
-	}
-	return &authCtx{via: "legacy"}, true
-}
-
 func bearerToken(r *http.Request) string {
 	if a := r.Header.Get("Authorization"); strings.HasPrefix(a, "Bearer ") {
 		return strings.TrimPrefix(a, "Bearer ")
@@ -186,19 +162,17 @@ func bearerToken(r *http.Request) string {
 	return ""
 }
 
-// hasLoginCookie reports whether the request carries any cookie that proves a
-// login (session or legacy). The console redirect uses it to decide whether
-// stripping ?token= from the URL is safe.
+// hasSessionCookie reports whether the request carries a valid login session.
+// The console redirect uses it to decide whether stripping ?token= from the
+// URL is safe.
 func (s *Server) hasLoginCookie(r *http.Request) bool {
+	if s.catalog == nil {
+		return false
+	}
 	if c, err := r.Cookie(sessionCookie); err == nil && c.Value != "" {
 		sum := sha256.Sum256([]byte(c.Value))
 		if _, err := s.catalog.GetSession(hex.EncodeToString(sum[:])); err == nil {
 			return true
-		}
-	}
-	if s.catalog == nil || !s.usersExist() {
-		if c, err := r.Cookie(legacyCookie); err == nil && c.Value != "" {
-			return subtle.ConstantTimeCompare([]byte(c.Value), []byte(s.cfg.Token)) == 1
 		}
 	}
 	return false
@@ -206,12 +180,18 @@ func (s *Server) hasLoginCookie(r *http.Request) bool {
 
 // minRoleFor returns the role rank a route needs. Console routes need member
 // because opening a guest console is full control of that desktop, not reading.
+// Workspace membership endpoints need owner: they create trust boundaries.
 func minRoleFor(method, path string) int {
 	switch {
 	case strings.HasPrefix(path, "/api/users"):
 		return catalog.RoleRank(catalog.RoleAdmin)
-	case path == "/api/workspaces" || strings.HasPrefix(path, "/api/workspaces/"):
-		return catalog.RoleRank(catalog.RoleViewer)
+	case path == "/api/workspaces" && method == http.MethodPost:
+		return catalog.RoleRank(catalog.RoleOwner)
+	case strings.HasPrefix(path, "/api/workspaces/"):
+		if method == http.MethodGet {
+			return catalog.RoleRank(catalog.RoleViewer)
+		}
+		return catalog.RoleRank(catalog.RoleOwner)
 	case strings.HasPrefix(path, "/d/") ||
 		strings.HasPrefix(path, "/websockify/") ||
 		strings.HasPrefix(path, "/vnc/") ||
@@ -820,4 +800,112 @@ func (s *Server) deleteToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "token revoked"})
+}
+
+// POST /api/workspaces — {name}. Owner only. Trust boundaries are created
+// deliberately, never as a side effect. The creator joins as owner so the
+// workspace they just made is visible to them.
+func (s *Server) createWorkspace(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Name string `json:"name"`
+	}
+	if err := decodeJSON(r, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+	if req.Name == "" {
+		req.Name = "default"
+	}
+	ws, err := s.catalog.CreateWorkspace(req.Name)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not create workspace"})
+		return
+	}
+	ac := authOf(r)
+	if ac != nil && ac.userID != "" {
+		_ = s.catalog.AddMember(ws.ID, ac.userID, catalog.RoleOwner)
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"workspace": map[string]string{"id": ws.ID, "name": ws.Name},
+	})
+}
+
+// DELETE /api/workspaces/{id}/members/{userId} — owner only. Removes one
+// membership; the account itself survives in its other workspaces. The last
+// owner of a workspace cannot be removed.
+func (s *Server) removeWorkspaceMember(w http.ResponseWriter, r *http.Request) {
+	workspaceID := r.PathValue("id")
+	targetID := r.PathValue("userId")
+	if workspaceID == "" || targetID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "workspace and user id required"})
+		return
+	}
+	role, err := s.catalog.GetMembership(workspaceID, targetID)
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "membership not found"})
+		return
+	}
+	if role == catalog.RoleOwner {
+		if n, _ := s.catalog.CountOwners(workspaceID); n <= 1 {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "the workspace needs at least one owner"})
+			return
+		}
+	}
+	if err := s.catalog.RemoveMembership(workspaceID, targetID); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not remove member"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "member removed"})
+}
+
+// POST /api/workspaces/{id}/members — {user_id|email, role}. Owner only.
+// Adds an existing user to another workspace; use POST /api/users for new
+// accounts (they join the caller's workspace).
+func (s *Server) addWorkspaceMember(w http.ResponseWriter, r *http.Request) {
+	workspaceID := r.PathValue("id")
+	if workspaceID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "workspace id required"})
+		return
+	}
+	var req struct {
+		UserID string `json:"user_id"`
+		Email  string `json:"email"`
+		Role   string `json:"role"`
+	}
+	if err := decodeJSON(r, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+	role, err := catalog.ParseRole(req.Role)
+	if err != nil {
+		role = catalog.RoleMember
+	}
+	var userID string
+	if req.UserID != "" {
+		if _, err := s.catalog.GetUserByID(req.UserID); err != nil {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "user not found"})
+			return
+		}
+		userID = req.UserID
+	} else if req.Email != "" {
+		u, _, err := s.catalog.GetUserByEmail(req.Email)
+		if err != nil {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "user not found"})
+			return
+		}
+		userID = u.ID
+	} else {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "user_id or email required"})
+		return
+	}
+	if _, err := s.catalog.GetMembership(workspaceID, userID); err == nil {
+		if err := s.catalog.SetMemberRole(workspaceID, userID, role); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not update membership"})
+			return
+		}
+	} else if err := s.catalog.AddMember(workspaceID, userID, role); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not add member"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "member added", "role": role})
 }

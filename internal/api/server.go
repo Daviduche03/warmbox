@@ -4,7 +4,6 @@ package api
 
 import (
 	"context"
-	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -20,8 +19,6 @@ import (
 	"runmesh/workspace/internal/catalog"
 	"runmesh/workspace/internal/desktop"
 	"runmesh/workspace/internal/egress"
-	"runmesh/workspace/internal/netutil"
-	"runmesh/workspace/internal/pool"
 	"runmesh/workspace/internal/vnc"
 	"runmesh/workspace/internal/volume"
 	"runmesh/workspace/web"
@@ -31,7 +28,7 @@ import (
 // http.Handler.
 type Server struct {
 	mgr     *desktop.Manager
-	pool    *pool.Pool
+	pool    *desktop.Pool
 	cfg     *desktop.Config
 	volumes *volume.Store
 	catalog *catalog.DB
@@ -45,7 +42,7 @@ type Server struct {
 }
 
 // New builds a Server. volumes and cat may be nil when those are disabled.
-func New(mgr *desktop.Manager, p *pool.Pool, cfg *desktop.Config, volumes *volume.Store, cat *catalog.DB, log io.Writer) *Server {
+func New(mgr *desktop.Manager, p *desktop.Pool, cfg *desktop.Config, volumes *volume.Store, cat *catalog.DB, log io.Writer) *Server {
 	if log == nil {
 		log = io.Discard
 	}
@@ -88,8 +85,7 @@ func (s *Server) EgressPolicyForIP(ip string) (egress.Policy, bool) {
 // setDesktopPolicy updates a desktop's egress policy after creation.
 func (s *Server) setDesktopPolicy(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	if _, ok := s.mgr.Get(id); !ok {
-		http.NotFound(w, r)
+	if _, ok := s.visibleVM(w, r, id); !ok {
 		return
 	}
 	var req struct {
@@ -150,6 +146,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PATCH /api/users/{id}", s.updateUser)
 	mux.HandleFunc("DELETE /api/users/{id}", s.deleteUser)
 	mux.HandleFunc("GET /api/workspaces", s.listWorkspaces)
+	mux.HandleFunc("POST /api/workspaces", s.createWorkspace)
+	mux.HandleFunc("POST /api/workspaces/{id}/members", s.addWorkspaceMember)
+	mux.HandleFunc("DELETE /api/workspaces/{id}/members/{userId}", s.removeWorkspaceMember)
 	mux.HandleFunc("GET /api/tokens", s.listTokens)
 	mux.HandleFunc("POST /api/tokens", s.createToken)
 	mux.HandleFunc("DELETE /api/tokens/{id}", s.deleteToken)
@@ -188,10 +187,6 @@ func (s *Server) withAuth(next http.Handler) http.Handler {
 			return
 		}
 		if isShellPath(r.URL.Path) {
-			// Pre-setup installs still bootstrap the old cookie from ?token=.
-			if !s.usersExist() {
-				s.maybeSetLegacyCookie(w, r)
-			}
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -228,25 +223,6 @@ func (s *Server) withAuth(next http.Handler) http.Handler {
 	})
 }
 
-// maybeSetLegacyCookie preserves the old ?token= bootstrap for installs that
-// have not completed setup yet. Once users exist the shared token is dead.
-func (s *Server) maybeSetLegacyCookie(w http.ResponseWriter, r *http.Request) {
-	if s.cfg.Token == "" || r.URL.Query().Get("token") == "" {
-		return
-	}
-	token := r.URL.Query().Get("token")
-	if subtle.ConstantTimeCompare([]byte(token), []byte(s.cfg.Token)) != 1 {
-		return
-	}
-	http.SetCookie(w, &http.Cookie{
-		Name:     legacyCookie,
-		Value:    token,
-		Path:     "/",
-		HttpOnly: true,
-		SameSite: http.SameSiteLaxMode,
-	})
-}
-
 // isShellPath reports whether a request is for the dashboard bundle itself —
 // index.html or a file the build dropped next to it (assets, favicon). API,
 // WebSocket and console routes are pinned explicitly so a dotted name can
@@ -268,6 +244,25 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+// callerScope returns the request workspace and whether the caller administers
+// (admin or owner — admins see every workspace).
+func (s *Server) callerScope(r *http.Request) (string, bool) {
+	ac := authOf(r)
+	if ac == nil {
+		return "", false
+	}
+	return ac.workspaceID, catalog.RoleRank(ac.role) >= catalog.RoleRank(catalog.RoleAdmin)
+}
+
+// wsVisible reports whether a tagged resource is visible to the caller.
+// Untagged rows predate scoping (or are unleased pool capacity) and stay
+// visible everywhere; tagged rows only to their workspace, or to admins.
+// Callers answer 404 for hidden rows so one workspace cannot probe another's
+// inventory.
+func wsVisible(rowWS, ws string, admin bool) bool {
+	return admin || rowWS == "" || rowWS == ws
 }
 
 func (s *Server) create(w http.ResponseWriter, r *http.Request) {
@@ -295,11 +290,13 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 		return
 	}
+	ws, _ := s.callerScope(r)
+	vm.SetWorkspace(ws)
 	s.setPolicy(vm.ID, pol)
-	s.recordDesktop(vm.ID, "", "busy", "", 0)
+	s.recordDesktop(vm.ID, "", "busy", "", 0, ws)
 	writeJSON(w, http.StatusCreated, map[string]any{
 		"id":  vm.ID,
-		"vnc": "/d/" + vm.ID + s.tokenQuery(),
+		"vnc": "/d/" + vm.ID,
 		"ws":  "/websockify/" + vm.ID,
 	})
 }
@@ -314,11 +311,13 @@ func (s *Server) createImage(w http.ResponseWriter, r *http.Request, name string
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 			return
 		}
+		ws, _ := s.callerScope(r)
+		vm.SetWorkspace(ws)
 		s.setPolicy(vm.ID, pol)
-		s.recordDesktop(vm.ID, "", "busy", "", 0)
+		s.recordDesktop(vm.ID, "", "busy", "", 0, ws)
 		writeJSON(w, http.StatusCreated, map[string]any{
 			"id":  vm.ID,
-			"vnc": "/d/" + vm.ID + s.tokenQuery(),
+			"vnc": "/d/" + vm.ID,
 			"ws":  "/websockify/" + vm.ID,
 		})
 		return
@@ -330,8 +329,10 @@ func (s *Server) createImage(w http.ResponseWriter, r *http.Request, name string
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
+	ws, _ := s.callerScope(r)
+	vm.SetWorkspace(ws)
 	s.setPolicy(id, pol)
-	s.recordDesktop(id, "", "booting", "", 0)
+	s.recordDesktop(id, "", "booting", "", 0, ws)
 	wctx, cancel := context.WithTimeout(r.Context(), 120*time.Second)
 	defer cancel()
 	if _, err := s.mgr.WaitReady(wctx, vm.ID); err != nil {
@@ -341,7 +342,7 @@ func (s *Server) createImage(w http.ResponseWriter, r *http.Request, name string
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{
 		"id":  vm.ID,
-		"vnc": "/d/" + vm.ID + s.tokenQuery(),
+		"vnc": "/d/" + vm.ID,
 		"ws":  "/websockify/" + vm.ID,
 	})
 }
@@ -353,10 +354,17 @@ func (s *Server) images(w http.ResponseWriter, r *http.Request) {
 
 // createWithVolume boots a VM whose writable layer is a persistent volume.
 // Volume-backed VMs cannot come from the warm pool (the disk must be attached
-// before boot), so they cold-boot.
+// before boot), so they cold-boot. The volume must be visible to the caller.
 func (s *Server) createWithVolume(w http.ResponseWriter, r *http.Request, name string, pol egress.Policy) {
 	if !s.volumesEnabled(w) {
 		return
+	}
+	ws, admin := s.callerScope(r)
+	if s.catalog != nil {
+		if v, err := s.catalog.GetVolume(name); err != nil || !wsVisible(v.WorkspaceID, ws, admin) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown volume"})
+			return
+		}
 	}
 	ctx := r.Context()
 	image, err := s.volumes.EnsureLocal(ctx, name)
@@ -375,8 +383,9 @@ func (s *Server) createWithVolume(w http.ResponseWriter, r *http.Request, name s
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
+	vm.SetWorkspace(ws)
 	s.setPolicy(id, pol)
-	s.recordDesktop(id, name, "booting", "", 0)
+	s.recordDesktop(id, name, "booting", "", 0, ws)
 	wctx, cancel := context.WithTimeout(ctx, 90*time.Second)
 	defer cancel()
 	if _, err := s.mgr.WaitReady(wctx, vm.ID); err != nil {
@@ -387,30 +396,13 @@ func (s *Server) createWithVolume(w http.ResponseWriter, r *http.Request, name s
 	writeJSON(w, http.StatusCreated, map[string]any{
 		"id":     vm.ID,
 		"volume": name,
-		"vnc":    "/d/" + vm.ID + s.tokenQuery(),
+		"vnc":    "/d/" + vm.ID,
 		"ws":     "/websockify/" + vm.ID,
 	})
 }
 
-// tokenSuffix returns "&token=..." when token auth is enabled so the noVNC
-// landing page can seed the auth cookie, or "" otherwise.
-func (s *Server) tokenSuffix() string {
-	if s.cfg.Token == "" {
-		return ""
-	}
-	return "&token=" + url.QueryEscape(s.cfg.Token)
-}
-
-// tokenQuery is tokenSuffix for a URL with no query yet.
-func (s *Server) tokenQuery() string {
-	if s.cfg.Token == "" {
-		return ""
-	}
-	return "?token=" + url.QueryEscape(s.cfg.Token)
-}
-
 // dashHTML is the short desktop page: noVNC fills the viewport. The iframe
-// inherits the auth cookie, so the URL carries no token after the first visit.
+// inherits the session cookie, so the URL carries no credential.
 const dashHTML = `<!doctype html>
 <html><head><meta charset="utf-8"><title>warmbox</title>
 <style>html,body{margin:0;height:100%%;background:#111}
@@ -425,8 +417,7 @@ iframe{border:0;width:100vw;height:100vh;display:block}</style></head>
 // cookies) and stripping it would lock the client out.
 func (s *Server) dash(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	if _, ok := s.mgr.Get(id); !ok {
-		http.NotFound(w, r)
+	if _, ok := s.visibleVM(w, r, id); !ok {
 		return
 	}
 	if r.URL.Query().Get("token") != "" && s.hasLoginCookie(r) {
@@ -438,19 +429,38 @@ func (s *Server) dash(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) list(w http.ResponseWriter, r *http.Request) {
-	infos := s.mgr.List()
-	for i := range infos {
-		p := s.policyFor(infos[i].ID)
-		infos[i].Allow, infos[i].Deny = p.Allow, p.Deny
+	ws, admin := s.callerScope(r)
+	var infos []desktop.Info
+	for _, info := range s.mgr.List() {
+		if !wsVisible(info.Workspace, ws, admin) {
+			continue
+		}
+		p := s.policyFor(info.ID)
+		info.Allow, info.Deny = p.Allow, p.Deny
+		infos = append(infos, info)
+	}
+	if infos == nil {
+		infos = []desktop.Info{}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"desktops": infos})
 }
 
+// visibleVM fetches a desktop the caller may see. Hidden ones 404 so one
+// workspace cannot probe another's inventory.
+func (s *Server) visibleVM(w http.ResponseWriter, r *http.Request, id string) (*desktop.VM, bool) {
+	ws, admin := s.callerScope(r)
+	vm, ok := s.mgr.Get(id)
+	if !ok || !wsVisible(vm.Info().Workspace, ws, admin) {
+		http.Error(w, "unknown desktop", http.StatusNotFound)
+		return nil, false
+	}
+	return vm, true
+}
+
 func (s *Server) get(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	vm, ok := s.mgr.Get(id)
+	vm, ok := s.visibleVM(w, r, id)
 	if !ok {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown desktop"})
 		return
 	}
 	info := vm.Info()
@@ -461,6 +471,9 @@ func (s *Server) get(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) destroy(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	if _, ok := s.visibleVM(w, r, id); !ok {
+		return
+	}
 	if err := s.mgr.Destroy(id); err != nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
 		return
@@ -506,9 +519,8 @@ func (s *Server) websockify(w http.ResponseWriter, r *http.Request) {
 // agentProxy forwards a request to warmbox-agent inside the guest, preserving
 // the method, body and query (the agent exposes /exec, /files, /file, ...).
 func (s *Server) agentProxy(w http.ResponseWriter, r *http.Request, id, agentPath string) {
-	vm, ok := s.mgr.Get(id)
+	vm, ok := s.visibleVM(w, r, id)
 	if !ok {
-		http.Error(w, "unknown desktop", http.StatusNotFound)
 		return
 	}
 	target := vm.Target(s.cfg.AgentPort)
@@ -524,7 +536,7 @@ func (s *Server) agentProxy(w http.ResponseWriter, r *http.Request, id, agentPat
 		},
 		Transport: &http.Transport{
 			DialContext: func(_ context.Context, _, addr string) (net.Conn, error) {
-				return netutil.Dial(addr)
+				return vnc.Dial(addr)
 			},
 		},
 		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, err error) {
@@ -588,7 +600,7 @@ func (s *Server) expose(w http.ResponseWriter, r *http.Request) {
 		},
 		Transport: &http.Transport{
 			DialContext: func(_ context.Context, _, addr string) (net.Conn, error) {
-				return netutil.Dial(addr)
+				return vnc.Dial(addr)
 			},
 		},
 		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, err error) {
@@ -600,8 +612,7 @@ func (s *Server) expose(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) novnc(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	if _, ok := s.mgr.Get(id); !ok {
-		http.NotFound(w, r)
+	if _, ok := s.visibleVM(w, r, id); !ok {
 		return
 	}
 	prefix := "/vnc/" + id + "/"
@@ -628,11 +639,11 @@ func (s *Server) webui(w http.ResponseWriter, r *http.Request) {
 // --- volumes ---
 
 // recordDesktop keeps the SQLite catalog in sync with the in-memory manager.
-func (s *Server) recordDesktop(id, vol, state, ip string, pid int) {
+func (s *Server) recordDesktop(id, vol, state, ip string, pid int, ws string) {
 	if s.catalog == nil || id == "" {
 		return
 	}
-	_ = s.catalog.UpsertDesktop(&catalog.Desktop{ID: id, Volume: vol, State: state, GuestIP: ip, PID: pid})
+	_ = s.catalog.UpsertDesktop(&catalog.Desktop{ID: id, Volume: vol, State: state, GuestIP: ip, PID: pid, WorkspaceID: ws})
 }
 
 // lockVolume takes the single-writer lock for a volume (a catalog lease when
@@ -697,14 +708,16 @@ func (s *Server) volumeCreate(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
+	ws, _ := s.callerScope(r)
 	if s.catalog != nil {
 		_ = s.catalog.UpsertVolume(&catalog.Volume{
-			Name:      m.Name,
-			Size:      m.Size,
-			ChunkSize: m.ChunkSize,
-			Remote:    s.cfg.VolumePrefix + "/" + m.Name,
-			From:      m.From,
-			CreatedAt: m.Created,
+			Name:        m.Name,
+			Size:        m.Size,
+			ChunkSize:   m.ChunkSize,
+			Remote:      s.cfg.VolumePrefix + "/" + m.Name,
+			From:        m.From,
+			WorkspaceID: ws,
+			CreatedAt:   m.Created,
 		})
 	}
 	writeJSON(w, http.StatusCreated, m)
@@ -715,7 +728,14 @@ func (s *Server) volumeList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s.catalog != nil {
-		vs, err := s.catalog.ListVolumes()
+		ws, admin := s.callerScope(r)
+		var vs []*catalog.Volume
+		var err error
+		if admin {
+			vs, err = s.catalog.ListVolumes()
+		} else {
+			vs, err = s.catalog.ListVolumesInWorkspace(ws)
+		}
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 			return
@@ -743,7 +763,8 @@ func (s *Server) volumeGet(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.catalog != nil {
 		m, err := s.catalog.GetVolume(r.PathValue("name"))
-		if err != nil {
+		ws, admin := s.callerScope(r)
+		if err != nil || !wsVisible(m.WorkspaceID, ws, admin) {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown volume"})
 			return
 		}
@@ -763,6 +784,13 @@ func (s *Server) volumeDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	name := r.PathValue("name")
+	if s.catalog != nil {
+		ws, admin := s.callerScope(r)
+		if v, err := s.catalog.GetVolume(name); err != nil || !wsVisible(v.WorkspaceID, ws, admin) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown volume"})
+			return
+		}
+	}
 	if owner := s.volumeOwner(name); owner != "" {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "volume is attached to " + owner})
 		return
@@ -788,6 +816,13 @@ func (s *Server) volumeClone(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
+	ws, admin := s.callerScope(r)
+	if s.catalog != nil {
+		if v, err := s.catalog.GetVolume(r.PathValue("name")); err != nil || !wsVisible(v.WorkspaceID, ws, admin) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown volume"})
+			return
+		}
+	}
 	m, err := s.volumes.Clone(r.Context(), r.PathValue("name"), req.Name)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
@@ -795,12 +830,13 @@ func (s *Server) volumeClone(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.catalog != nil {
 		_ = s.catalog.UpsertVolume(&catalog.Volume{
-			Name:      m.Name,
-			Size:      m.Size,
-			ChunkSize: m.ChunkSize,
-			Remote:    s.cfg.VolumePrefix + "/" + m.Name,
-			From:      m.From,
-			CreatedAt: m.Created,
+			Name:        m.Name,
+			Size:        m.Size,
+			ChunkSize:   m.ChunkSize,
+			Remote:      s.cfg.VolumePrefix + "/" + m.Name,
+			From:        m.From,
+			WorkspaceID: ws,
+			CreatedAt:   m.Created,
 		})
 	}
 	writeJSON(w, http.StatusCreated, m)
@@ -820,6 +856,13 @@ func (s *Server) snapshotCreate(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
+	ws, admin := s.callerScope(r)
+	if s.catalog != nil {
+		if v, err := s.catalog.GetVolume(req.Volume); err != nil || !wsVisible(v.WorkspaceID, ws, admin) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown volume"})
+			return
+		}
+	}
 	snap, err := s.volumes.Snapshot(r.Context(), req.Volume, req.Name)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
@@ -828,7 +871,7 @@ func (s *Server) snapshotCreate(w http.ResponseWriter, r *http.Request) {
 	if s.catalog != nil {
 		_ = s.catalog.UpsertSnapshot(&catalog.Snapshot{
 			ID: snap.ID, Volume: snap.Volume, Size: snap.Size,
-			ChunkSize: snap.ChunkSize, CreatedAt: snap.Created,
+			ChunkSize: snap.ChunkSize, WorkspaceID: ws, CreatedAt: snap.Created,
 		})
 	}
 	writeJSON(w, http.StatusCreated, snap)
@@ -839,7 +882,14 @@ func (s *Server) snapshotList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s.catalog != nil {
-		snaps, err := s.catalog.ListSnapshots(r.URL.Query().Get("volume"))
+		ws, admin := s.callerScope(r)
+		var snaps []*catalog.Snapshot
+		var err error
+		if admin {
+			snaps, err = s.catalog.ListSnapshots(r.URL.Query().Get("volume"))
+		} else {
+			snaps, err = s.catalog.ListSnapshotsInWorkspace(ws, r.URL.Query().Get("volume"))
+		}
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 			return

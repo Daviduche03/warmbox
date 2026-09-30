@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"net/http"
 	"time"
+
+	"runmesh/workspace/internal/catalog"
 )
 
 // StatusInfo is the daemon-level detail the API reports to the dashboard. It is
@@ -24,7 +26,6 @@ type StatusResponse struct {
 	Version       string   `json:"version"`
 	Backend       string   `json:"backend"`
 	Addr          string   `json:"addr"`
-	TokenRequired bool     `json:"token_required"`
 	Up            string   `json:"up"`
 	Pool          poolInfo `json:"pool"`
 	Desktops      int      `json:"desktops"`
@@ -43,14 +44,20 @@ type poolInfo struct {
 
 func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 	idle, pending := s.pool.Stats()
+	ws, admin := s.callerScope(r)
+	ndesktops := 0
+	for _, info := range s.mgr.List() {
+		if wsVisible(info.Workspace, ws, admin) {
+			ndesktops++
+		}
+	}
 	out := StatusResponse{
 		Version:       or(s.info.Version, "dev"),
 		Backend:       or(s.info.Backend, "vfkit"),
 		Addr:          s.cfg.APIAddr,
-		TokenRequired: s.cfg.Token != "",
 		Up:            humanDuration(time.Since(s.started)),
 		Pool:          poolInfo{Size: s.cfg.PoolSize, Idle: idle, Booting: pending},
-		Desktops:      len(s.mgr.List()),
+		Desktops:      ndesktops,
 		Images:        s.mgr.Images(),
 		VolumesBacked: or(s.info.VolumesBacked, "local storage"),
 		DefaultImage:  or(s.info.DefaultImage, s.cfg.Image),
@@ -59,10 +66,24 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 		out.Images = []string{}
 	}
 	if s.catalog != nil {
-		if vs, err := s.catalog.ListVolumes(); err == nil {
+		listVols := s.catalog.ListVolumes
+		if !admin {
+			listVols = func() ([]*catalog.Volume, error) {
+				return s.catalog.ListVolumesInWorkspace(ws)
+			}
+		}
+		if vs, err := listVols(); err == nil {
 			out.Volumes = len(vs)
 		}
-		if sn, err := s.catalog.ListSnapshots(""); err == nil {
+		listSnaps := func() ([]*catalog.Snapshot, error) {
+			return s.catalog.ListSnapshots("")
+		}
+		if !admin {
+			listSnaps = func() ([]*catalog.Snapshot, error) {
+				return s.catalog.ListSnapshotsInWorkspace(ws, "")
+			}
+		}
+		if sn, err := listSnaps(); err == nil {
 			out.Snapshots = len(sn)
 		}
 	} else if s.volumes != nil {

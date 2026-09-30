@@ -1,6 +1,6 @@
-// Package pool keeps a warm set of pre-booted microVMs so that acquiring a
+// Pool keeps a warm set of pre-booted microVMs so that acquiring a
 // desktop skips the cold-boot cost entirely.
-package pool
+package desktop
 
 import (
 	"context"
@@ -8,23 +8,21 @@ import (
 	"io"
 	"sync"
 	"time"
-
-	"runmesh/workspace/internal/desktop"
 )
 
 // Pool maintains PoolSize idle, ready VMs.
 type Pool struct {
-	mgr  *desktop.Manager
+	mgr  *Manager
 	size int
 	log  io.Writer
 
 	mu      sync.Mutex
-	idle    []*desktop.VM
+	idle    []*VM
 	pending int
 }
 
-// New creates a warm pool over the given manager.
-func New(mgr *desktop.Manager, size int, log io.Writer) *Pool {
+// NewPool creates a warm pool over the given manager.
+func NewPool(mgr *Manager, size int, log io.Writer) *Pool {
 	if log == nil {
 		log = io.Discard
 	}
@@ -73,8 +71,8 @@ func (p *Pool) replenish(ctx context.Context) {
 	}
 }
 
-func (p *Pool) bootOne(ctx context.Context) (*desktop.VM, error) {
-	id := desktop.NewID()
+func (p *Pool) bootOne(ctx context.Context) (*VM, error) {
+	id := NewID()
 	vm, err := p.mgr.Start(id)
 	if err != nil {
 		return nil, err
@@ -91,14 +89,14 @@ func (p *Pool) bootOne(ctx context.Context) (*desktop.VM, error) {
 }
 
 // Acquire returns a ready VM, booting one on demand if the pool is empty.
-func (p *Pool) Acquire(ctx context.Context) (*desktop.VM, error) {
+func (p *Pool) Acquire(ctx context.Context) (*VM, error) {
 	for {
 		p.mu.Lock()
 		if n := len(p.idle); n > 0 {
 			vm := p.idle[n-1]
 			p.idle = p.idle[:n-1]
 			p.mu.Unlock()
-			vm.SetState(desktop.StateBusy)
+			vm.SetState(StateBusy)
 			fmt.Fprintf(p.log, "pool: leased vm %s\n", vm.ID)
 			return vm, nil
 		}
@@ -112,7 +110,7 @@ func (p *Pool) Acquire(ctx context.Context) (*desktop.VM, error) {
 		}
 		vm, err := p.bootOne(ctx)
 		if err == nil {
-			vm.SetState(desktop.StateBusy)
+			vm.SetState(StateBusy)
 			return vm, nil
 		}
 		// Back off and retry unless the context is done.
@@ -125,7 +123,7 @@ func (p *Pool) Acquire(ctx context.Context) (*desktop.VM, error) {
 }
 
 // Release destroys a leased VM. The Run loop replenishes the pool.
-func (p *Pool) Release(vm *desktop.VM) error {
+func (p *Pool) Release(vm *VM) error {
 	if vm == nil {
 		return nil
 	}

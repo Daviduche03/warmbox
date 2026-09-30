@@ -4,7 +4,6 @@ import { AppShell } from "@/components/app-shell";
 import { AuthGate } from "@/components/auth-gate";
 import { Dashboard } from "@/components/dashboard";
 import { EmptyState } from "@/components/empty-state";
-import { setToken } from "@/lib/api";
 import { useRoute } from "@/lib/router";
 import { DesktopsPage } from "@/pages/Desktops";
 import { VolumesPage } from "@/pages/Volumes";
@@ -12,21 +11,8 @@ import { SnapshotsPage } from "@/pages/Snapshots";
 import { ImagesPage } from "@/pages/Images";
 import { ActivityPage } from "@/pages/Activity";
 import { SettingsPage } from "@/pages/Settings";
-
-// The daemon hands out `?token=` so noVNC iframes can authenticate; capture it
-// for API calls before the first poll and drop it from the address bar.
-(function seedTokenFromUrl() {
-	try {
-		const url = new URL(window.location.href);
-		const token = url.searchParams.get("token");
-		if (!token) return;
-		setToken(token);
-		url.searchParams.delete("token");
-		window.history.replaceState({}, "", url.toString());
-	} catch {
-		/* no URL to read */
-	}
-})();
+import { SetupPage } from "@/pages/Setup";
+import { LoginPage } from "@/pages/Login";
 
 function NotFound({ path }: { path: string }) {
 	return (
@@ -57,6 +43,10 @@ function Routes() {
 			return <ActivityPage />;
 		case "/settings":
 			return <SettingsPage />;
+		case "/setup":
+			return <SetupPage />;
+		case "/login":
+			return <LoginPage />;
 		default:
 			return <NotFound path={route.path} />;
 	}

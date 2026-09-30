@@ -25,6 +25,9 @@ type VM struct {
 	GuestIP string
 	Started time.Time
 	Volume  string
+	// Workspace tags which workspace leased this VM. Empty means unleased
+	// warm-pool capacity, visible everywhere until handed out.
+	Workspace string
 
 	forwards map[int]string
 	cmd      *exec.Cmd
@@ -57,6 +60,14 @@ func (v *VM) setState(s State) {
 // SetState updates the VM lifecycle state.
 func (v *VM) SetState(s State) { v.setState(s) }
 
+// SetWorkspace tags which workspace leased this VM. Called once on hand-out;
+// the pool boots VMs untagged.
+func (v *VM) SetWorkspace(ws string) {
+	v.mu.Lock()
+	v.Workspace = ws
+	v.mu.Unlock()
+}
+
 // IP returns the guest IP reported at readiness (empty until then).
 func (v *VM) IP() string {
 	v.mu.Lock()
@@ -86,6 +97,8 @@ type Info struct {
 	GuestIP string    `json:"guest_ip,omitempty"`
 	Started time.Time `json:"started"`
 	Volume  string    `json:"volume,omitempty"`
+	// Workspace tags the leasing workspace; empty means unleased pool capacity.
+	Workspace string `json:"workspace,omitempty"`
 	// Allow and Deny are the desktop's egress policy (set by the API).
 	Allow []string `json:"allow,omitempty"`
 	Deny  []string `json:"deny,omitempty"`
@@ -96,10 +109,11 @@ func (v *VM) Info() Info {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	return Info{
-		ID:      v.ID,
-		State:   v.State,
-		GuestIP: v.GuestIP,
-		Started: v.Started,
-		Volume:  v.Volume,
+		ID:        v.ID,
+		State:     v.State,
+		GuestIP:   v.GuestIP,
+		Started:   v.Started,
+		Volume:    v.Volume,
+		Workspace: v.Workspace,
 	}
 }

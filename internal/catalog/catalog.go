@@ -25,33 +25,41 @@ type DB struct {
 
 // Volume is the metadata for a cloud-backed volume.
 type Volume struct {
-	Name      string    `json:"name"`
-	Size      int64     `json:"size"`
-	ChunkSize int64     `json:"chunk_size"`
-	Remote    string    `json:"remote,omitempty"`
-	From      string    `json:"from,omitempty"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	Name      string `json:"name"`
+	Size      int64  `json:"size"`
+	ChunkSize int64  `json:"chunk_size"`
+	Remote    string `json:"remote,omitempty"`
+	From      string `json:"from,omitempty"`
+	// WorkspaceID scopes visibility. Empty means legacy (pre-scoping) and is
+	// visible everywhere; new writes always tag.
+	WorkspaceID string    `json:"workspace_id,omitempty"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
 }
 
 // Desktop is the metadata for a VM instance.
 type Desktop struct {
-	ID        string    `json:"id"`
-	Volume    string    `json:"volume,omitempty"`
-	State     string    `json:"state"`
-	GuestIP   string    `json:"guest_ip,omitempty"`
-	PID       int       `json:"pid,omitempty"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	ID      string `json:"id"`
+	Volume  string `json:"volume,omitempty"`
+	State   string `json:"state"`
+	GuestIP string `json:"guest_ip,omitempty"`
+	PID     int    `json:"pid,omitempty"`
+	// WorkspaceID mirrors the in-memory tag (see desktop.VM). Empty means an
+	// unleased pool VM and is visible everywhere.
+	WorkspaceID string    `json:"workspace_id,omitempty"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
 }
 
 // Snapshot is a frozen volume manifest.
 type Snapshot struct {
-	ID        string    `json:"id"`
-	Volume    string    `json:"volume"`
-	Size      int64     `json:"size"`
-	ChunkSize int64     `json:"chunk_size"`
-	CreatedAt time.Time `json:"created_at"`
+	ID        string `json:"id"`
+	Volume    string `json:"volume"`
+	Size      int64  `json:"size"`
+	ChunkSize int64  `json:"chunk_size"`
+	// WorkspaceID scopes visibility; empty means legacy, visible everywhere.
+	WorkspaceID string    `json:"workspace_id,omitempty"`
+	CreatedAt   time.Time `json:"created_at"`
 }
 
 // Open opens (or creates) the catalog at path. An empty path uses an in-memory
@@ -81,7 +89,48 @@ func Open(path string) (*DB, error) {
 		db.Close()
 		return nil, err
 	}
+	if err := migrateScoping(d); err != nil {
+		db.Close()
+		return nil, err
+	}
 	return d, nil
+}
+
+// migrateScoping tags resource tables with a workspace. Rows written before
+// scoping keep ” and stay visible everywhere; every new write tags its
+// workspace. Idempotent: existing installs gain the column on first open.
+func migrateScoping(d *DB) error {
+	for _, table := range []string{"volumes", "desktops", "snapshots"} {
+		rows, err := d.db.Query(fmt.Sprintf(`PRAGMA table_info(%s)`, table))
+		if err != nil {
+			return err
+		}
+		has := false
+		for rows.Next() {
+			var cid int
+			var name, typ string
+			var notnull, pk int
+			var dflt any
+			if err := rows.Scan(&cid, &name, &typ, &notnull, &dflt, &pk); err != nil {
+				rows.Close()
+				return err
+			}
+			if name == "workspace_id" {
+				has = true
+			}
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		if !has {
+			if _, err := d.db.Exec(fmt.Sprintf(
+				`ALTER TABLE %s ADD COLUMN workspace_id TEXT NOT NULL DEFAULT ''`, table)); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // Close releases the database.
@@ -95,6 +144,7 @@ CREATE TABLE IF NOT EXISTS volumes (
     chunk_size  INTEGER NOT NULL,
     remote      TEXT NOT NULL DEFAULT '',
     from_volume TEXT NOT NULL DEFAULT '',
+    workspace_id TEXT NOT NULL DEFAULT '',
     created_at  TEXT NOT NULL,
     updated_at  TEXT NOT NULL
 );
@@ -104,6 +154,7 @@ CREATE TABLE IF NOT EXISTS desktops (
     state      TEXT NOT NULL DEFAULT '',
     guest_ip   TEXT NOT NULL DEFAULT '',
     pid        INTEGER NOT NULL DEFAULT 0,
+    workspace_id TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -117,6 +168,7 @@ CREATE TABLE IF NOT EXISTS snapshots (
     volume     TEXT NOT NULL DEFAULT '',
     size       INTEGER NOT NULL,
     chunk_size INTEGER NOT NULL,
+    workspace_id TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_desktops_volume ON desktops(volume);
@@ -146,26 +198,48 @@ func (d *DB) UpsertVolume(v *Volume) error {
 	}
 	v.UpdatedAt = now()
 	_, err := d.db.Exec(`
-INSERT INTO volumes(name, size, chunk_size, remote, from_volume, created_at, updated_at)
-VALUES(?, ?, ?, ?, ?, ?, ?)
+INSERT INTO volumes(name, size, chunk_size, remote, from_volume, workspace_id, created_at, updated_at)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(name) DO UPDATE SET
     size=excluded.size, chunk_size=excluded.chunk_size, remote=excluded.remote,
-    from_volume=excluded.from_volume, updated_at=excluded.updated_at`,
-		v.Name, v.Size, v.ChunkSize, v.Remote, v.From, format(v.CreatedAt), format(v.UpdatedAt))
+    from_volume=excluded.from_volume, workspace_id=excluded.workspace_id,
+    updated_at=excluded.updated_at`,
+		v.Name, v.Size, v.ChunkSize, v.Remote, v.From, v.WorkspaceID, format(v.CreatedAt), format(v.UpdatedAt))
 	return err
 }
 
 // GetVolume returns a volume by name.
 func (d *DB) GetVolume(name string) (*Volume, error) {
-	row := d.db.QueryRow(`SELECT name, size, chunk_size, remote, from_volume, created_at, updated_at
+	row := d.db.QueryRow(`SELECT name, size, chunk_size, remote, from_volume, workspace_id, created_at, updated_at
 		FROM volumes WHERE name = ?`, name)
 	return scanVolume(row)
 }
 
 // ListVolumes returns every volume, ordered by name.
 func (d *DB) ListVolumes() ([]*Volume, error) {
-	rows, err := d.db.Query(`SELECT name, size, chunk_size, remote, from_volume, created_at, updated_at
+	rows, err := d.db.Query(`SELECT name, size, chunk_size, remote, from_volume, workspace_id, created_at, updated_at
 		FROM volumes ORDER BY name`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*Volume
+	for rows.Next() {
+		v, err := scanVolume(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, v)
+	}
+	return out, rows.Err()
+}
+
+// ListVolumesInWorkspace returns volumes visible to a workspace: its own plus
+// legacy untagged rows. Names stay globally unique, so this filters rather
+// than partitions.
+func (d *DB) ListVolumesInWorkspace(workspaceID string) ([]*Volume, error) {
+	rows, err := d.db.Query(`SELECT name, size, chunk_size, remote, from_volume, workspace_id, created_at, updated_at
+		FROM volumes WHERE workspace_id = '' OR workspace_id = ? ORDER BY name`, workspaceID)
 	if err != nil {
 		return nil, err
 	}
@@ -192,7 +266,7 @@ type scanner interface{ Scan(dest ...any) error }
 func scanVolume(s scanner) (*Volume, error) {
 	var v Volume
 	var created, updated string
-	if err := s.Scan(&v.Name, &v.Size, &v.ChunkSize, &v.Remote, &v.From, &created, &updated); err != nil {
+	if err := s.Scan(&v.Name, &v.Size, &v.ChunkSize, &v.Remote, &v.From, &v.WorkspaceID, &created, &updated); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
 		}
@@ -214,25 +288,25 @@ func (d *DB) UpsertDesktop(x *Desktop) error {
 	}
 	x.UpdatedAt = now()
 	_, err := d.db.Exec(`
-INSERT INTO desktops(id, volume, state, guest_ip, pid, created_at, updated_at)
-VALUES(?, ?, ?, ?, ?, ?, ?)
+INSERT INTO desktops(id, volume, state, guest_ip, pid, workspace_id, created_at, updated_at)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
     volume=excluded.volume, state=excluded.state, guest_ip=excluded.guest_ip,
-    pid=excluded.pid, updated_at=excluded.updated_at`,
-		x.ID, x.Volume, x.State, x.GuestIP, x.PID, format(x.CreatedAt), format(x.UpdatedAt))
+    pid=excluded.pid, workspace_id=excluded.workspace_id, updated_at=excluded.updated_at`,
+		x.ID, x.Volume, x.State, x.GuestIP, x.PID, x.WorkspaceID, format(x.CreatedAt), format(x.UpdatedAt))
 	return err
 }
 
 // GetDesktop returns a desktop by id.
 func (d *DB) GetDesktop(id string) (*Desktop, error) {
-	row := d.db.QueryRow(`SELECT id, volume, state, guest_ip, pid, created_at, updated_at
+	row := d.db.QueryRow(`SELECT id, volume, state, guest_ip, pid, workspace_id, created_at, updated_at
 		FROM desktops WHERE id = ?`, id)
 	return scanDesktop(row)
 }
 
 // ListDesktops returns every desktop, newest first.
 func (d *DB) ListDesktops() ([]*Desktop, error) {
-	rows, err := d.db.Query(`SELECT id, volume, state, guest_ip, pid, created_at, updated_at
+	rows, err := d.db.Query(`SELECT id, volume, state, guest_ip, pid, workspace_id, created_at, updated_at
 		FROM desktops ORDER BY created_at DESC`)
 	if err != nil {
 		return nil, err
@@ -258,7 +332,7 @@ func (d *DB) DeleteDesktop(id string) error {
 func scanDesktop(s scanner) (*Desktop, error) {
 	var x Desktop
 	var created, updated string
-	if err := s.Scan(&x.ID, &x.Volume, &x.State, &x.GuestIP, &x.PID, &created, &updated); err != nil {
+	if err := s.Scan(&x.ID, &x.Volume, &x.State, &x.GuestIP, &x.PID, &x.WorkspaceID, &created, &updated); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
 		}
@@ -279,21 +353,21 @@ func (d *DB) UpsertSnapshot(s *Snapshot) error {
 		s.CreatedAt = now()
 	}
 	_, err := d.db.Exec(`
-INSERT INTO snapshots(id, volume, size, chunk_size, created_at) VALUES(?, ?, ?, ?, ?)
+INSERT INTO snapshots(id, volume, size, chunk_size, workspace_id, created_at) VALUES(?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET volume=excluded.volume, size=excluded.size,
-    chunk_size=excluded.chunk_size`, s.ID, s.Volume, s.Size, s.ChunkSize, format(s.CreatedAt))
+    chunk_size=excluded.chunk_size, workspace_id=excluded.workspace_id`, s.ID, s.Volume, s.Size, s.ChunkSize, s.WorkspaceID, format(s.CreatedAt))
 	return err
 }
 
 // GetSnapshot returns a snapshot by id.
 func (d *DB) GetSnapshot(id string) (*Snapshot, error) {
-	row := d.db.QueryRow(`SELECT id, volume, size, chunk_size, created_at FROM snapshots WHERE id = ?`, id)
+	row := d.db.QueryRow(`SELECT id, volume, size, chunk_size, workspace_id, created_at FROM snapshots WHERE id = ?`, id)
 	return scanSnapshot(row)
 }
 
 // ListSnapshots returns snapshots, newest first; empty volume means all.
 func (d *DB) ListSnapshots(volume string) ([]*Snapshot, error) {
-	q := `SELECT id, volume, size, chunk_size, created_at FROM snapshots`
+	q := `SELECT id, volume, size, chunk_size, workspace_id, created_at FROM snapshots`
 	var args []any
 	if volume != "" {
 		q += ` WHERE volume = ?`
@@ -325,7 +399,7 @@ func (d *DB) DeleteSnapshot(id string) error {
 func scanSnapshot(s scanner) (*Snapshot, error) {
 	var x Snapshot
 	var created string
-	if err := s.Scan(&x.ID, &x.Volume, &x.Size, &x.ChunkSize, &created); err != nil {
+	if err := s.Scan(&x.ID, &x.Volume, &x.Size, &x.ChunkSize, &x.WorkspaceID, &created); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
 		}
@@ -333,6 +407,33 @@ func scanSnapshot(s scanner) (*Snapshot, error) {
 	}
 	x.CreatedAt = parse(created)
 	return &x, nil
+}
+
+// ListSnapshotsInWorkspace returns snapshots visible to a workspace — its own
+// plus legacy untagged rows — newest first; empty volume means all.
+func (d *DB) ListSnapshotsInWorkspace(workspaceID, volume string) ([]*Snapshot, error) {
+	q := `SELECT id, volume, size, chunk_size, workspace_id, created_at FROM snapshots
+		WHERE (workspace_id = '' OR workspace_id = ?)`
+	args := []any{workspaceID}
+	if volume != "" {
+		q += ` AND volume = ?`
+		args = append(args, volume)
+	}
+	q += ` ORDER BY created_at DESC`
+	rows, err := d.db.Query(q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*Snapshot
+	for rows.Next() {
+		s, err := scanSnapshot(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, s)
+	}
+	return out, rows.Err()
 }
 
 // --- leases (single writer) ---

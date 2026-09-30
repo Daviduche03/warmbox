@@ -1,10 +1,10 @@
-// Package imagepack packs and unpacks guest images as compressed tar archives
+// Pack and Pull bundle a guest image as a compressed tar archive
 // (disk.raw + efi-vars.fd + meta.json), so an image can be downloaded as a
 // single artifact and expanded into the images directory on first use.
 //
 // A raw disk image is mostly zeros and free space, so zstd takes the Omarchy
 // image from ~8.4 GiB on disk to ~3.9 GiB that travels.
-package imagepack
+package desktop
 
 import (
 	"archive/tar"
@@ -19,26 +19,26 @@ import (
 	"github.com/klauspost/compress/zstd"
 )
 
-// members are the files that make up a packed image: either an EFI disk
+// packMembers are the files that make up a packed image: either an EFI disk
 // (disk.raw [+ efi-vars.fd]) or an overlay image (vmlinux + rootfs.squashfs +
 // initramfs-overlay), plus an optional meta.json. Missing members are skipped.
-var members = []string{
+var packMembers = []string{
 	"disk.raw", "efi-vars.fd", "meta.json",
 	"vmlinux", "rootfs.squashfs", "initramfs-overlay",
 	"initramfs.zst", "initramfs-virt",
 }
 
-// isImage reports whether dir holds a bootable image.
-func isImage(dir string) bool {
-	if exists(filepath.Join(dir, "disk.raw")) {
+// isPackableImage reports whether dir holds a bootable image.
+func isPackableImage(dir string) bool {
+	if packExists(filepath.Join(dir, "disk.raw")) {
 		return true
 	}
-	return exists(filepath.Join(dir, "vmlinux")) &&
-		exists(filepath.Join(dir, "rootfs.squashfs")) &&
-		exists(filepath.Join(dir, "initramfs-overlay"))
+	return packExists(filepath.Join(dir, "vmlinux")) &&
+		packExists(filepath.Join(dir, "rootfs.squashfs")) &&
+		packExists(filepath.Join(dir, "initramfs-overlay"))
 }
 
-func exists(p string) bool {
+func packExists(p string) bool {
 	_, err := os.Stat(p)
 	return err == nil
 }
@@ -47,7 +47,7 @@ func exists(p string) bool {
 // it defaults to imageDir/<name>.tar.zst.
 func Pack(imageDir, name, out string) (string, error) {
 	dir := filepath.Join(imageDir, name)
-	if !isImage(dir) {
+	if !isPackableImage(dir) {
 		return "", fmt.Errorf("image %q has no disk.raw or squashfs set at %s", name, dir)
 	}
 	if out == "" {
@@ -66,7 +66,7 @@ func Pack(imageDir, name, out string) (string, error) {
 	}
 	tw := tar.NewWriter(zw)
 
-	for _, name := range members {
+	for _, name := range packMembers {
 		p := filepath.Join(dir, name)
 		st, err := os.Stat(p)
 		if err != nil {
@@ -143,7 +143,7 @@ func Pull(imageDir, name, src string) error {
 			return err
 		}
 		base := filepath.Base(hdr.Name)
-		if !allowed(base) {
+		if !allowedPackMember(base) {
 			continue
 		}
 		out := filepath.Join(dir, base)
@@ -196,8 +196,8 @@ func allZero(b []byte) bool {
 	return len(b) > 0 && bytes.Count(b, []byte{0}) == len(b)
 }
 
-func allowed(name string) bool {
-	for _, m := range members {
+func allowedPackMember(name string) bool {
+	for _, m := range packMembers {
 		if name == m {
 			return true
 		}

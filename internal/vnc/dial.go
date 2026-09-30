@@ -1,7 +1,6 @@
-// Package netutil provides a TCP dialer that works both for normal hosts and
-// for macOS sandboxes that can't reach vmnet guests directly (where it falls
-// back to an Apple-signed /usr/bin/nc child process).
-package netutil
+// Dial connects to a host:port, falling back to nc on macOS when the direct
+// dial is refused (unsigned processes get EHOSTUNREACH to vmnet guests).
+package vnc
 
 import (
 	"fmt"

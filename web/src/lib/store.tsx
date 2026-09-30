@@ -12,6 +12,7 @@ import {
   ApiError,
   type DaemonStatus,
   type Desktop,
+  type Me,
   type Snapshot,
   type Volume,
 } from "./api";
@@ -46,6 +47,10 @@ interface Store {
   loading: boolean;
   error?: string;
   unauthorized: boolean;
+  /** Null until logged in. Set alongside unauthorized. */
+  me: Me | null;
+  /** True when no account exists yet — the app shows setup instead of login. */
+  needsSetup: boolean;
   refresh: () => Promise<void>;
 }
 
@@ -69,6 +74,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string>();
   const [unauthorized, setUnauthorized] = useState(false);
+  const [me, setMe] = useState<Me | null>(null);
+  const [needsSetup, setNeedsSetup] = useState(false);
   const busy = useRef(false);
   const lastDesktops = useRef<Map<string, string>>(new Map());
 
@@ -76,6 +83,25 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     if (busy.current) return;
     busy.current = true;
     try {
+      // Identity first: setup status is public, everything else needs it.
+      const setup = await api.auth.setupStatus().catch(() => undefined);
+      if (setup?.needs_setup) {
+        setNeedsSetup(true);
+        setMe(null);
+        setUnauthorized(false);
+        setLoading(false);
+        return;
+      }
+      setNeedsSetup(false);
+      const identity = await api.auth.me().catch((e) => {
+        if (e instanceof ApiError && e.status === 401) throw e;
+        return undefined;
+      });
+      if (!identity) {
+        setError("connection failed");
+        return;
+      }
+      setMe(identity);
       const [st, d, v, s, im] = await Promise.all([
         api.status().catch((e) => {
           if (e instanceof ApiError && e.status === 401) throw e;
@@ -128,6 +154,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       setHistory((h) => [...h, sample].slice(-MAX_SAMPLES));
     } catch (e) {
       if (e instanceof ApiError && e.status === 401) {
+        setMe(null);
         setUnauthorized(true);
       } else {
         setError(e instanceof Error ? e.message : "connection failed");
@@ -169,6 +196,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         loading,
         error,
         unauthorized,
+        me,
+        needsSetup,
         refresh,
       }}
     >
