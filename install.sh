@@ -11,7 +11,6 @@
 #   WARMBOX_PREFIX    where to put the binary (default: /usr/local/bin when
 #                     running as root, otherwise ~/.local/bin)
 #   WARMBOX_REPO      owner/repo to install from (default Daviduche03/warmbox)
-#   GITHUB_TOKEN      only needed while the repository is private
 #
 # What this does NOT do: download the guest image. That is ~800 MB and warmbox
 # fetches it itself, verified, on the next `warmbox setup`.
@@ -48,32 +47,19 @@ if [ "$os" = darwin ] && [ "$arch" = amd64 ]; then
 	die "Intel Macs are not supported: vfkit needs Apple Silicon (guests are ARM64 only)"
 fi
 
-auth=""
-if [ -n "${GITHUB_TOKEN:-}" ]; then
-	auth="Authorization: Bearer ${GITHUB_TOKEN}"
-fi
-
 fetch() { # url dest
-	if [ -n "$auth" ]; then
-		curl -fSL --progress-bar -H "$auth" "$1" -o "$2"
-	else
-		curl -fSL --progress-bar "$1" -o "$2"
-	fi
+	curl -fSL --progress-bar "$1" -o "$2"
 }
 
 get() { # url -> stdout
-	if [ -n "$auth" ]; then
-		curl -fsSL -H "$auth" "$1"
-	else
-		curl -fsSL "$1"
-	fi
+	curl -fsSL "$1"
 }
 
 # --- which version? ---
 if [ -z "$VERSION" ]; then
 	VERSION=$(get "https://api.github.com/repos/${REPO}/releases/latest" |
 		sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
-	[ -n "$VERSION" ] || die "could not find the latest release of ${REPO} (is it private? set GITHUB_TOKEN)"
+	[ -n "$VERSION" ] || die "could not find the latest release of ${REPO}"
 fi
 
 # Release assets drop the leading v from the tag.

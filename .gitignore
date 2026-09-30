@@ -23,3 +23,5 @@ __pycache__/
 # OS
 .DS_Store
 /dist/
+/warmbox-image-*.tar.zst
+/warmbox-image-*.tar.zst.sha256

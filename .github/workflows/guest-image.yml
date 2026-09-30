@@ -63,13 +63,13 @@ jobs:
             --clobber
 
   arm64:
-    # ubuntu-24.04-arm is GitHub's free arm64 runner for *public* repositories.
-    # A private repository cannot use it, so build the arm64 image on an Apple
+    # ubuntu-24.04-arm is GitHub's free arm64 runner, available on public
+    # repositories. If it is ever unavailable, build the arm64 image on an Apple
     # Silicon Mac instead — which is where the guest image already lives:
     #
-    #   make image-pack VERSION=v0.2.0
-    #   gh release upload v0.2.0 warmbox-image-v0.2.0-arm64.tar.zst \
-    #       warmbox-image-v0.2.0-arm64.tar.zst.sha256
+    #   make image-pack VERSION=v0.2.1
+    #   gh release upload v0.2.1 warmbox-image-v0.2.1-arm64.tar.zst \
+    #       warmbox-image-v0.2.1-arm64.tar.zst.sha256
     if: ${{ inputs.arch == 'arm64' || inputs.arch == 'both' }}
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 90

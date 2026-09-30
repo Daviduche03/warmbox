@@ -144,21 +144,16 @@ missing, so a release can never fail on it.
 
 Two things worth knowing:
 
-- The workflow builds the **amd64** image on a standard runner. The **arm64**
-  build needs GitHub's free `ubuntu-24.04-arm` runner, which exists for public
-  repositories only; on a private repo build it on an Apple Silicon Mac, where
-  the image already is:
+- The workflow builds **both** architectures: amd64 on a standard runner, arm64 on
+  GitHub's free `ubuntu-24.04-arm` runner (public repositories get it at no cost).
+  If that runner is ever unavailable, build the arm64 image on an Apple Silicon
+  Mac, where the image already is:
 
   ```sh
-  make image-pack VERSION=v0.2.0
-  gh release upload v0.2.0 warmbox-image-v0.2.0-arm64.tar.zst \
-      warmbox-image-v0.2.0-arm64.tar.zst.sha256
+  make image-pack VERSION=v0.2.1
+  gh release upload v0.2.1 warmbox-image-v0.2.1-arm64.tar.zst \
+      warmbox-image-v0.2.1-arm64.tar.zst.sha256
   ```
-
-- If the repository is **private**, release assets cannot be downloaded without a
-  token, so `brew install`, `install.sh` (without `GITHUB_TOKEN`) and
-  `warmbox setup` stop working for anyone who does not have access. Handing out
-  tarballs still works for people you invite.
 
 Each desktop gets a short URL (`http://localhost:7070/d/<id>`); open it and
 noVNC fills the page. The token is dropped from the address bar after the first
