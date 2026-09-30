@@ -83,7 +83,7 @@ an archive of your own.
 One line — it verifies the release's checksum before installing anything:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Daviduche03/warmbox/v0.2.0/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/Daviduche03/warmbox/v0.2.1/install.sh | sh
 ```
 
 It installs to `/usr/local/bin` when run as root, otherwise `~/.local/bin`.
