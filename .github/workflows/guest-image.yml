@@ -54,7 +54,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create images \
+          gh release create images --latest=false \
             --title "Guest images" \
             --notes "Guest images for \`warmbox setup\`, one per host architecture. Not versioned with the CLI: they change only when the guest does." \
             2>/dev/null || true
@@ -96,7 +96,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create images \
+          gh release create images --latest=false \
             --title "Guest images" \
             --notes "Guest images for \`warmbox setup\`, one per host architecture. Not versioned with the CLI: they change only when the guest does." \
             2>/dev/null || true

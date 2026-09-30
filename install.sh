@@ -57,9 +57,12 @@ get() { # url -> stdout
 
 # --- which version? ---
 if [ -z "$VERSION" ]; then
-	VERSION=$(get "https://api.github.com/repos/${REPO}/releases/latest" |
-		sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
-	[ -n "$VERSION" ] || die "could not find the latest release of ${REPO}"
+	# Not /releases/latest: we also publish the guest images under a fixed
+	# "images" tag, and if GitHub marks that release as Latest it would resolve
+	# to a tag with no binary. Ask for the newest version tag instead.
+	VERSION=$(get "https://api.github.com/repos/${REPO}/releases?per_page=30" |
+		sed -n 's/.*"tag_name":[[:space:]]*"\(v[0-9][^"]*\)".*/\1/p' | head -1)
+	[ -n "$VERSION" ] || die "could not find a released version of ${REPO}"
 fi
 
 # Release assets drop the leading v from the tag.
