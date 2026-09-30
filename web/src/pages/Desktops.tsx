@@ -29,6 +29,7 @@ import {
 } from "@/components/ui/table";
 import { ConfirmDialog } from "@/components/confirm-dialog";
 import { RowActions } from "@/components/row-actions";
+import { Field } from "@/components/field";
 import { SectionHead } from "@/components/section-head";
 import { Spinner } from "@/components/spinner";
 import { StateBadge } from "@/components/state-badge";
@@ -284,9 +285,7 @@ export function DesktopsPage() {
 					<DialogHeader>
 						<DialogTitle>New desktop</DialogTitle>
 						<DialogDescription>
-							Boot a microVM from a guest image. Egress lists are
-							comma-separated; an empty allow list means allow-all, a non-empty
-							one means default-deny. Deny always wins.
+							Boot a microVM from a guest image.
 						</DialogDescription>
 					</DialogHeader>
 					<form
@@ -296,10 +295,7 @@ export function DesktopsPage() {
 							void create();
 						}}
 					>
-						<div className="space-y-2">
-							<label className="text-sm" htmlFor="new-desktop-image">
-								Image
-							</label>
+						<Field id="new-desktop-image" label="Image">
 							<Select disabled={busy} onValueChange={setImage} value={selected}>
 								<SelectTrigger
 									aria-label="Image for the new desktop"
@@ -318,12 +314,9 @@ export function DesktopsPage() {
 									))}
 								</SelectContent>
 							</Select>
-						</div>
-						<div className="grid grid-cols-2 gap-3">
-							<div className="space-y-2">
-								<label className="text-sm" htmlFor="new-desktop-cpus">
-									vCPUs
-								</label>
+						</Field>
+						<div className="grid gap-4 sm:grid-cols-2 sm:gap-3">
+							<Field id="new-desktop-cpus" label="vCPUs">
 								<Input
 									disabled={busy}
 									id="new-desktop-cpus"
@@ -331,18 +324,13 @@ export function DesktopsPage() {
 									min={1}
 									onChange={(e) => setCpus(e.target.value)}
 									placeholder={
-										status?.defaults?.cpus
-											? `${status.defaults.cpus} (default)`
-											: "default"
+										status?.defaults?.cpus ? `${status.defaults.cpus}` : ""
 									}
 									type="number"
 									value={cpus}
 								/>
-							</div>
-							<div className="space-y-2">
-								<label className="text-sm" htmlFor="new-desktop-mem">
-									Memory (MiB)
-								</label>
+							</Field>
+							<Field id="new-desktop-mem" label="Memory (MiB)">
 								<Input
 									disabled={busy}
 									id="new-desktop-mem"
@@ -350,24 +338,18 @@ export function DesktopsPage() {
 									min={256}
 									onChange={(e) => setMemMiB(e.target.value)}
 									placeholder={
-										status?.defaults?.mem_mib
-											? `${status.defaults.mem_mib} (default)`
-											: "default"
+										status?.defaults?.mem_mib ? `${status.defaults.mem_mib}` : ""
 									}
 									type="number"
 									value={memMiB}
 								/>
-							</div>
+							</Field>
 						</div>
-						<p className="text-muted-foreground text-xs">
-							Leave a size blank for the daemon default. A custom size or an
-							attached volume boots on demand instead of coming from the warm
-							pool.
-						</p>
-						<div className="space-y-2">
-							<label className="text-sm" htmlFor="new-desktop-volume">
-								Volume
-							</label>
+						<Field
+							hint="Keeps your files across destroys."
+							id="new-desktop-volume"
+							label="Volume"
+						>
 							<Select
 								disabled={busy}
 								onValueChange={setVolume}
@@ -382,9 +364,7 @@ export function DesktopsPage() {
 									<SelectValue />
 								</SelectTrigger>
 								<SelectContent>
-									<SelectItem value="none">
-										None — ephemeral guest disk
-									</SelectItem>
+									<SelectItem value="none">None — ephemeral</SelectItem>
 									{volumes.map((v) => (
 										<SelectItem key={v.name} value={v.name}>
 											{v.name}
@@ -392,15 +372,12 @@ export function DesktopsPage() {
 									))}
 								</SelectContent>
 							</Select>
-							<p className="text-muted-foreground text-xs">
-								A volume keeps your files across destroys; without one the guest
-								disk is thrown away.
-							</p>
-						</div>
-						<div className="space-y-2">
-							<label className="text-sm" htmlFor="new-desktop-allow">
-								Allow
-							</label>
+						</Field>
+						<Field
+							hint="Empty allows everything."
+							id="new-desktop-allow"
+							label="Allow"
+						>
 							<Input
 								disabled={busy}
 								id="new-desktop-allow"
@@ -408,15 +385,8 @@ export function DesktopsPage() {
 								placeholder="api.openai.com, pypi.org"
 								value={allow}
 							/>
-							<p className="text-muted-foreground text-xs">
-								Optional — empty allows every domain; a list means
-								default-deny.
-							</p>
-						</div>
-						<div className="space-y-2">
-							<label className="text-sm" htmlFor="new-desktop-deny">
-								Deny
-							</label>
+						</Field>
+						<Field id="new-desktop-deny" label="Deny">
 							<Input
 								disabled={busy}
 								id="new-desktop-deny"
@@ -424,7 +394,7 @@ export function DesktopsPage() {
 								placeholder="ads.example.com"
 								value={deny}
 							/>
-						</div>
+						</Field>
 						<NoticeLine
 							className="border-b-0 px-0 py-0"
 							message={createError}

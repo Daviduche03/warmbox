@@ -42,6 +42,31 @@ archives:
 checksum:
   name_template: checksums.txt
 
+# Linux packages, for servers: provisioning a VPS with a .deb/.rpm is friendlier
+# than unpacking a tarball. They deliberately do NOT fetch the guest image — that
+# is several hundred MB and belongs in `warmbox setup`, not in a package
+# post-install step.
+nfpms:
+  - id: warmbox
+    package_name: warmbox
+    vendor: warmbox
+    homepage: https://github.com/Daviduche03/warmbox
+    # nfpm wants an email; this is GitHub's no-reply form for the account.
+    maintainer: Daviduche03 <Daviduche03@users.noreply.github.com>
+    description: |-
+      Self-hosted GUI desktop microVMs (vfkit/QEMU + noVNC).
+      Boot a Linux desktop in a second, hand a browser a link, and keep the whole
+      machine - files, installed apps, settings - on a disk that lives in object
+      storage and can be cloned or restored on another host.
+    license: Apache-2.0
+    formats: [deb, rpm]
+    bindir: /usr/bin
+    section: utils
+    priority: optional
+    contents:
+      - src: ./LICENSE
+        dst: /usr/share/doc/warmbox/LICENSE
+
 changelog:
   sort: asc
   filters:

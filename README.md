@@ -68,11 +68,27 @@ picks up where it left off, and re-running it is safe. Point it somewhere else
 with `--image-url` (plus `--image-sha256` if you don't publish a `.sha256`).
 
 <details>
-<summary>Without Homebrew</summary>
+<summary>Without Homebrew (Linux servers, or by hand)</summary>
 
-Download the tarball for your platform from the
-[releases page](https://github.com/Daviduche03/warmbox/releases), unpack it, and
-run the same three commands (`./warmbox setup`, `./warmbox service install`).
+One line — it verifies the release's checksum before installing anything:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Daviduche03/warmbox/v0.2.0/install.sh | sh
+```
+
+It installs to `/usr/local/bin` when run as root, otherwise `~/.local/bin`.
+
+On Debian/Ubuntu or Fedora/RHEL the packages in the same release are tidier for a
+server (they do not fetch the guest image — that stays `warmbox setup`):
+
+```sh
+sudo apt install ./warmbox_0.2.0_linux_amd64.deb
+sudo rpm -i ./warmbox_0.2.0_linux_amd64.rpm
+```
+
+Or unpack the tarball for your platform from the
+[releases page](https://github.com/Daviduche03/warmbox/releases) and run the same
+three commands (`./warmbox setup`, `./warmbox service install`).
 
 </details>
 
@@ -116,6 +132,27 @@ Two things must exist before the first release:
 - a `HOMEBREW_TAP_GITHUB_TOKEN` secret — a PAT with write access to that repo,
   because the default `GITHUB_TOKEN` cannot push to a different repository.
 
+The release workflow warns and publishes without the cask if that secret is
+missing, so a release can never fail on it.
+
+Two things worth knowing:
+
+- The workflow builds the **amd64** image on a standard runner. The **arm64**
+  build needs GitHub's free `ubuntu-24.04-arm` runner, which exists for public
+  repositories only; on a private repo build it on an Apple Silicon Mac, where
+  the image already is:
+
+  ```sh
+  make image-pack VERSION=v0.2.0
+  gh release upload v0.2.0 warmbox-image-v0.2.0-arm64.tar.zst \
+      warmbox-image-v0.2.0-arm64.tar.zst.sha256
+  ```
+
+- If the repository is **private**, release assets cannot be downloaded without a
+  token, so `brew install`, `install.sh` (without `GITHUB_TOKEN`) and
+  `warmbox setup` stop working for anyone who does not have access. Handing out
+  tarballs still works for people you invite.
+
 Each desktop gets a short URL (`http://localhost:7070/d/<id>`); open it and
 noVNC fills the page. The token is dropped from the address bar after the first
 load. To run the daemon in the background instead of the foreground:
@@ -129,6 +166,11 @@ On Linux it installs a **systemd** unit instead: a system unit at
 `/etc/systemd/system/warmbox.service` when you run it as root, or a per-user
 unit (`~/.config/systemd/user/`, with lingering enabled so it starts at boot)
 otherwise. Logs live in the journal — `journalctl -u warmbox.service -f`.
+
+The dashboard binds `127.0.0.1` by default (`--addr`), and guests get their own
+listener on the vmnet gateway (`--guest-addr`, derived from `--host`) that serves
+nothing but the readiness callback — so the API is never reachable from the
+network, and guests can still report ready.
 
 Warm VMs hold RAM even when nobody is creating anything, so the pool drains
 itself after 15 minutes without a lease (`--pool-idle-timeout 30m`, `0` keeps it
@@ -238,6 +280,8 @@ bucket up.
 | Guest desktop (XFCE over noVNC), warm pool | ✅ works |
 | Accounts, workspaces, per-workspace scoping | ✅ works (bcrypt + session/API-token auth) |
 | Pause / resume a desktop | ✅ works (CPU only — the guest keeps its memory) |
+| vCPU/RAM + volume chosen at create | ✅ works (a custom size or a volume boots on demand) |
+| Per-workspace desktop limit | ✅ works (Settings → Storage; 429 past the cap) |
 | Warm-pool idle drain | ✅ works (`--pool-idle-timeout`, default 15m) |
 | Named images + create-time selection | ✅ works |
 | Omarchy guest (EFI disk image) | ✅ works (macOS) |

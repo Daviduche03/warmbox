@@ -1,11 +1,11 @@
 name: release
 
 # Tag-driven: push v0.2.0 and this builds the CLI for darwin/arm64 and
-# linux/{amd64,arm64}, publishes the tarballs + checksums, and updates the
-# Homebrew tap.
+# linux/{amd64,arm64}, publishes the tarballs + checksums + .deb/.rpm, and
+# updates the Homebrew cask.
 #
-# The guest image is published separately (see guest-image.yml) because it is a
-# few hundred MB and has to be built once per architecture.
+# The guest image is published separately (guest-image.yml) because it is a few
+# hundred MB and has to be built once per architecture.
 
 on:
   push:
@@ -22,17 +22,32 @@ jobs:
         with:
           # goreleaser needs the full history for the changelog.
           fetch-depth: 0
+
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
           cache: true
+
       - run: go test ./...
+
+      # install-only so the release command below can branch on the tap token.
       - uses: goreleaser/goreleaser-action@v6
         with:
           version: "~> v2"
-          args: release --clean
+          install-only: true
+
+      - name: Release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # A PAT with write access to Daviduche03/homebrew-warmbox; the default
-          # token cannot push to another repository.
           HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
+        run: |
+          # Pushing the cask needs write access to Daviduche03/homebrew-warmbox,
+          # which the default token does not have. If that secret is not
+          # configured yet, publish everything else rather than failing the
+          # whole release.
+          if [ -n "${HOMEBREW_TAP_GITHUB_TOKEN}" ]; then
+            goreleaser release --clean
+          else
+            echo "::warning::HOMEBREW_TAP_GITHUB_TOKEN is not set - publishing without the Homebrew cask"
+            goreleaser release --clean --skip=homebrew
+          fi
