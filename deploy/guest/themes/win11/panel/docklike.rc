@@ -1,0 +1,11 @@
+[user]
+showPreviews=false
+showWindowCount=false
+forceIconSize=true
+iconSize=32
+indicatorStyle=2
+inactiveIndicatorStyle=2
+indicatorOrientation=1
+indicatorColorFromTheme=true
+noWindowsListIfSingle=true
+onlyDisplayVisible=true

@@ -1,466 +1,391 @@
-# Runmesh Workspace
+# warmbox
 
-**A developer-first cloud filesystem and execution layer.**
+Self-hosted GUI desktop microVMs on Apple Silicon, with portable cloud-backed
+disks. Boot a Linux desktop in a second, hand a browser a link, and keep the
+whole machine — files, installed apps, settings — on a disk that lives in object
+storage (S3/R2) and can be cloned or restored on another host.
 
-Your workspace — your project files, your dev environment, your agents — all connected, all accessible from any device, all orchestrated from one tool.
+Two guest images ship out of the box: a tiny **Alpine + XFCE** desktop (~776 MB,
+boots in ~1s from a shared read-only rootfs) and a full **Omarchy**
+(Arch + Hyprland, ~8.4 GB) built as an EFI disk. You pick the OS at create time.
 
----
+> **Status: experimental alpha.** macOS / Apple Silicon is the primary target;
+> Linux + KVM works for the built-in image. Not hardened: plaintext HTTP with no
+> TLS, the guest's VNC server accepts anyone who can reach it, and the guest runs
+> as **root**. The API itself *is* gated by accounts and workspaces — see
+> [Limitations](#limitations) — but the transport is unencrypted, so don't expose
+> it to an untrusted network.
 
-## The Problem
+## What it does
 
-Developers work across multiple devices — laptop, desktop, phone, remote servers. There is no clean way to have your development environment feel the same everywhere. You either:
+- **Disposable computers, portable disks.** The OS is a read-only image shared by
+  every VM; the writable layer is a per-VM *volume* stored as content-addressed
+  chunks in an S3-compatible bucket (via [rclone](https://rclone.org)). Start a VM
+  on any host, attach the volume, and it is the same machine.
+- **Fast boot.** Create clones the golden image with an APFS copy-on-write copy
+  (instant, shared blocks) and boots it; a warm pool of pre-booted VMs makes a
+  desktop ready in ~1s.
+- **Choose your OS at create time.** `warmbox create --image omarchy` boots a
+  clone of the Omarchy disk; no image argument uses the built-in desktop.
+- **Browser access.** Each desktop is streamed over noVNC — no client to install.
+- **Agent API.** `exec` + file read/write/list inside any guest over HTTP, no SSH
+  keys (`docs/agent-api.md`).
+- **Snapshots & clones.** A snapshot is a frozen disk manifest, so it is O(1) and
+  shares every chunk; clone it into a fresh box.
+- **Apps.** `warmbox-app` turns a directory (e.g. an agent-built HTML dashboard)
+  into a menu app, persisted on the volume.
+- **Publish.** `GET /p/<vm>/<port>/` reverse-proxies to a port inside a guest, so
+  anything served there (a dashboard, an app) gets a shareable URL.
 
-- Manually sync files with rsync or scp
-- Commit and push to git just to move code between machines
-- Shell into a remote machine and deal with latency
-- Give up and only work on one machine
+## Requirements
 
-Existing solutions fall into two camps, neither of which solves the actual problem:
+**Host** — one of:
+- **macOS on Apple Silicon**, with `vfkit` (`brew install vfkit`); or
+- **Linux with KVM** and `qemu-system-x86_64` / `qemu-system-aarch64` — run the
+  daemon with `--backend qemu`. Verified on x86_64 KVM. Note: the Linux backend
+  cannot boot EFI disk images yet (no OVMF), so image guests are macOS-only.
 
-| Solution | Approach | Problem |
-|----------|----------|---------|
-| Git / GitHub | Version control | Designed for history and collaboration, not live workspace sync. Requires explicit commits, pushes, pulls. |
-| Dropbox / Google Drive | Generic file sync | No concept of development environments. Syncs `node_modules`, `.git`, build artifacts. No CLI, no dev-aware features. |
-| Codespaces / Gitpod | Full browser IDE | Locks you into their editor and workflow. You live inside the browser. Not composable with your existing tools. |
-| Syncthing | P2P file sync | No cloud hub, no lazy loading, no dev awareness. Great for privacy, not for the agentic era. |
+To **build from source** you also need **Docker** (for the guest image) and
+**Go 1.25+** — but an install from a release needs neither.
 
-**Nobody has built the right primitive for the agentic era.**
+## Install
 
----
+Prebuilt binaries ship with a prebuilt guest image, so there is no Docker step:
 
-## The Vision: Three Layers, Three Timescales
-
-The key insight that makes Runmesh Workspace different:
-
-**Your files, your environment, and your execution are all the same thing — at different timescales.**
-
-```
-────────────────────────────────────────────────────
-  LAYER        | WHAT                  | TIMESCALE
-────────────────────────────────────────────────────
-  Storage      | Project files in the  │ Forever
-               │ cloud, local on any   │
-               │ device                │
-               │ (rclone + R2/S3)      │
-────────────────────────────────────────────────────
-  Environment  | Persistent cloud      │ Your session
-               │ workspace tied to     │
-               │ your project —        │
-               │ containers, runtime,  │
-               │ tools, always warm    │
-               │ (devpod)              │
-────────────────────────────────────────────────────
-  Execution    | Ephemeral sandboxes   │ One task
-               │ for agents — spin up, │
-               │ read/write project    │
-               │ files, run tests, die │
-               │ (E2B / Daytona)       │
-────────────────────────────────────────────────────
-```
-
-Each layer builds on the one below it. Together they form a single concept: **your workspace, everywhere, at every timescale.**
-
----
-
-### Storage Layer (Current — Building)
-
-Your project files live in an S3-compatible bucket (Cloudflare R2) and feel local on any device.
-
-- One bucket per developer, projects as prefixes (`bucket/midday/`, `bucket/runmesh/`)
-- `.devignore` keeps build artifacts, `node_modules`, cache, and platform-specific junk out of sync
-- Auto-sync daemon watches for local changes and pushes to cloud; polls cloud and pulls down remote changes
-- Credentials stored globally (`~/.runmesh/config.json`), not per-project
-- Projects are linked to cloud prefixes (`runmesh link <prefix>`) — the bucket is a global setting
-
-### Environment Layer (Planned)
-
-A persistent cloud workspace (via devpod or similar) tied to your project. Your containers, runtime, and tools follow you between devices. Reconnect to a warm workspace from any machine — your dev server is still running, your terminal session is still there.
-
-### Execution Layer (Planned)
-
-Ephemeral sandboxes for AI agents and automated tasks. Spin up fast, read/write your actual project files from the storage layer, run tests, make changes, write output back, die. Agents get a safe, isolated place to work against your real codebase without touching your live environment.
-
----
-
-## Why Now?
-
-Every piece of this was technically possible before — but the tooling to compose them cleanly didn't exist:
-
-- **rclone** — mature Go library for cloud storage. Handles S3, R2, GCS, and 40+ providers with a unified filesystem interface.
-- **devpod** — headless dev environments that persist in the cloud.
-- **E2B / Daytona** — sandbox APIs for ephemeral code execution.
-- **Go** — single language, single binary, cross-platform, excellent for CLI tooling.
-
-The gap is the **orchestration layer**. That's what Runmesh Workspace builds.
-
-And the agentic use case — agents that need real dev environments with real project files to work in, not toy sandboxes — is brand new and completely underserved.
-
----
-
-## Architecture
-
-```
-~/.runmesh/config.json     # Global: credentials + default bucket
-  project/
-    .devignore                  # Ignore patterns (gitignore syntax)
-    .runmesh/config.json     # Project: cloud prefix mapping
+```sh
+brew install --cask Daviduche03/warmbox/warmbox   # macOS, or Linuxbrew
+warmbox setup                                     # fetch noVNC + the guest image
+warmbox service install --pool 1                  # run the daemon in the background
 ```
 
-### Config Model
+Then open <http://localhost:7070> (or `warmbox create` for a desktop and its
+URL). `warmbox setup` prints what it found and what to do next.
 
-| Config | Location | Contents |
-|--------|----------|----------|
-| Global | `~/.runmesh/config.json` | Provider, endpoint, access key, secret key, region, default bucket |
-| Project | `project/.runmesh/config.json` | Cloud prefix (e.g. `"midday"`) |
+`setup` downloads the guest image for your host architecture — the guest has to
+match the hypervisor, so there is one image per arch — verifies it against the
+published sha256, and installs it. It is resumable: an interrupted download
+picks up where it left off, and re-running it is safe. Point it somewhere else
+with `--image-url` (plus `--image-sha256` if you don't publish a `.sha256`).
 
-This split means credentials are never in your project directory. The project only stores which cloud prefix it maps to. The bucket is a global setting — all projects live under one bucket.
+<details>
+<summary>Without Homebrew (Linux servers, or by hand)</summary>
 
-### How Sync Works
+One line — it verifies the release's checksum before installing anything:
 
-**Push (local → cloud):**
-1. fsnotify watches the project directory recursively
-2. Changed files are collected and debounced (500ms window)
-3. rclone's `CopyDir` copies changed files from local to the S3 prefix
-4. `.devignore` patterns are applied as rclone filters
-
-**Pull (cloud → local):**
-1. Every 8 seconds, rclone's `CopyDir` runs in reverse (cloud → local)
-2. Only files that differ between cloud and local are transferred
-3. New directories created by the pull are automatically added to the fsnotify watcher
-
-**Why `CopyDir` instead of individual file operations?**
-- `CopyDir` checks hashes and sizes — it only transfers what's actually changed
-- It handles the full directory tree comparison efficiently
-- No need to track individual file states or manage pending queues
-- The bidirectional loop (pull triggers push triggers pull) is a no-op because identical files are skipped
-
-### Why S3-Compatible Storage?
-
-- S3 is the industry standard for object storage. Every cloud provider implements it.
-- Cloudflare R2 has zero egress fees — cost-effective for multi-device sync.
-- rclone provides a unified filesystem interface over any S3-compatible backend.
-- Object storage is ideal for the "cloud as canonical source" model — files are immutable objects with metadata, not a mountable filesystem (that's a future FUSE layer).
-
----
-
-## Current Status
-
-### ✅ Built
-
-| Feature | Status | Details |
-|---------|--------|---------|
-| `config set` | Done | Stores credentials globally in `~/.runmesh/` |
-| `link` | Done | Links a local directory to a cloud prefix |
-| `envkey` | Done | Manages the .env encryption key (`--generate`, `--show`, `--force`) |
-| `up` | Done | Full sync from local → cloud (env files encrypted) |
-| `down` | Done | Full sync from cloud → local (env files decrypted) |
-| `list` | Done | Lists all files stored in the cloud prefix |
-| `status` | Done | Shows local vs remote file diff (incl. encrypted env diff) |
-| `watch` | Done | Bidirectional auto-sync daemon (push on change, pull every 8s) |
-| `.devignore` | Done | Gitignore-syntax patterns to exclude files from sync |
-| Encrypted `.env` sync | Done | AES-256-GCM, zero-knowledge — key never leaves devices |
-| Single-bucket namespace | Done | All projects under one bucket, projects as prefixes |
-| Global credentials | Done | Credentials never stored in project directory |
-| `no_check_bucket` | Done | Skips bucket existence checks for R2 compatibility |
-| `force_path_style` | Done | Path-style URLs for S3-compatible backends |
-
-### 🚧 In Progress
-
-| Feature | Status | Details |
-|---------|--------|---------|
-| Lazy loading | Planned | Only fetch files on access (FUSE mount or on-demand download) |
-| Watch mode improvements | Planned | Handle renames properly, reduce edge-case noise |
-| Root command UX | Planned | `runmesh` without args should show meaningful state |
-
-### 📋 Planned
-
-| Feature | Layer | Details |
-|---------|-------|---------|
-| Project registry (`runmesh projects`) | Storage | List all linked projects and their sync status |
-| `runmesh clone <prefix>` | Storage | Pull an existing cloud project to a fresh local machine |
-| Sync multiple projects at once | Storage | Watch daemon that handles all linked projects |
-| Per-machine `.devignore` overrides | Storage | Ignore different things on different devices |
-| File history / versioning | Storage | Dropbox-style version history for synced files |
-| FUSE mount | Storage | Mount the cloud bucket as a local filesystem with on-demand loading |
-| Conflict resolution | Storage | Handle simultaneous edits on two devices |
-| `devpod` integration | Environment | Auto-start/attach a devpod workspace when entering a project |
-| Cloud workspace management | Environment | List, start, stop, reconnect persistent workspaces |
-| Env var sync | Environment | `~/.envrc`-style env sync across devices |
-| `E2B` / `Daytona` integration | Execution | Ephemeral sandboxes with project files mounted |
-| Agent API | Execution | `runmesh run <task>` — spin sandbox, run task, return diff |
-| Web dashboard | UX | View sync status, manage projects, trigger syncs from browser |
-| Mobile app | UX | `runmesh` on iOS/Android (at least file access) |
-| Team sharing | Storage | Share prefixes with other developers |
-
----
-
-## Installation
-
-```bash
-# Install via Go
-go install github.com/Daviduche03/Runmesh/runmesh-main/workspace/cmd/runmesh@latest
-
-# Or build from source
-git clone https://github.com/Daviduche03/Runmesh
-cd Runmesh/runmesh-main/workspace
-go install ./cmd/runmesh/
+```sh
+curl -fsSL https://raw.githubusercontent.com/Daviduche03/warmbox/v0.2.0/install.sh | sh
 ```
 
-Requires Go 1.25+.
+It installs to `/usr/local/bin` when run as root, otherwise `~/.local/bin`.
 
----
+On Debian/Ubuntu or Fedora/RHEL the packages in the same release are tidier for a
+server (they do not fetch the guest image — that stays `warmbox setup`):
 
-## Usage
-
-### 1. Configure credentials (once)
-
-```bash
-runmesh config set \
-  --bucket matriq \
-  --endpoint https://<account_id>.r2.cloudflarestorage.com \
-  --access-key <your_access_key> \
-  --secret-key <your_secret_key>
+```sh
+sudo apt install ./warmbox_0.2.0_linux_amd64.deb
+sudo rpm -i ./warmbox_0.2.0_linux_amd64.rpm
 ```
 
-Credentials are stored in `~/.runmesh/config.json` with `0600` permissions. The bucket is global — all projects live under this bucket as prefixes.
+Or unpack the tarball for your platform from the
+[releases page](https://github.com/Daviduche03/warmbox/releases) and run the same
+three commands (`./warmbox setup`, `./warmbox service install`).
 
-Supported providers: `Cloudflare` (R2), `AWS` (S3), `Minio`, `Wasabi`, and any S3-compatible storage.
+</details>
 
-### 2. Link a project
+## Quickstart (from source)
 
-```bash
-cd ~/code/my-project
-runmesh link my-project
+```sh
+# 1. Build the built-in guest image (kernel + rootfs + a 2 GiB base disk).
+#    First run is slow (Docker + squashfs); artifacts land in ~/.warmbox.
+./deploy/guest/build.sh
+
+# 2. Build the CLI and fetch noVNC.
+go build -o warmbox ./cmd/warmbox
+./warmbox setup --no-image      # the image is already built above
+
+# 3. Run the daemon (warm pool + REST API + noVNC bridge).
+./warmbox daemon
+
+# 4. Provision a desktop; prints a URL to open in your browser.
+./warmbox create
 ```
 
-This creates `.runmesh/config.json` and a default `.devignore`. Your local directory is now mapped to `bucket/my-project/` in the cloud.
+Maintainers publish an image with `warmbox image pack --builtin -o <file>`,
+which also writes the `.sha256` that `setup` verifies.
 
-### 3. Sync
+### Releasing
 
-```bash
-# One-time syncs
-runmesh up       # Push local changes to cloud
-runmesh down     # Pull cloud changes to local
+Push a tag (`git tag v0.2.0 && git push origin v0.2.0`). The release workflow
+builds the binaries for darwin/arm64 and linux/{amd64,arm64}, publishes them with
+`checksums.txt`, and updates the Homebrew cask.
 
-# Auto-sync daemon (bidirectional)
-runmesh watch    # Push on change, pull every 8s
+The guest image is published separately by the **guest image** workflow, which is
+manual on purpose — it takes ~15 minutes per architecture and a failure there
+should not block a binary release. Run it with the tag as input and it attaches
+`warmbox-image-<tag>-<arch>.tar.zst` plus its `.sha256` to that release. Those
+names are exactly what `warmbox setup` looks for, so the tag and the asset must
+agree.
+
+Two things must exist before the first release:
+
+- a `homebrew-warmbox` tap repository, and
+- a `HOMEBREW_TAP_GITHUB_TOKEN` secret — a PAT with write access to that repo,
+  because the default `GITHUB_TOKEN` cannot push to a different repository.
+
+The release workflow warns and publishes without the cask if that secret is
+missing, so a release can never fail on it.
+
+Two things worth knowing:
+
+- The workflow builds the **amd64** image on a standard runner. The **arm64**
+  build needs GitHub's free `ubuntu-24.04-arm` runner, which exists for public
+  repositories only; on a private repo build it on an Apple Silicon Mac, where
+  the image already is:
+
+  ```sh
+  make image-pack VERSION=v0.2.0
+  gh release upload v0.2.0 warmbox-image-v0.2.0-arm64.tar.zst \
+      warmbox-image-v0.2.0-arm64.tar.zst.sha256
+  ```
+
+- If the repository is **private**, release assets cannot be downloaded without a
+  token, so `brew install`, `install.sh` (without `GITHUB_TOKEN`) and
+  `warmbox setup` stop working for anyone who does not have access. Handing out
+  tarballs still works for people you invite.
+
+Each desktop gets a short URL (`http://localhost:7070/d/<id>`); open it and
+noVNC fills the page. The token is dropped from the address bar after the first
+load. To run the daemon in the background instead of the foreground:
+
+```sh
+./warmbox service install --pool 1   # launchd on macOS, systemd on Linux
+./warmbox service status             # start | stop | restart | status
 ```
 
-### 4. Inspect
+On Linux it installs a **systemd** unit instead: a system unit at
+`/etc/systemd/system/warmbox.service` when you run it as root, or a per-user
+unit (`~/.config/systemd/user/`, with lingering enabled so it starts at boot)
+otherwise. Logs live in the journal — `journalctl -u warmbox.service -f`.
 
-```bash
-runmesh list     # List files in cloud
-runmesh status   # Show local vs remote diff
+The dashboard binds `127.0.0.1` by default (`--addr`), and guests get their own
+listener on the vmnet gateway (`--guest-addr`, derived from `--host`) that serves
+nothing but the readiness callback — so the API is never reachable from the
+network, and guests can still report ready.
+
+Warm VMs hold RAM even when nobody is creating anything, so the pool drains
+itself after 15 minutes without a lease (`--pool-idle-timeout 30m`, `0` keeps it
+warm forever); the next create pays a cold boot instead. Desktops can also be
+frozen from the dashboard's row menu: **Pause** stops the guest's CPUs and keeps
+its memory, **Resume** picks the session back up, and **Destroy** is what hands
+the RAM back. Pause works on both backends (vfkit's REST API, QEMU's monitor).
+
+On **Linux**, add `--backend qemu` to the daemon (KVM + `qemu-system-*`).
+`warmbox service install` passes that flag for you and manages the daemon as a
+systemd unit, so the same command works on both hosts. QEMU's user-mode
+networking isn't reachable host→guest, so the backend forwards a host port to
+each guest's VNC; everything else is identical. Build the guest image for the
+host arch with `PLATFORM=linux/amd64 ./deploy/guest/build.sh`.
+
+## Images
+
+A named image is a directory under `$WARMBOX_HOME/images/<name>/` holding
+`disk.raw` (a bootable disk), an optional `efi-vars.fd` seed, and an optional
+`meta.json` (`{"gpu","mem_mib","cpus","input"}`). The daemon discovers them at
+startup and you choose one per desktop:
+
+```sh
+./warmbox images                     # list what the daemon can boot
+./warmbox create --image omarchy     # a full Omarchy (Hyprland) desktop
+./warmbox create --image default     # the built-in desktop (aliases: xfce, alpine)
+./warmbox create                     # whatever --image the daemon was started with
 ```
 
----
+| image | base | size on disk | boot |
+|---|---|---|---|
+| `default` | Alpine + XFCE | ~776 MB (compressed squashfs base) | ~1s, shared rootfs |
+| `lxqt` | Alpine + LXQt | ~800 MB (compressed squashfs base) | ~7s cold |
+| `omarchy` | Arch + Hyprland/Quickshell | 24 GB sparse, ~8.4 GB real | ~13s cold, instant if pooled |
 
-## Encrypted `.env` sync
+The built-in and `lxqt` images are *overlay* images (a shared read-only squashfs
+plus a writable upper); `omarchy` is an *EFI disk*. Both kinds are named images
+and are selected the same way. Build a variant with:
 
-`.env` files sync too — but **never as plaintext**. They are encrypted on your
-device before upload and only decrypted after download. The bucket only ever
-holds ciphertext; the key never leaves your devices (zero-knowledge).
-
-```bash
-# One time, on your primary device — generates and saves a key to
-# ~/.runmesh/config.json (mode 0600)
-runmesh envkey --generate
-
-# Copy the key to another device
-runmesh envkey --show          # prints the hex key
-# …on the other device:
-runmesh config set --env-key <hex>
+```sh
+DESKTOP=lxqt THEME=ambiance VARIANT=lxqt ./deploy/guest/build.sh   # -> images/lxqt
 ```
 
-How it works:
+Images travel as a single compressed artifact:
 
-- `.env`, `.env.local`, `.env.production`, etc. are **always excluded** from the
-  normal (plaintext) sync — hard-coded, regardless of your `.devignore`.
-- On `up`/`watch` they are encrypted with **AES-256-GCM** and uploaded as
-  `.env.enc` siblings. On `down`/`watch` they are decrypted back with `0600`
-  permissions.
-- An HMAC change-tag in each blob lets devices skip unchanged files without
-  decrypting — and without exposing a plaintext hash to anyone but key holders.
-- `.env.example` / `.env.sample` stay plaintext (they are meant to be shared).
-- Wrong or missing key? Sync continues for everything else and prints a
-  warning — plaintext is never written or uploaded as a fallback.
-- `RUNMESH_ENV_KEY=<hex>` overrides the configured key (useful for CI/agents).
-- Rotating the key (`envkey --generate --force`) makes old cloud blobs
-  undecryptable; re-push from a device that has the plaintext.
-
----
-
-## `.devignore`
-
-A `.devignore` file in your project root tells Runmesh Workspace which files and directories to exclude from sync. It uses standard gitignore syntax.
-
-Default `.devignore`:
-
-```
-.git/
-node_modules/
-build/
-dist/
-target/
-.cache/
-__pycache__/
-*.pyc
-.next/
-.venv/
-.env
-vendor/
-.idea/
-*.swp
-*.swo
-.DS_Store
-Thumbs.db
+```sh
+./warmbox image pack omarchy                 # -> ~/.warmbox/images/omarchy.tar.zst (~3.9 GB)
+./warmbox image pull omarchy <file-or-url>   # expand into ~/.warmbox/images/omarchy
+./warmbox image list                         # local images (offline)
 ```
 
----
+See [`deploy/omarchy/README.md`](deploy/omarchy/README.md) for how the Omarchy
+image is built and provisioned (it stands on the community aarch64 port).
 
-## How It's Different
+## Agent API
 
-### Vs. Git
+Run commands and move files inside any guest over HTTP — the daemon proxies to
+`warmbox-agent` in the VM, reachable on the same dial path as VNC:
 
-Git is a version control system. It solves **time** — history, branches, collaboration. Moving files between machines is a side effect, not the purpose.
-
-Runmesh Workspace solves **space** — your workspace, live, on every device, right now. No commits, no push/pull dance, no stale copies. The cloud *is* your working directory.
-
-They're complementary. You still use Git inside a Runmesh Workspace-synced project for history and collaboration. Runmesh Workspace just makes sure `git status` sees the same files on every machine.
-
-### Vs. Dropbox
-
-Dropbox is a general-purpose file sync tool. It has no concept of:
-- What a development environment is
-- Which files are build artifacts that shouldn't be synced
-- How to handle `node_modules`, `.git`, or compiled binaries
-- How to interact with agents or automated tooling
-- What lazy loading means for a monorepo
-
-Runmesh Workspace is purpose-built for developers. It understands `.devignore`, it integrates with your CLI, and it's designed for the agentic era.
-
-### Vs. Codespaces / Gitpod
-
-Full browser IDEs lock you into their editor, their terminal, their workflow. You `ssh` into a remote machine or you live inside a web app. They solve "remote development" by replacing your local setup.
-
-Runmesh Workspace takes the opposite approach: your local tools stay your local tools. The cloud is just storage and compute that feels local. You use your own editor, your own terminal, your own workflow — on any device.
-
----
-
-## Design Decisions
-
-### Why Go?
-
-- Single binary, no runtime dependencies
-- Cross-platform (macOS, Linux, Windows)
-- Excellent CLI tooling (cobra/pflag)
-- rclone is written in Go — direct library integration, no subprocess calls
-- Strong standard library for filesystem, networking, and concurrency
-
-### Why rclone as a library, not a CLI subprocess?
-
-- Direct access to rclone's filesystem, filter, and sync packages
-- No parsing CLI output or managing subprocess lifecycle
-- Type-safe config via `configmap.Simple` instead of connection strings
-- Provider quirks (like R2's force_path_style) applied automatically via `fs.ConfigMap`
-
-### Why programmatic config instead of connection strings?
-
-Rclone connection strings use `:` as a separator (`:backend,key=val:/path`). Endpoint URLs contain `://` (e.g., `https://account.r2.cloudflarestorage.com`), which breaks the parser.
-
-Using `fs.ConfigMap` with `configmap.Simple` avoids this entirely — values are passed as typed config, not serialized into a string.
-
-### Why Cloudflare R2?
-
-- S3-compatible API
-- Zero egress fees — cost-effective for multi-device sync
-- Global edge network for low-latency access from anywhere
-- Generous free tier
-
-But any S3-compatible backend works. Swap `--provider AWS` and point to any S3 endpoint.
-
-### Why "cloud is canonical"?
-
-In the current implementation, local is the primary source and cloud is a mirror. This is pragmatic for v0 — developers edit files locally, and changes flow to the cloud.
-
-The long-term model is the reverse: the cloud bucket is the source of truth, and local machines maintain a synced cache. This enables:
-- Lazy loading (only pull files you access)
-- Trivial onboarding (`runmesh clone` on a new machine)
-- Agent execution (sandboxes read/write the canonical copy)
-
-### Why `CopyDir` for watch instead of per-file operations?
-
-Individual file operations (`Put` / `Remove` per path) require tracking file state, handling renames, managing a pending queue, and recovering from partial failures. `CopyDir` handles all of this internally — it compares directory trees, transfers only what changed, and handles edge cases (deletions, renames, new files) correctly.
-
-The tradeoff: `CopyDir` does a full directory listing on each call. For the push direction (debounced to 500ms), this is negligible. For the pull direction (every 8 seconds), it's a small overhead that ensures correctness.
-
----
-
-## Project Structure
-
-```
-cmd/runmesh/main.go       # CLI entry point — commands, flags, usage
-internal/
-  config/config.go            # Global + project config management, S3 filesystem construction
-  ignore/ignore.go            # .devignore parser, gitignore matcher, rclone filter builder
-  ignore/ignore_test.go       # Tests for ignore parsing
-  sync/sync.go                # Sync engine — up, down, list, status, watch
-go.mod                        # Go module definition (rclone, fsnotify, go-gitignore)
-go.sum                        # Dependency checksums
+```sh
+curl -X POST localhost:7070/api/desktops/$ID/exec -d '{"cmd":"uname -a"}'
+curl "localhost:7070/api/desktops/$ID/files?path=/home"
+curl "localhost:7070/api/desktops/$ID/file?path=/etc/hostname"
 ```
 
----
+Phase 1 is `exec` + files; streaming/background exec, `tty`, and
+screenshot/input are next. Design: [`docs/agent-api.md`](docs/agent-api.md).
 
-## Development
+## Persistent volumes
 
-```bash
-# Build
-go build ./cmd/runmesh/
-
-# Install to GOPATH/bin
-go install ./cmd/runmesh/
-
-# Test
-go test ./...
-
-# Vet
-go vet ./...
+```sh
+./warmbox volume create dev --size 8G     # grow-only; floor is VOLUME_BASE_SIZE
+./warmbox create --volume dev             # boot a VM on that disk
+./warmbox snapshot create dev             # freeze it
+./warmbox volume clone dev dev-clean      # template a fresh box
 ```
 
----
+Volumes attach to image guests too. On the built-in image the volume *is* the
+writable overlay (the whole machine persists); on an image guest like Omarchy it
+is a data disk mounted at `/volume`, flushed every couple of seconds.
 
-## Roadmap
+Inside the guest:
 
-### Phase 1: Storage Layer (Current)
-- [x] Global credential management
-- [x] Project linking with `.devignore`
-- [x] One-directional sync (up / down)
-- [x] File listing and status inspection
-- [x] Bidirectional auto-sync daemon
-- [ ] Lazy loading / on-demand fetch
-- [ ] FUSE mount for local filesystem feel
-- [ ] Per-machine `.devignore` overrides
-- [ ] File conflict resolution
-- [ ] `runmesh clone` for new devices
-- [ ] Encrypted secrets sync
+```sh
+warmbox-app new mydash          # scaffold a web app
+warmbox-app install mydash      # appears in the XFCE menu (opens as an app window)
+warmbox-app serve mydash 8080   # prints a /p/<vm>/8080/ link you can open
+```
 
-### Phase 2: Environment Layer
-- [ ] devpod integration — auto-create workspace per project
-- [ ] Persistent cloud workspace management
-- [ ] Warm reconnect — reattach to running workspace from any device
-- [ ] Env var and tooling sync across devices
-- [ ] Multiple workspace templates per project
+Storage is local by default (a directory under the workdir). To keep volumes in
+a bucket so the same disk can attach on another machine, point warmbox at it
+(also available in the dashboard under Settings):
 
-### Phase 3: Execution Layer
-- [ ] E2B / Daytona sandbox integration
-- [ ] `runmesh run <task>` — ephemeral agent execution
-- [ ] Sandbox has read/write access to project files from storage layer
-- [ ] Diff review — what did the agent change?
-- [ ] Parallel sandbox execution for CI-like workflows
+```sh
+warmbox cloud set --endpoint https://<acct>.r2.cloudflarestorage.com \
+  --access-key <KEY> --secret-key <SECRET> --bucket <BUCKET>
+warmbox cloud show          # where volume bytes live
+```
 
-### Phase 4: Ecosystem
-- [ ] Web dashboard
-- [ ] Mobile app (file access, sync status, trigger syncs)
-- [ ] Team sharing and permissions
-- [ ] Plugin API for custom sync filters and hooks
-- [ ] VSCode extension (sync status in editor)
+Restart the daemon afterwards (`warmbox service restart`) and it picks the
+bucket up.
+
+## Status
+
+| Area | State |
+|---|---|
+| Guest desktop (XFCE over noVNC), warm pool | ✅ works |
+| Accounts, workspaces, per-workspace scoping | ✅ works (bcrypt + session/API-token auth) |
+| Pause / resume a desktop | ✅ works (CPU only — the guest keeps its memory) |
+| vCPU/RAM + volume chosen at create | ✅ works (a custom size or a volume boots on demand) |
+| Per-workspace desktop limit | ✅ works (Settings → Storage; 429 past the cap) |
+| Warm-pool idle drain | ✅ works (`--pool-idle-timeout`, default 15m) |
+| Named images + create-time selection | ✅ works |
+| Omarchy guest (EFI disk image) | ✅ works (macOS) |
+| Persistent, cloud-backed volumes (chunked) | ✅ works |
+| Volumes on image guests (`/volume`) | ✅ works |
+| Grow a volume (`--size`) | ✅ works (grow-only) |
+| Disk snapshots + clone | ✅ works |
+| Image pack / pull (compressed artifacts) | ✅ works |
+| Install without Docker (`warmbox setup` fetches the image) | ✅ works (no release published yet) |
+| Agent API: exec + files | ✅ works |
+| Agent API: background/streaming runs + sessions | ✅ works |
+| Linux host (QEMU/KVM) | ✅ works (x86_64 verified; no EFI images) |
+| `warmbox-app` (menu apps) | 🟡 experimental |
+| Publish a guest port at a URL (`/p/<vm>/<port>/`) | 🟡 experimental |
+| Agent API: tty, screenshot/input (computer-use) | ❌ not yet |
+| Linux host (Cloud Hypervisor / Firecracker) | ❌ not yet |
+| Windows host (WSL2 / native WHPX) | ❌ not yet |
+| Memory snapshot / ~100 ms restore | ❌ blocked on macOS |
+| TLS / per-guest VNC auth | ❌ not yet |
+| GPU / audio | ❌ not supported |
+
+## Limitations
+
+- **EFI disk images are macOS-only.** Omarchy is an EFI disk, and the QEMU
+  backend ships no OVMF firmware, so it cannot boot it. (vfkit wraps Apple's
+  Virtualization.framework, which is ARM64-only and handles the firmware itself.)
+  Overlay images — the built-in one and `lxqt` — need no firmware and take the
+  same path on both backends: the built-in image is verified on Linux/QEMU, a
+  *named* overlay image there is not.
+- **Authorised, but not encrypted.** The API is not open: accounts and workspaces
+  gate every stateful route, and everything that reaches a desktop — console
+  streams (`/d/`, `/websockify/`, `/vnc/`), the agent API, published guest ports
+  (`/p/`) — is scoped to the caller's workspace; warm-pool VMs are daemon
+  capacity and are never listed or controllable as desktops. What is missing is
+  confidentiality and guest hardening: there is still no TLS, the guest's VNC
+  server runs with `-SecurityTypes None`, and the guest is **root**. The guest
+  only sits behind the hypervisor's NAT, so its VNC port is reachable from the
+  host — and therefore through the authenticated daemon — rather than from the
+  LAN. All of it assumes a machine you trust; don't expose it to an untrusted
+  network.
+- **No memory snapshots.** Apple's framework exposes no VM state save/restore, so
+  fast "restore anywhere" needs a Linux backend (see `docs/snapshots.md`). Pause
+  is not a substitute: it freezes the guest's CPUs in place but its memory stays
+  allocated. To actually reclaim RAM, destroy the desktop (its volume keeps your
+  files) or let the warm pool drain.
+- **Guests have no GPU.** The hypervisor exposes virtio-gpu without 3D (AVF on
+  macOS, virtio on QEMU), so a Wayland desktop composites through Mesa
+  `llvmpipe`; the Omarchy image is tuned for it (small output, effects off). X11
+  is far lighter for remote display.
+- **Images are big.** The built-in image is ~800 MB compressed and `warmbox
+  setup` downloads it in one piece. Omarchy is the heavy one: ~8.4 GB on disk,
+  ~3.9 GB packed, and because btrfs fragments its free space and APFS only
+  preserves large holes, an expanded copy may not be as sparse as you'd like.
+- **Single writer.** A volume attaches to one VM at a time; the lock is
+  in-process (fine for one host, not a fleet).
+- **Commit cost.** Committing hashes the changed extents; a commit is fast for
+  sparse disks but is still O(used) today.
+
+## Repository layout
+
+```
+cmd/warmbox         the CLI (daemon, create, image, volume, snapshot, cloud)
+internal/desktop    boot/attach microVMs (vfkit, qemu); images, boot modes, pack
+internal/volume     persistent volumes (chunked, content-addressed)
+internal/cloudstore shared chunk+manifest engine
+internal/catalog    SQLite metadata (volumes, desktops, snapshots, leases)
+internal/egress     default-deny egress policy + forward proxy
+internal/api        REST API, noVNC bridge, guest port proxy, agent proxy
+internal/vnc        WebSocket→TCP VNC bridge
+deploy/guest        built-in image (Dockerfile, init, overlay-init, apps, agent)
+deploy/omarchy      Omarchy image build + guest provisioning
+docs/               architecture, volumes, snapshots, agent-api, egress, oss-positioning
+```
+
+## Docs
+
+- [`docs/architecture.md`](docs/architecture.md) — the cloud-native design.
+- [`docs/volumes.md`](docs/volumes.md) — volumes, sizing, API.
+- [`docs/snapshots.md`](docs/snapshots.md) — snapshots & fast-resume plan.
+- [`docs/agent-api.md`](docs/agent-api.md) — the guest agent API and roadmap.
+- [`docs/egress.md`](docs/egress.md) — the egress policy and what it does not do yet.
+- [`deploy/omarchy/README.md`](deploy/omarchy/README.md) — the Omarchy image.
+- [`docs/oss-positioning.md`](docs/oss-positioning.md) — what could be a shared primitive.
+
+## Help wanted
+
+- **Named-image distribution** — the built-in image is a release artifact now
+  (`warmbox setup` downloads and verifies it), but *named* images are not:
+  `warmbox image pull` still wants a file or a URL, so Omarchy has to be built
+  locally. Publishing them, and letting `pull omarchy` resolve a bare name, is
+  the remaining half.
+- **EFI on Linux** — OVMF support in the QEMU backend so image guests run there too.
+- **Cloud Hypervisor / Firecracker backend** — leaner boot and real memory
+  snapshot/restore (the "~100 ms restore anywhere" story).
+- **Windows** — a **WSL2 setup guide** (WSL2 is Linux + KVM) or a native **WHPX**
+  QEMU backend. Unverified; the seam is `internal/desktop/backend.go`.
+- **Agent API** — streaming/background exec, `tty`, and computer-use
+  (`docs/agent-api.md`).
+- **WebRTC streaming** — replace noVNC/RFB for latency and bandwidth.
+- **macOS VNC bridge** — replace the `/usr/bin/nc` fallback with a signed helper.
+- **Tests** — API and VM lifecycle integration tests.
+
+See [`CONTRIBUTING.md`](CONTRIBUTING.md).
+
+## License
+
+[Apache-2.0](LICENSE).

@@ -1,0 +1,252 @@
+#!/bin/sh
+# warmbox guest init — PID 1 inside the microVM.
+#
+# Boots: virtio NIC + DHCP -> TigerVNC Xvnc -> a proper XFCE4 session
+# (via dbus-run-session + startxfce4), then reports readiness + its IP back
+# to the orchestrator so it can be leased.
+#
+# Kernel cmdline is expected to carry:
+#   warmbox.id=<id> warmbox.host=<host ip> warmbox.port=<api port>
+
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export DISPLAY=:0
+export XDG_RUNTIME_DIR=/run/user/0
+export LANG=C.UTF-8
+# WebKitGTK sandboxes web processes via bubblewrap + user namespaces, which
+# the microVM kernel does not permit (bwrap: Creating new namespace failed).
+# Disable the sandbox so Epiphany and other WebKit apps can actually start.
+export WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1
+
+log() { echo "[warmbox] $*" > /dev/hvc0; }
+
+# --- mounts (must come before /proc/cmdline is read) ---
+mkdir -p /proc /sys /dev /tmp /run /var/log /root
+mount -t proc proc /proc 2>/dev/null
+mount -t sysfs sys /sys 2>/dev/null
+mount -t devtmpfs dev /dev 2>/dev/null
+mkdir -p /dev/pts /dev/shm
+mount -t devpts devpts /dev/pts 2>/dev/null
+mount -t tmpfs tmpfs /dev/shm 2>/dev/null
+mount -t tmpfs tmpfs /tmp 2>/dev/null
+mount -t tmpfs tmpfs /run 2>/dev/null
+ln -sf /run /var/run 2>/dev/null
+# XDG_RUNTIME_DIR lives under the freshly mounted tmpfs.
+mkdir -p /run/user/0
+chmod 700 /run/user/0
+hostname warmbox
+
+# When booting from a virtio-blk root (rather than the all-RAM initramfs), the
+# boot initramfs mounts the root read-only and expects a service manager to
+# remount it. We are the service manager, so do it here. No-op on tmpfs root.
+mount -o remount,rw / 2>/dev/null || true
+
+# --- kernel cmdline ---
+VM_ID=""
+HOST_ADDR=""
+API_PORT="7070"
+SHARE_TAG=""
+HAVE_VOLUME=""
+PROXY=""
+for kv in $(cat /proc/cmdline); do
+    case "$kv" in
+        warmbox.id=*)     VM_ID="${kv#warmbox.id=}" ;;
+        warmbox.host=*)   HOST_ADDR="${kv#warmbox.host=}" ;;
+        warmbox.port=*)   API_PORT="${kv#warmbox.port=}" ;;
+        warmbox.share=*)  SHARE_TAG="${kv#warmbox.share=}" ;;
+        warmbox.volume=*) HAVE_VOLUME=1 ;;
+        warmbox.proxy=*)  PROXY="${kv#warmbox.proxy=}" ;;
+    esac
+done
+
+# Egress policy: route all client traffic through the host's proxy so the
+# allow/deny decision is made outside the guest. Set for the agent (which passes
+# its environment to exec'd commands) and for interactive login shells.
+if [ -n "$PROXY" ]; then
+    export http_proxy="http://$PROXY" https_proxy="http://$PROXY" \
+           HTTP_PROXY="http://$PROXY" HTTPS_PROXY="http://$PROXY" \
+           all_proxy="http://$PROXY" ALL_PROXY="http://$PROXY" \
+           no_proxy="localhost,127.0.0.1,192.168.64.1" NO_PROXY="localhost,127.0.0.1,192.168.64.1"
+    cat > /etc/profile.d/warmbox-proxy.sh <<PROXYEOF
+export http_proxy="http://$PROXY" https_proxy="http://$PROXY"
+export HTTP_PROXY="http://$PROXY" HTTPS_PROXY="http://$PROXY"
+export no_proxy="localhost,127.0.0.1,192.168.64.1"
+PROXYEOF
+    log "egress proxy $PROXY"
+fi
+
+# --- network ---
+modprobe virtio_net 2>/dev/null
+ip link set lo up
+i=0
+while [ $i -lt 50 ]; do
+    IFACE=$(ls /sys/class/net 2>/dev/null | grep -v '^lo$' | head -1)
+    [ -n "$IFACE" ] && break
+    sleep 0.1
+    i=$((i+1))
+done
+if [ -n "$IFACE" ]; then
+    ip link set "$IFACE" up 2>/dev/null
+    udhcpc -i "$IFACE" -b -q -t 10 -T 2 >/var/log/dhcp.log 2>&1
+    IP=$(ip -4 addr show "$IFACE" 2>/dev/null | grep -o 'inet [0-9.]*' | awk '{print $2}')
+fi
+log "id=${VM_ID:-?} iface=${IFACE:-none} ip=${IP:-none}"
+
+# When the root lives on a persistent volume, flush it periodically so a
+# host-side commit after an unclean stop loses at most a couple of seconds.
+if [ "$HAVE_VOLUME" = "1" ]; then
+    {
+        while true; do
+            sync
+            sleep 2
+        done
+    } &
+    log "volume sync loop started"
+fi
+
+# --- agent API (host -> guest exec/files), localhost only ---
+/usr/local/bin/warmbox-agent >/var/log/warmbox-agent.log 2>&1 &
+log "warmbox-agent started"
+
+# --- optional virtiofs workspace share ---
+# The host can attach a directory with `--device virtio-fs,sharedDir=...,
+# mountTag=<tag>`; we mount it at /workspace so agents/editors in the guest see
+# the real project files instead of a copy.
+if [ -n "$SHARE_TAG" ]; then
+    mkdir -p /workspace
+    modprobe virtiofs 2>/dev/null
+    if mount -t virtiofs "$SHARE_TAG" /workspace 2>/var/log/virtiofs.log; then
+        log "mounted virtiofs '$SHARE_TAG' at /workspace"
+    else
+        log "WARN: virtiofs mount '$SHARE_TAG' failed: $(cat /var/log/virtiofs.log 2>/dev/null | tr '\n' '|')"
+    fi
+fi
+
+# --- D-Bus: machine id + system bus ---
+# Without /etc/machine-id and /run/dbus the system bus refuses to start.
+mkdir -p /run/dbus
+[ -s /etc/machine-id ] || dbus-uuidgen > /etc/machine-id 2>/dev/null
+dbus-daemon --system --fork 2>/var/log/dbus-system.log \
+    && log "dbus system bus up" \
+    || log "WARN: dbus system bus failed: $(cat /var/log/dbus-system.log 2>/dev/null | tr '\n' '|')"
+
+# --- X server + VNC (TigerVNC Xvnc) ---
+Xvnc :0 -geometry 1280x800 -depth 24 -SecurityTypes None -AlwaysShared \
+    -rfbport 5900 -desktop warmbox >/var/log/xvnc.log 2>&1 &
+XPID=$!
+
+# Wait for the VNC port to actually open instead of fixed sleeps.
+i=0
+while [ $i -lt 100 ]; do
+    if ss -ltn 2>/dev/null | grep -q ':5900'; then
+        break
+    fi
+    if ! kill -0 "$XPID" 2>/dev/null; then
+        log "FATAL: Xvnc died"
+        tail -20 /var/log/xvnc.log > /dev/hvc0 2>&1
+        break
+    fi
+    sleep 0.1
+    i=$((i+1))
+done
+
+if kill -0 "$XPID" 2>/dev/null; then
+    log "Xvnc running (pid $XPID)"
+    xsetroot -solid '#204060' 2>/dev/null
+    xdpyinfo 2>/dev/null | grep -E 'dimensions' | head -1 > /dev/hvc0
+else
+    log "WARN: Xvnc not running"
+fi
+
+# --- desktop session (XFCE default, LXQt-Ambiance when installed) ---
+# startxfce4 only brings up xfwm4 + xfsettingsd; the session manager never
+# spawns the panel/desktop on a fresh root (verified in a container), so we
+# launch those explicitly below on the same session bus. The bus address is
+# recorded so every component shares it — without it they run blind.
+# LXQt path: `startlxqt` owns panel+desktop itself, so just launch it.
+rm -f /run/session-bus
+if command -v startlxqt >/dev/null 2>&1; then
+    DESKTOP_SESSION=lxqt
+    export QT_STYLE_OVERRIDE=kvantum
+    export QT_QPA_PLATFORMTHEME=lxqt
+    dbus-run-session -- sh -c 'echo "$DBUS_SESSION_BUS_ADDRESS" > /run/session-bus; exec startlxqt' >/var/log/lxqt-session.log 2>&1 &
+    SESSION_PID=$!
+    log "lxqt-session pid $SESSION_PID"
+else
+    DESKTOP_SESSION=xfce
+    dbus-run-session -- sh -c 'echo "$DBUS_SESSION_BUS_ADDRESS" > /run/session-bus; exec startxfce4' >/var/log/xfce-session.log 2>&1 &
+    SESSION_PID=$!
+    log "xfce4-session pid $SESSION_PID"
+fi
+
+# Wait for the window manager to own the screen, then for the panel to appear.
+i=0
+while [ $i -lt 100 ]; do
+    xprop -root _NET_SUPPORTING_WM_CHECK >/dev/null 2>&1 && break
+    sleep 0.1
+    i=$((i+1))
+done
+
+# Compositing costs CPU we want for streaming; turn it off (xfce only).
+if [ "${DESKTOP_SESSION:-xfce}" = "xfce" ]; then
+xfconf-query -c xfwm4 -p /general/use_compositing -s false 2>/dev/null || true
+fi
+
+# Give xfce4-session time to bring up the WM, then join every further
+# component to its session bus.
+i=0
+while [ $i -lt 100 ] && [ ! -s /run/session-bus ]; do
+    sleep 0.1
+    i=$((i+1))
+done
+if [ -s /run/session-bus ]; then
+    export DBUS_SESSION_BUS_ADDRESS="$(cat /run/session-bus)"
+    log "session bus ${DBUS_SESSION_BUS_ADDRESS%%,*}"
+else
+    log "WARN: no session bus recorded"
+fi
+
+# Panel + desktop + terminal (xfce only; lxqt session owns its own).
+# Explicitly on the session bus (the session manager does not spawn them).
+if [ "${DESKTOP_SESSION:-xfce}" = "xfce" ]; then
+for app in "xfce4-panel:/var/log/xfce4-panel.log" "xfdesktop:/var/log/xfdesktop.log" "xfce4-terminal:/var/log/xfce4-terminal.log"; do
+    bin="${app%%:*}"
+    lg="${app##*:}"
+    if ! ps -o comm= 2>/dev/null | grep -qw "$bin"; then
+        log "starting $bin on session bus"
+        ($bin >"$lg" 2>&1 &)
+    fi
+done
+sleep 2
+# Re-apply wallpaper explicitly (covers the case where the autostart script
+# ran before xfdesktop registered its xfconf backdrop paths).
+if [ -f /usr/share/backgrounds/warmbox-win11.png ]; then
+    /usr/local/bin/warmbox-wallpaper.sh 2>/dev/null || true
+fi
+fi
+
+log "xfce procs: $(ps -o comm= 2>/dev/null | grep -E 'xfwm4|xfce4-panel|xfdesktop|xfsettingsd|xfconfd|xfce4-terminal' | tr '\n' ' ')"
+log "session log: $(tail -4 /var/log/xfce-session.log 2>&1 | tr '\n' '|')"
+
+# --- readiness callback ---
+if ss -ltn 2>/dev/null | grep -q ':5900'; then
+    log "READY: vnc listening on 5900"
+    if [ -n "$VM_ID" ] && [ -n "$HOST_ADDR" ]; then
+        # The readiness callback is control-plane traffic: never through the
+        # egress proxy (busybox wget ignores no_proxy).
+        env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY \
+            -u all_proxy -u ALL_PROXY -u no_proxy -u NO_PROXY \
+            wget -q -O /dev/null \
+            "http://${HOST_ADDR}:${API_PORT}/internal/ready?id=${VM_ID}&ip=${IP}" \
+            && log "reported ready to ${HOST_ADDR}:${API_PORT}" \
+            || log "WARN: readiness callback failed"
+    fi
+else
+    log "WARN: vnc not listening"
+    tail -20 /var/log/xvnc.log > /dev/hvc0 2>&1
+fi
+
+# Reap orphans; keep PID 1 alive.
+while true; do
+    wait
+    sleep 5
+done

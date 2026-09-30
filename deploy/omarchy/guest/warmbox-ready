@@ -1,0 +1,48 @@
+#!/bin/sh
+# warmbox: report guest readiness to the host daemon.
+#
+# Named images boot via EFI, which has no kernel cmdline, so the daemon writes
+# the guest's identity into a virtiofs share tagged "warmbox-config". This
+# unit reads it, waits for the VNC server, then calls back /internal/ready.
+#
+# Exits 0 quietly when there is no config share (e.g. booting the image
+# directly, outside warmbox).
+set -u
+TAG=warmbox-config
+MNT=/run/warmbox-config
+log() { echo "warmbox-ready: $*"; }
+
+mkdir -p "$MNT"
+i=0
+while [ $i -lt 50 ]; do
+  mount -t virtiofs "$TAG" "$MNT" 2>/dev/null && break
+  i=$((i+1)); sleep 0.2
+done
+
+if [ ! -f "$MNT/config.json" ]; then
+  log "no config.json under $MNT; nothing to report"
+  exit 0
+fi
+
+id=$(sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$MNT/config.json" | head -1)
+host=$(sed -n 's/.*"host"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$MNT/config.json" | head -1)
+port=$(sed -n 's/.*"port"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$MNT/config.json" | head -1)
+if [ -z "$id" ] || [ -z "$host" ] || [ -z "$port" ]; then
+  log "incomplete config: id=$id host=$host port=$port"; exit 1
+fi
+
+# Wait for VNC so "ready" means the desktop is actually streamable.
+i=0
+while [ $i -lt 300 ]; do
+  ss -ltn 2>/dev/null | grep -q ':5900 ' && break
+  i=$((i+1)); sleep 0.2
+done
+
+ip=$(ip route get "$host" 2>/dev/null | sed -n 's/.*src \([0-9.]*\).*/\1/p' | head -1)
+[ -n "$ip" ] || ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+
+for try in 1 2 3 4 5; do
+  curl -sf -o /dev/null "http://$host:$port/internal/ready?id=$id&ip=$ip" && { log "reported ready id=$id ip=$ip"; exit 0; }
+  sleep 1
+done
+log "ready callback failed (host=$host port=$port ip=$ip)"; exit 1

@@ -1,0 +1,103 @@
+# Releasing: push a tag (v0.2.0) and the release workflow builds the binaries,
+# publishes them with checksums, and updates the Homebrew tap.
+#
+# The guest image is NOT built here — it is a few hundred MB and needs a real
+# image build per architecture, so it is published by .github/workflows/guest-image.yml
+# (or locally with `make image-pack`). `warmbox setup` downloads it from the
+# release with the matching tag.
+version: 2
+
+project_name: warmbox
+
+builds:
+  - id: warmbox
+    main: ./cmd/warmbox
+    binary: warmbox
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      # .Tag (not .Version): `warmbox setup` builds the image URL from the tag
+      # path, and .Version would strip the leading "v" and 404.
+      - -X main.version={{ .Tag }}
+    goos: [darwin, linux]
+    goarch: [arm64, amd64]
+    ignore:
+      # vfkit wraps Apple's Virtualization.framework, which needs Apple Silicon;
+      # there is no useful Intel-Mac build (no nested virtualization for QEMU).
+      - goos: darwin
+        goarch: amd64
+
+archives:
+  - id: warmbox
+    formats: [tar.gz]
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    files:
+      - README.md
+      - LICENSE
+
+checksum:
+  name_template: checksums.txt
+
+# Linux packages, for servers: provisioning a VPS with a .deb/.rpm is friendlier
+# than unpacking a tarball. They deliberately do NOT fetch the guest image — that
+# is several hundred MB and belongs in `warmbox setup`, not in a package
+# post-install step.
+nfpms:
+  - id: warmbox
+    package_name: warmbox
+    vendor: warmbox
+    homepage: https://github.com/Daviduche03/warmbox
+    # nfpm wants an email; this is GitHub's no-reply form for the account.
+    maintainer: Daviduche03 <Daviduche03@users.noreply.github.com>
+    description: |-
+      Self-hosted GUI desktop microVMs (vfkit/QEMU + noVNC).
+      Boot a Linux desktop in a second, hand a browser a link, and keep the whole
+      machine - files, installed apps, settings - on a disk that lives in object
+      storage and can be cloned or restored on another host.
+    license: Apache-2.0
+    formats: [deb, rpm]
+    bindir: /usr/bin
+    section: utils
+    priority: optional
+    contents:
+      - src: ./LICENSE
+        dst: /usr/share/doc/warmbox/LICENSE
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^ci:"
+      - "^chore:"
+
+# Homebrew: a Cask, not a Formula. Formulas for precompiled binaries are the
+# deprecated path (see goreleaser's "brews" notice), so the tap holds
+# Casks/warmbox.rb and users install with `brew install --cask`.
+homebrew_casks:
+  - name: warmbox
+    repository:
+      owner: Daviduche03
+      name: homebrew-warmbox
+      # The default GITHUB_TOKEN cannot push to another repository, so the
+      # release workflow passes a PAT with write access to the tap.
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    homepage: https://github.com/Daviduche03/warmbox
+    description: Self-hosted GUI desktop microVMs (vfkit/QEMU + noVNC)
+    binaries:
+      - warmbox
+    caveats: |
+      Warmbox needs a hypervisor:
+        macOS:  brew install vfkit
+        Linux:  QEMU + KVM (qemu-system-x86_64 / qemu-system-aarch64)
+
+      Then fetch the guest image and start the daemon:
+        warmbox setup
+        warmbox service install --pool 1
+
+      The dashboard is on http://localhost:7070

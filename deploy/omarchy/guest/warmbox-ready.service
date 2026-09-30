@@ -1,0 +1,12 @@
+[Unit]
+Description=warmbox readiness callback
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/warmbox-ready
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

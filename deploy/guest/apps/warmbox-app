@@ -1,0 +1,156 @@
+#!/bin/sh
+# warmbox-app — install/run first-class apps inside the guest.
+#
+# An "app" is a directory. If it has an index.html it is treated as a web app
+# and launched in Chromium's app-window mode; otherwise it uses app.json /
+# run.sh. Installing copies it to /opt/apps/<id>/ and drops a menu entry, so it
+# shows up in the XFCE menu like any program. Since /opt and /usr/share live on
+# the writable volume, installed apps persist and clone with the machine.
+set -eu
+
+APPS_DIR=/opt/apps
+DESKTOP_DIR=/usr/share/applications
+
+usage() {
+    echo "usage: warmbox-app <install <dir> | list | run <id> | remove <id> | serve <dir> [port] | new <id>>" >&2
+}
+
+field() { sed -n 's/.*"'"$2"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$1" | head -1; }
+
+sanitize() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9._-' '-'; }
+
+# write_webrun <appdir>: open index.html in an app window (no tabs/URL bar).
+write_webrun() {
+    cat > "$1/run.sh" <<'EOF'
+#!/bin/sh
+DIR=$(cd "$(dirname "$0")" && pwd)
+exec chromium --no-sandbox --disable-gpu --disable-dev-shm-usage \
+    --allow-file-access-from-files --app="file://$DIR/index.html"
+EOF
+    chmod +x "$1/run.sh"
+}
+
+cmd_install() {
+    src=$1
+    [ -d "$src" ] || { echo "no such directory: $src" >&2; exit 1; }
+    id=""
+    name=""
+    [ -f "$src/app.json" ] && { id=$(field "$src/app.json" id); name=$(field "$src/app.json" name); }
+    # No manifest: derive from an index.html (a web app) or the folder name.
+    if [ -z "$id" ]; then
+        id=$(sanitize "$(basename "$(cd "$src" && pwd)")")
+        if [ -f "$src/index.html" ]; then
+            name=$(sed -n 's:.*<title>\(.*\)</title>.*:\1:p' "$src/index.html" | head -1)
+        fi
+    fi
+    [ -n "$name" ] || name=$id
+    [ -n "$id" ] || { echo "cannot determine app id" >&2; exit 1; }
+
+    mkdir -p "$APPS_DIR/$id"
+    cp -R "$src/." "$APPS_DIR/$id/"
+    chmod +x "$APPS_DIR/$id"/*.sh 2>/dev/null || true
+
+    # A web app with no launcher gets one (app-window mode).
+    if [ ! -f "$APPS_DIR/$id/run.sh" ] && [ -f "$APPS_DIR/$id/index.html" ]; then
+        write_webrun "$APPS_DIR/$id"
+    fi
+    command="$APPS_DIR/$id/run.sh"
+    [ -f "$src/app.json" ] && { c=$(field "$src/app.json" command); [ -n "$c" ] && command=$c; }
+    icon="applications-internet"
+    [ -f "$src/app.json" ] && { i=$(field "$src/app.json" icon); [ -n "$i" ] && icon=$i; }
+    desc=""
+    [ -f "$src/app.json" ] && desc=$(field "$src/app.json" description)
+
+    mkdir -p "$DESKTOP_DIR"
+    cat > "$DESKTOP_DIR/$id.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=$name
+Comment=$desc
+Exec=$command
+Icon=$icon
+Terminal=false
+Categories=Utility;
+EOF
+    command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$DESKTOP_DIR" 2>/dev/null || true
+    echo "installed $name ($id)"
+}
+
+cmd_list() {
+    found=0
+    for d in "$APPS_DIR"/*/; do
+        [ -d "$d" ] || continue
+        found=1
+        id=$(basename "$d")
+        name=""
+        [ -f "$d/app.json" ] && name=$(field "$d/app.json" name)
+        [ -n "$name" ] || name=$id
+        echo "$id	$name"
+    done
+    [ "$found" = "1" ] || echo "(no apps)"
+}
+
+cmd_run() {
+    id=$1
+    if [ -x "$APPS_DIR/$id/run.sh" ]; then
+        exec "$APPS_DIR/$id/run.sh"
+    fi
+    echo "no run.sh for $id" >&2
+    exit 1
+}
+
+cmd_remove() {
+    id=$1
+    rm -rf "$APPS_DIR/$id" "$DESKTOP_DIR/$id.desktop"
+    command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$DESKTOP_DIR" 2>/dev/null || true
+    echo "removed $id"
+}
+
+# serve <dir> [port]: serve a folder over HTTP and print the shareable link
+# (the host daemon proxies /p/<vm>/<port>/ to this guest port).
+cmd_serve() {
+    dir=${1:-.}
+    port=${2:-8080}
+    vm=""
+    apiport="7070"
+    for kv in $(cat /proc/cmdline 2>/dev/null); do
+        case "$kv" in
+            warmbox.id=*)   vm=${kv#warmbox.id=} ;;
+            warmbox.port=*) apiport=${kv#warmbox.port=} ;;
+        esac
+    done
+    echo "serving $(cd "$dir" && pwd) on 0.0.0.0:$port" >&2
+    [ -n "$vm" ] && echo "open: http://localhost:$apiport/p/$vm/$port/" >&2
+    if command -v darkhttpd >/dev/null 2>&1; then
+        exec darkhttpd "$dir" --port "$port"
+    fi
+    exec busybox httpd -f -p "$port" -h "$dir"
+}
+
+# new <id>: scaffold a minimal web app.
+cmd_new() {
+    id=$(sanitize "${1:-myapp}")
+    dir=${2:-$id}
+    mkdir -p "$dir"
+    if [ ! -f "$dir/index.html" ]; then
+        cat > "$dir/index.html" <<EOF
+<!doctype html>
+<html><head><meta charset="utf-8"><title>$id</title></head>
+<body style="font-family:sans-serif;margin:40px">
+<h1>$id</h1>
+<p>Edit index.html, then: warmbox-app install $dir</p>
+</body></html>
+EOF
+    fi
+    echo "created $dir/; install with: warmbox-app install $dir"
+}
+
+case "${1:-}" in
+    install) shift; cmd_install "$@";;
+    list)    cmd_list;;
+    run)     shift; cmd_run "$@";;
+    remove)  shift; cmd_remove "$@";;
+    serve)   shift; cmd_serve "$@";;
+    new)     shift; cmd_new "$@";;
+    *)       usage; exit 1;;
+esac
