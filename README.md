@@ -152,13 +152,18 @@ warmbox-app install mydash      # appears in the XFCE menu (opens as an app wind
 warmbox-app serve mydash 8080   # prints a /p/<vm>/8080/ link you can open
 ```
 
-Storage is local by default (a directory under the workdir). To use a bucket,
-point `runmesh` at it and the daemon picks it up:
+Storage is local by default (a directory under the workdir). To keep volumes in
+a bucket so the same disk can attach on another machine, point warmbox at it
+(also available in the dashboard under Settings):
 
 ```sh
-./runmesh config set --endpoint https://<acct>.r2.cloudflarestorage.com \
+warmbox cloud set --endpoint https://<acct>.r2.cloudflarestorage.com \
   --access-key <KEY> --secret-key <SECRET> --bucket <BUCKET>
+warmbox cloud show          # where volume bytes live
 ```
+
+Restart the daemon afterwards (`warmbox service restart`) and it picks the
+bucket up.
 
 ## Status
 
@@ -173,10 +178,11 @@ point `runmesh` at it and the daemon picks it up:
 | Disk snapshots + clone | ✅ works |
 | Image pack / pull (compressed artifacts) | ✅ works |
 | Agent API: exec + files | ✅ works |
+| Agent API: background/streaming runs + sessions | ✅ works |
 | Linux host (QEMU/KVM) | ✅ works (x86_64 verified; no EFI images) |
 | `warmbox-app` (menu apps) | 🟡 experimental |
 | Publish a guest port at a URL (`/p/<vm>/<port>/`) | 🟡 experimental |
-| Agent API: streaming, tty, screenshot/input | ❌ not yet |
+| Agent API: tty, screenshot/input (computer-use) | ❌ not yet |
 | Linux host (Cloud Hypervisor / Firecracker) | ❌ not yet |
 | Windows host (WSL2 / native WHPX) | ❌ not yet |
 | Memory snapshot / ~100 ms restore | ❌ blocked on macOS |
@@ -208,18 +214,17 @@ point `runmesh` at it and the daemon picks it up:
 ## Repository layout
 
 ```
-cmd/warmbox         the orchestrator CLI (daemon, create, image, volume, snapshot)
-cmd/runmesh         the storage/sync CLI (up/down/watch/mount)
-internal/desktop    boot/attach microVMs (vfkit, qemu); images, boot modes
-internal/imagepack  pack/pull images as compressed tar.zst artifacts
+cmd/warmbox         the CLI (daemon, create, image, volume, snapshot, cloud)
+internal/desktop    boot/attach microVMs (vfkit, qemu); images, boot modes, pack
 internal/volume     persistent volumes (chunked, content-addressed)
 internal/cloudstore shared chunk+manifest engine
 internal/catalog    SQLite metadata (volumes, desktops, snapshots, leases)
+internal/egress     default-deny egress policy + forward proxy
 internal/api        REST API, noVNC bridge, guest port proxy, agent proxy
 internal/vnc        WebSocket→TCP VNC bridge
 deploy/guest        built-in image (Dockerfile, init, overlay-init, apps, agent)
 deploy/omarchy      Omarchy image build + guest provisioning
-docs/               architecture, volumes, snapshots, agent-api, oss-positioning
+docs/               architecture, volumes, snapshots, agent-api, egress, oss-positioning
 ```
 
 ## Docs

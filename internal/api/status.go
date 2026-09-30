@@ -5,7 +5,7 @@ import (
 	"net/http"
 	"time"
 
-	"runmesh/workspace/internal/catalog"
+	"warmbox/internal/catalog"
 )
 
 // StatusInfo is the daemon-level detail the API reports to the dashboard. It is

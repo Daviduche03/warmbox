@@ -15,7 +15,10 @@ const (
 	StateBooting State = "booting"
 	StateReady   State = "ready"
 	StateBusy    State = "busy"
-	StateDead    State = "dead"
+	// StatePaused is a frozen VM: its vCPUs are stopped but its memory is
+	// still held by the host process (pause saves CPU, not RAM).
+	StatePaused State = "paused"
+	StateDead   State = "dead"
 )
 
 // VM is a single guest microVM managed by the orchestrator.
@@ -31,10 +34,15 @@ type VM struct {
 
 	forwards map[int]string
 	cmd      *exec.Cmd
-	dir      string
-	ready    chan struct{}
-	readyMu  sync.Once
-	mu       sync.Mutex
+	// inst is the launched process's handle, including the backend control
+	// endpoint used to pause and resume it.
+	inst *Instance
+	dir  string
+	// pausedFrom remembers the state to restore when a paused VM resumes.
+	pausedFrom State
+	ready      chan struct{}
+	readyMu    sync.Once
+	mu         sync.Mutex
 }
 
 // Ready returns a channel closed once the guest reports readiness.
@@ -54,6 +62,28 @@ func (v *VM) markReady(ip string) {
 func (v *VM) setState(s State) {
 	v.mu.Lock()
 	v.State = s
+	v.mu.Unlock()
+}
+
+// markPaused records a frozen VM, remembering the state to restore on resume.
+func (v *VM) markPaused() {
+	v.mu.Lock()
+	if v.State != StatePaused {
+		v.pausedFrom = v.State
+		v.State = StatePaused
+	}
+	v.mu.Unlock()
+}
+
+// markResumed returns a paused VM to the state it held before it was paused.
+func (v *VM) markResumed() {
+	v.mu.Lock()
+	if v.pausedFrom != "" && v.pausedFrom != StatePaused {
+		v.State = v.pausedFrom
+	} else {
+		v.State = StateReady
+	}
+	v.pausedFrom = ""
 	v.mu.Unlock()
 }
 

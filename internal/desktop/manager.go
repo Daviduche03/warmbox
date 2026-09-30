@@ -138,13 +138,14 @@ func (m *Manager) start(id, volumeName, volumeImage, imageName string) (*VM, err
 	}
 
 	spec := LaunchSpec{
-		ID:      id,
-		CPUs:    cpus,
-		MemMiB:  mem,
-		Console: consolePath,
-		PidFile: pidPath,
-		Display: display,
-		Input:   input,
+		ID:         id,
+		CPUs:       cpus,
+		MemMiB:     mem,
+		Console:    consolePath,
+		PidFile:    pidPath,
+		Display:    display,
+		Input:      input,
+		ControlDir: dir,
 	}
 	switch {
 	case haveImg && img.kind == "efi":
@@ -240,6 +241,7 @@ func (m *Manager) start(id, volumeName, volumeImage, imageName string) (*VM, err
 		Volume:   volumeName,
 		forwards: inst.Forwards,
 		cmd:      cmd,
+		inst:     inst,
 		dir:      dir,
 		ready:    make(chan struct{}),
 	}
@@ -346,6 +348,53 @@ func (m *Manager) Destroy(id string) error {
 	_ = os.RemoveAll(vm.dir)
 	vm.setState(StateDead)
 	fmt.Fprintf(m.log, "desktop: destroyed vm %s\n", id)
+	return nil
+}
+
+// Pause freezes a VM's vCPUs in place. The guest keeps its memory (and with it
+// its running session); the host simply stops scheduling it, so pause reclaims
+// CPU rather than RAM. Use Destroy to hand the memory back.
+func (m *Manager) Pause(id string) error {
+	vm, ok := m.Get(id)
+	if !ok {
+		return fmt.Errorf("unknown vm %s", id)
+	}
+	switch st := vm.Info().State; st {
+	case StatePaused:
+		return nil
+	case StateReady, StateBusy:
+		// Fine to freeze.
+	default:
+		return fmt.Errorf("cannot pause vm %s in state %s", id, st)
+	}
+	if !m.backend.Capabilities().Pause {
+		return fmt.Errorf("backend %s cannot pause vms", m.backend.Name())
+	}
+	if err := m.backend.Pause(vm.inst); err != nil {
+		return err
+	}
+	vm.markPaused()
+	fmt.Fprintf(m.log, "desktop: paused vm %s (memory retained)\n", id)
+	return nil
+}
+
+// Resume thaws a paused VM. Its guest session continues where it left off.
+func (m *Manager) Resume(id string) error {
+	vm, ok := m.Get(id)
+	if !ok {
+		return fmt.Errorf("unknown vm %s", id)
+	}
+	if st := vm.Info().State; st != StatePaused {
+		return fmt.Errorf("vm %s is not paused (state %s)", id, st)
+	}
+	if !m.backend.Capabilities().Pause {
+		return fmt.Errorf("backend %s cannot resume vms", m.backend.Name())
+	}
+	if err := m.backend.Resume(vm.inst); err != nil {
+		return err
+	}
+	vm.markResumed()
+	fmt.Fprintf(m.log, "desktop: resumed vm %s\n", id)
 	return nil
 }
 

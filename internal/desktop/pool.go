@@ -14,22 +14,41 @@ import (
 type Pool struct {
 	mgr  *Manager
 	size int
-	log  io.Writer
+	// idleTimeout, when > 0, reclaims idle VMs once the pool has gone untouched
+	// for this long. A warm VM holds RAM, so after a quiet spell it is worth
+	// dropping it and paying a cold boot on the next create.
+	idleTimeout time.Duration
+	log         io.Writer
 
 	mu      sync.Mutex
 	idle    []*VM
 	pending int
+	// touched is the last time a lease was taken or released.
+	touched time.Time
+	// drained records that idle VMs were reclaimed for inactivity, so
+	// replenishing stays off until the next Acquire.
+	drained bool
 }
 
-// NewPool creates a warm pool over the given manager.
-func NewPool(mgr *Manager, size int, log io.Writer) *Pool {
+// NewPool creates a warm pool over the given manager. An idleTimeout of 0 keeps
+// the pool warm indefinitely.
+func NewPool(mgr *Manager, size int, idleTimeout time.Duration, log io.Writer) *Pool {
 	if log == nil {
 		log = io.Discard
 	}
 	if size < 0 {
 		size = 0
 	}
-	return &Pool{mgr: mgr, size: size, log: log}
+	if idleTimeout < 0 {
+		idleTimeout = 0
+	}
+	return &Pool{
+		mgr:         mgr,
+		size:        size,
+		idleTimeout: idleTimeout,
+		log:         log,
+		touched:     time.Now(),
+	}
 }
 
 // Run maintains the pool until ctx is cancelled. It is meant to run in a
@@ -48,12 +67,28 @@ func (p *Pool) Run(ctx context.Context) {
 }
 
 func (p *Pool) replenish(ctx context.Context) {
+	// Reclaim idle VMs once the pool has been quiet for a while. They exist to
+	// make creates instant; holding their RAM through a long idle stretch (or
+	// overnight) is the wrong trade, so drop them and boot on demand instead.
+	var drained []*VM
 	p.mu.Lock()
-	need := p.size - len(p.idle) - p.pending
-	if need > 0 {
-		p.pending += need
+	if p.idleTimeout > 0 && !p.drained && len(p.idle) > 0 && time.Since(p.touched) > p.idleTimeout {
+		drained, p.idle = p.idle, nil
+		p.drained = true
+	}
+	need := 0
+	if !p.drained {
+		need = p.size - len(p.idle) - p.pending
+		if need > 0 {
+			p.pending += need
+		}
 	}
 	p.mu.Unlock()
+
+	for _, vm := range drained {
+		fmt.Fprintf(p.log, "pool: draining idle vm %s (%s without a lease; reclaiming RAM)\n", vm.ID, p.idleTimeout)
+		_ = p.mgr.Destroy(vm.ID)
+	}
 
 	for i := 0; i < need; i++ {
 		go func() {
@@ -62,6 +97,9 @@ func (p *Pool) replenish(ctx context.Context) {
 			p.pending--
 			if err == nil {
 				p.idle = append(p.idle, vm)
+				// A VM finishing its boot is the pool's last change: start
+				// (or restart) the idle clock from here.
+				p.touched = time.Now()
 			}
 			p.mu.Unlock()
 			if err != nil {
@@ -92,6 +130,9 @@ func (p *Pool) bootOne(ctx context.Context) (*VM, error) {
 func (p *Pool) Acquire(ctx context.Context) (*VM, error) {
 	for {
 		p.mu.Lock()
+		// A lease is activity: wake the pool back up.
+		p.touched = time.Now()
+		p.drained = false
 		if n := len(p.idle); n > 0 {
 			vm := p.idle[n-1]
 			p.idle = p.idle[:n-1]
@@ -127,6 +168,9 @@ func (p *Pool) Release(vm *VM) error {
 	if vm == nil {
 		return nil
 	}
+	p.mu.Lock()
+	p.touched = time.Now()
+	p.mu.Unlock()
 	return p.mgr.Destroy(vm.ID)
 }
 

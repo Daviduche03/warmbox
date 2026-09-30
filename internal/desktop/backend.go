@@ -1,14 +1,18 @@
 package desktop
 
 import (
+	"encoding/json"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Caps describes what a hypervisor backend can do.
@@ -19,6 +23,10 @@ type Caps struct {
 	SharedFS bool
 	// Snapshot reports in-memory VM snapshot/restore support.
 	Snapshot bool
+	// Pause reports whether running VMs can be frozen and resumed in place.
+	// A paused VM keeps its memory (the host still owns those pages); pausing
+	// saves CPU, not RAM.
+	Pause bool
 }
 
 // Disk is a block device to attach. Order matters: the first disk is /dev/vda.
@@ -55,6 +63,10 @@ type LaunchSpec struct {
 	Shares  []Share
 	Console string // serial console log path
 	PidFile string
+	// ControlDir, when non-empty, is a per-VM directory where the backend may
+	// open its control channel (pause/resume). Backends that need no channel
+	// ignore it.
+	ControlDir string
 }
 
 // Instance is a launched VM. Forwards maps a guest port to a host dial address
@@ -64,6 +76,10 @@ type LaunchSpec struct {
 type Instance struct {
 	Cmd      *exec.Cmd
 	Forwards map[int]string
+	// Control is the backend's live control endpoint, in whatever shape that
+	// backend's Pause/Resume expect ("host:port" for vfkit's REST API, a unix
+	// socket path for QEMU's QMP monitor). Empty when unavailable.
+	Control string
 }
 
 // Backend boots microVMs on a specific hypervisor. The manager owns the process
@@ -73,6 +89,11 @@ type Backend interface {
 	Name() string
 	Launch(spec LaunchSpec) (*Instance, error)
 	Capabilities() Caps
+	// Pause freezes the VM's vCPUs and Resume thaws them. Guest memory stays
+	// allocated throughout — pause saves CPU, not RAM. Only called when
+	// Capabilities().Pause is set.
+	Pause(inst *Instance) error
+	Resume(inst *Instance) error
 	// GuestHostAddr is the address the guest uses to reach this host (the
 	// readiness callback / API). Empty falls back to Config.HostAddr.
 	GuestHostAddr() string
@@ -99,7 +120,9 @@ type vfkitBackend struct {
 
 func (b *vfkitBackend) Name() string          { return "vfkit" }
 func (b *vfkitBackend) GuestHostAddr() string { return "192.168.64.1" }
-func (b *vfkitBackend) Capabilities() Caps    { return Caps{GUI: true, SharedFS: true, Snapshot: false} }
+func (b *vfkitBackend) Capabilities() Caps {
+	return Caps{GUI: true, SharedFS: true, Snapshot: false, Pause: true}
+}
 
 func (b *vfkitBackend) Launch(spec LaunchSpec) (*Instance, error) {
 	bin := b.path
@@ -150,6 +173,17 @@ func (b *vfkitBackend) Launch(spec LaunchSpec) (*Instance, error) {
 	if spec.PidFile != "" {
 		args = append(args, "--pidfile", spec.PidFile)
 	}
+	// Open vfkit's REST API on a loopback port so the manager can freeze and
+	// thaw this VM (POST /vm/state).
+	control := ""
+	if spec.ControlDir != "" {
+		port, err := freePort()
+		if err != nil {
+			return nil, err
+		}
+		control = fmt.Sprintf("127.0.0.1:%d", port)
+		args = append(args, "--restful-uri", "tcp://"+control)
+	}
 	if b.gui {
 		args = append(args, "--gui")
 	}
@@ -161,7 +195,36 @@ func (b *vfkitBackend) Launch(spec LaunchSpec) (*Instance, error) {
 			cmd.Stderr = f
 		}
 	}
-	return &Instance{Cmd: cmd}, nil
+	return &Instance{Cmd: cmd, Control: control}, nil
+}
+
+// Pause freezes the guest's vCPUs; Resume thaws them. The guest's memory stays
+// in the host process, so this buys CPU back, not RAM.
+func (b *vfkitBackend) Pause(inst *Instance) error  { return vfkitSetState(inst, "Pause") }
+func (b *vfkitBackend) Resume(inst *Instance) error { return vfkitSetState(inst, "Resume") }
+
+// vfkitSetState posts a state transition to vfkit's REST API (valid: Pause,
+// Resume, Stop, HardStop).
+func vfkitSetState(inst *Instance, state string) error {
+	if inst == nil || inst.Control == "" {
+		return fmt.Errorf("vm has no control channel")
+	}
+	req, err := http.NewRequest(http.MethodPost, "http://"+inst.Control+"/vm/state",
+		strings.NewReader(`{"state":"`+state+`"}`))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
+	if err != nil {
+		return fmt.Errorf("vfkit %s: %w", state, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("vfkit %s: %s %s", state, resp.Status, strings.TrimSpace(string(msg)))
+	}
+	return nil
 }
 
 // parseDisplay splits a "WIDTHxHEIGHT" string.
@@ -189,7 +252,9 @@ type qemuBackend struct {
 
 func (b *qemuBackend) Name() string          { return "qemu" }
 func (b *qemuBackend) GuestHostAddr() string { return "10.0.2.2" }
-func (b *qemuBackend) Capabilities() Caps    { return Caps{GUI: true, SharedFS: true, Snapshot: false} }
+func (b *qemuBackend) Capabilities() Caps {
+	return Caps{GUI: true, SharedFS: true, Snapshot: false, Pause: true}
+}
 
 func qemuSystemBinary() string {
 	if runtime.GOARCH == "arm64" {
@@ -248,6 +313,12 @@ func (b *qemuBackend) Launch(spec LaunchSpec) (*Instance, error) {
 		args = append(args, "-virtfs",
 			fmt.Sprintf("local,path=%s,mount_tag=%s,security_model=none,id=fs%d", s.Dir, s.Tag, i))
 	}
+	// A QMP monitor socket lets the manager freeze and thaw this VM.
+	control := ""
+	if spec.ControlDir != "" {
+		control = filepath.Join(spec.ControlDir, "qmp.sock")
+		args = append(args, "-qmp", "unix:"+control+",server,nowait")
+	}
 	if spec.PidFile != "" {
 		args = append(args, "-pidfile", spec.PidFile)
 	}
@@ -257,7 +328,50 @@ func (b *qemuBackend) Launch(spec LaunchSpec) (*Instance, error) {
 			5900: fmt.Sprintf("127.0.0.1:%d", vncPort),
 			7077: fmt.Sprintf("127.0.0.1:%d", agentPort),
 		},
+		Control: control,
 	}, nil
+}
+
+// Pause freezes the guest's vCPUs; Resume thaws them. Guest memory stays in the
+// QEMU process, so this buys CPU back, not RAM.
+func (b *qemuBackend) Pause(inst *Instance) error  { return qmpExec(inst, "stop") }
+func (b *qemuBackend) Resume(inst *Instance) error { return qmpExec(inst, "cont") }
+
+// qmpExec runs a single QMP command against a VM's monitor socket and reports
+// the monitor's error, if any.
+func qmpExec(inst *Instance, command string) error {
+	if inst == nil || inst.Control == "" {
+		return fmt.Errorf("vm has no control channel")
+	}
+	conn, err := net.DialTimeout("unix", inst.Control, 3*time.Second)
+	if err != nil {
+		return fmt.Errorf("qmp dial: %w", err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	dec := json.NewDecoder(conn)
+	var greeting map[string]json.RawMessage
+	if err := dec.Decode(&greeting); err != nil {
+		return fmt.Errorf("qmp greeting: %w", err)
+	}
+	var ack json.RawMessage
+	for _, cmd := range []string{"qmp_capabilities", command} {
+		if _, err := io.WriteString(conn, fmt.Sprintf("{\"execute\":%q}\n", cmd)); err != nil {
+			return fmt.Errorf("qmp %s: %w", cmd, err)
+		}
+		if err := dec.Decode(&ack); err != nil {
+			return fmt.Errorf("qmp %s: %w", cmd, err)
+		}
+		var out struct {
+			Error *struct {
+				Desc string `json:"desc"`
+			} `json:"error"`
+		}
+		if err := json.Unmarshal(ack, &out); err == nil && out.Error != nil {
+			return fmt.Errorf("qmp %s: %s", cmd, out.Error.Desc)
+		}
+	}
+	return nil
 }
 
 func freePort() (int, error) {

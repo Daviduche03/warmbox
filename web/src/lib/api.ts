@@ -57,7 +57,7 @@ const json = (v: unknown): RequestInit => ({ body: JSON.stringify(v) });
 
 // ── types ────────────────────────────────────────────────────────────────
 
-export type DesktopState = "booting" | "ready" | "busy" | "dead";
+export type DesktopState = "booting" | "ready" | "busy" | "paused" | "dead";
 
 export interface Desktop {
   id: string;
@@ -158,8 +158,40 @@ export function roleRank(role?: string): number {
 
 // ── calls ────────────────────────────────────────────────────────────────
 
+export type CloudStorage = {
+  configured: boolean;
+  provider: string;
+  bucket: string;
+  endpoint: string;
+  region: string;
+  /** Masked on read; leave blank when saving to keep the stored value. */
+  access_key: string;
+  secret_key: string;
+  path: string;
+};
+
 export const api = {
   status: () => request<DaemonStatus>("/api/status"),
+
+  cloud: {
+    get: () => request<CloudStorage>("/api/cloud"),
+    set: (body: {
+      provider?: string;
+      bucket: string;
+      endpoint?: string;
+      region?: string;
+      access_key?: string;
+      secret_key?: string;
+    }) =>
+      request<{ ok: boolean; restart_required?: boolean }>("/api/cloud", {
+        method: "PUT",
+        ...json(body),
+      }),
+    clear: () =>
+      request<{ ok: boolean; restart_required?: boolean }>("/api/cloud", {
+        method: "DELETE",
+      }),
+  },
 
   desktops: {
     list: () => request<{ desktops: Desktop[] | null }>("/api/desktops"),
@@ -181,6 +213,14 @@ export const api = {
       ),
     destroy: (id: string) =>
       request<{ status: string }>(`/api/desktops/${id}`, { method: "DELETE" }),
+    pause: (id: string) =>
+      request<{ status: string; id: string }>(`/api/desktops/${id}/pause`, {
+        method: "POST",
+      }),
+    resume: (id: string) =>
+      request<{ status: string; id: string }>(`/api/desktops/${id}/resume`, {
+        method: "POST",
+      }),
     exec: (id: string, cmd: string, cwd?: string, timeoutMs = 30000) =>
       request<ExecResult>(`/api/desktops/${id}/exec`, {
         method: "POST",

@@ -14,7 +14,7 @@ import (
 
 	"golang.org/x/crypto/bcrypt"
 
-	"runmesh/workspace/internal/catalog"
+	"warmbox/internal/catalog"
 )
 
 // Authentication model.
@@ -185,6 +185,9 @@ func minRoleFor(method, path string) int {
 	switch {
 	case strings.HasPrefix(path, "/api/users"):
 		return catalog.RoleRank(catalog.RoleAdmin)
+	case strings.HasPrefix(path, "/api/cloud"):
+		// Node-level storage credentials; the owner sets where bytes live.
+		return catalog.RoleRank(catalog.RoleOwner)
 	case path == "/api/workspaces" && method == http.MethodPost:
 		return catalog.RoleRank(catalog.RoleOwner)
 	case strings.HasPrefix(path, "/api/workspaces/"):

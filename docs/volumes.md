@@ -5,7 +5,7 @@ Status: **design + first milestone in progress.**
 ## The idea in one line
 
 The computer is disposable; the hard drive lives in the cloud. Each VM gets a
-"volume" stored in R2 (through runmesh/rclone). Start a VM on any host, plug in
+"volume" stored in S3/R2 (through rclone). Start a VM on any host, plug in
 the volume, and it is the same machine — same files, same installed apps, same
 settings. Stop it and the volume goes back to the cloud.
 
@@ -24,7 +24,7 @@ volume, so a dev box can be cloned/recreated on any host.
 
 - **Volume** — a raw ext4 disk image, addressed by name. Stored in R2 as
   fixed-size chunks (so only changed chunks move, not the whole disk).
-- **Volume store** — host-side agent (built on runmesh/rclone) that pulls chunks
+- **Volume store** — host-side agent (built on rclone) that pulls chunks
   down before a VM boots and pushes changed chunks back after.
 - **Attach** — a volume may be attached to at most one running VM at a time
   (single-writer, like a cloud block device).
@@ -92,7 +92,7 @@ Daemon flags for volumes:
 Example:
 
 ```sh
-runmesh config set ...                 # point storage at your bucket (once)
+warmbox cloud set ...                  # point storage at your bucket (once)
 warmbox volume create dev --size 8G
 warmbox create --volume dev            # prints the noVNC URL
 

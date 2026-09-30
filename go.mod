@@ -1,4 +1,4 @@
-module runmesh/workspace
+module warmbox
 
 go 1.25.6
 

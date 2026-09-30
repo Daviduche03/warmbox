@@ -9,6 +9,7 @@ const tone: Record<DesktopState, StatusIndicatorProps["color"]> = {
 	ready: "emerald",
 	busy: "sky",
 	booting: "amber",
+	paused: "slate",
 	dead: "rose",
 };
 

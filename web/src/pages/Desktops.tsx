@@ -41,6 +41,8 @@ import { usePending } from "@/lib/use-pending";
 import {
 	Plus as PlusIcon,
 	ArrowSquareOut as SquareArrowOutUpRightIcon,
+	Pause as PauseIcon,
+	Play as PlayIcon,
 	Trash as TrashIcon,
 	Globe as GlobeIcon,
 } from "@phosphor-icons/react";
@@ -121,6 +123,26 @@ export function DesktopsPage() {
 		}
 	}
 
+	async function pause(id: string) {
+		setError(undefined);
+		try {
+			await api.desktops.pause(id);
+			await refresh();
+		} catch (e) {
+			setError(e instanceof Error ? e.message : "pause failed");
+		}
+	}
+
+	async function resume(id: string) {
+		setError(undefined);
+		try {
+			await api.desktops.resume(id);
+			await refresh();
+		} catch (e) {
+			setError(e instanceof Error ? e.message : "resume failed");
+		}
+	}
+
 	function open(id: string) {
 		window.open(`/d/${id}`, "_blank", "noopener");
 	}
@@ -135,7 +157,7 @@ export function DesktopsPage() {
 					</Button>
 				}
 				badge={<Badge variant="secondary">{desktops.length}</Badge>}
-				desc="MicroVMs managed by this daemon. Creating one boots it into the pool."
+				desc="MicroVMs managed by this daemon. Creating one boots it into the pool. Pause keeps a desktop's memory; Destroy frees it."
 				title="Desktops"
 			/>
 			<Card className="shadow-none dark:ring-0">
@@ -185,12 +207,28 @@ export function DesktopsPage() {
 										<TableCell className="pr-6 text-right">
 											<RowActions label={`Actions for ${d.id}`}>
 												<DropdownMenuItem
-													disabled={d.state === "dead"}
+													disabled={d.state === "dead" || d.state === "paused"}
 													onSelect={() => open(d.id)}
 												>
 													<SquareArrowOutUpRightIcon />
 													Open console
 												</DropdownMenuItem>
+												{d.state === "paused" ? (
+													<DropdownMenuItem onSelect={() => void resume(d.id)}>
+														<PlayIcon />
+														Resume
+													</DropdownMenuItem>
+												) : (
+													<DropdownMenuItem
+														disabled={
+															d.state === "booting" || d.state === "dead"
+														}
+														onSelect={() => void pause(d.id)}
+													>
+														<PauseIcon />
+														Pause
+													</DropdownMenuItem>
+												)}
 												<DropdownMenuItem
 													onSelect={() => {
 														setPolicyFor(d.id);

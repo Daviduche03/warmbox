@@ -24,7 +24,7 @@ import (
 	rfs "github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/operations"
 
-	"runmesh/workspace/internal/cloudstore"
+	"warmbox/internal/cloudstore"
 )
 
 // DefaultChunkSize is the transfer granularity when syncing a volume image.

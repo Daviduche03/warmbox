@@ -16,12 +16,12 @@ import (
 	"sync"
 	"time"
 
-	"runmesh/workspace/internal/catalog"
-	"runmesh/workspace/internal/desktop"
-	"runmesh/workspace/internal/egress"
-	"runmesh/workspace/internal/vnc"
-	"runmesh/workspace/internal/volume"
-	"runmesh/workspace/web"
+	"warmbox/internal/catalog"
+	"warmbox/internal/desktop"
+	"warmbox/internal/egress"
+	"warmbox/internal/vnc"
+	"warmbox/internal/volume"
+	"warmbox/web"
 )
 
 // Server wires the manager, warm pool, volume store and VNC bridge into an
@@ -107,9 +107,16 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/desktops", s.create)
 	mux.HandleFunc("GET /api/status", s.status)
 	mux.HandleFunc("GET /api/images", s.images)
+
+	// Cloud storage (where volume bytes live) — owner-only, see minRoleFor.
+	mux.HandleFunc("GET /api/cloud", s.cloudGet)
+	mux.HandleFunc("PUT /api/cloud", s.cloudPut)
+	mux.HandleFunc("DELETE /api/cloud", s.cloudDelete)
 	mux.HandleFunc("GET /api/desktops", s.list)
 	mux.HandleFunc("GET /api/desktops/{id}", s.get)
 	mux.HandleFunc("DELETE /api/desktops/{id}", s.destroy)
+	mux.HandleFunc("POST /api/desktops/{id}/pause", s.pause)
+	mux.HandleFunc("POST /api/desktops/{id}/resume", s.resume)
 	mux.HandleFunc("POST /api/desktops/{id}/policy", s.setDesktopPolicy)
 
 	// Agent API: exec + files inside the guest (proxied to warmbox-agent).
@@ -496,6 +503,33 @@ func (s *Server) destroy(w http.ResponseWriter, r *http.Request) {
 		_ = s.catalog.DeleteDesktop(id)
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "destroyed", "id": id})
+}
+
+// pause freezes a desktop's vCPUs. Its memory (and running session) survive;
+// what is reclaimed is CPU. Destroy is what hands RAM back.
+func (s *Server) pause(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if _, ok := s.visibleVM(w, r, id); !ok {
+		return
+	}
+	if err := s.mgr.Pause(id); err != nil {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "paused", "id": id})
+}
+
+// resume thaws a paused desktop; the guest continues where it left off.
+func (s *Server) resume(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if _, ok := s.visibleVM(w, r, id); !ok {
+		return
+	}
+	if err := s.mgr.Resume(id); err != nil {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "running", "id": id})
 }
 
 func (s *Server) ready(w http.ResponseWriter, r *http.Request) {

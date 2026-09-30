@@ -24,6 +24,7 @@ export function DashboardStats() {
 		ready: desktops.filter((d) => d.state === "ready").length,
 		busy: desktops.filter((d) => d.state === "busy").length,
 		booting: desktops.filter((d) => d.state === "booting").length,
+		paused: desktops.filter((d) => d.state === "paused").length,
 		dead: desktops.filter((d) => d.state === "dead").length,
 	};
 
@@ -40,6 +41,7 @@ export function DashboardStats() {
 				`${byState.ready} ready`,
 				`${byState.busy} busy`,
 				`${byState.booting} booting`,
+				byState.paused ? `${byState.paused} paused` : undefined,
 				byState.dead ? `${byState.dead} dead` : undefined,
 			]
 				.filter(Boolean)

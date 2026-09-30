@@ -1,8 +1,12 @@
+// Package config stores where warmbox keeps its cloud credentials: one global
+// remote (S3/R2) that volume chunks are uploaded to. It can be written by
+// `warmbox cloud` or from the dashboard's settings page.
 package config
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -25,13 +29,18 @@ type RemoteConfig struct {
 	EnvKey string `json:"env_key,omitempty"`
 }
 
-type ProjectConfig struct {
-	Prefix string `json:"prefix"`
-}
+const (
+	configDirName  = ".warmbox"
+	configFileName = "config.json"
+	// remoteName is the rclone remote name these settings are exposed as.
+	remoteName = "warmbox"
+	// legacyDirName is where runmesh kept the same file. Read as a fallback so
+	// an existing setup keeps working after the rename.
+	legacyDirName = ".runmesh"
+)
 
-const configDirName = ".runmesh"
-
-func RunmeshDir() (string, error) {
+// Dir is warmbox's config directory (~/.warmbox).
+func Dir() (string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", err
@@ -39,22 +48,25 @@ func RunmeshDir() (string, error) {
 	return filepath.Join(home, configDirName), nil
 }
 
+// GlobalPath is the cloud credentials file (~/.warmbox/config.json).
 func GlobalPath() (string, error) {
-	dir, err := RunmeshDir()
+	dir, err := Dir()
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(dir, "config.json"), nil
+	return filepath.Join(dir, configFileName), nil
 }
 
-func ProjectDir(projectDir string) string {
-	return filepath.Join(projectDir, configDirName)
+func legacyGlobalPath() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, legacyDirName, configFileName), nil
 }
 
-func ProjectPath(projectDir string) string {
-	return filepath.Join(ProjectDir(projectDir), "config.json")
-}
-
+// LoadGlobal reads the cloud settings. It falls back to runmesh's old location
+// if the new one doesn't exist yet, so a rename isn't a data loss.
 func LoadGlobal() (*RemoteConfig, error) {
 	p, err := GlobalPath()
 	if err != nil {
@@ -62,10 +74,20 @@ func LoadGlobal() (*RemoteConfig, error) {
 	}
 	data, err := os.ReadFile(p)
 	if err != nil {
-		if os.IsNotExist(err) {
+		if !errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("reading global config: %w", err)
+		}
+		legacy, lerr := legacyGlobalPath()
+		if lerr != nil {
 			return nil, nil
 		}
-		return nil, fmt.Errorf("reading global config: %w", err)
+		data, err = os.ReadFile(legacy)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return nil, nil
+			}
+			return nil, fmt.Errorf("reading global config: %w", err)
+		}
 	}
 	var cfg RemoteConfig
 	if err := json.Unmarshal(data, &cfg); err != nil {
@@ -74,60 +96,45 @@ func LoadGlobal() (*RemoteConfig, error) {
 	return &cfg, nil
 }
 
+// SaveGlobal writes the cloud settings to ~/.warmbox/config.json.
 func SaveGlobal(cfg *RemoteConfig) error {
-	dir, err := RunmeshDir()
+	dir, err := Dir()
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(dir, 0700); err != nil {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("creating config dir: %w", err)
-	}
-	p, err := GlobalPath()
-	if err != nil {
-		return err
 	}
 	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encoding global config: %w", err)
 	}
-	return os.WriteFile(p, data, 0600)
-}
-
-func LoadProject(projectDir string) (*ProjectConfig, error) {
-	data, err := os.ReadFile(ProjectPath(projectDir))
+	p, err := GlobalPath()
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("reading project config: %w", err)
+		return err
 	}
-	var cfg ProjectConfig
-	if err := json.Unmarshal(data, &cfg); err != nil {
-		return nil, fmt.Errorf("parsing project config: %w", err)
-	}
-	return &cfg, nil
+	return os.WriteFile(p, data, 0o600)
 }
 
-func SaveProject(projectDir string, cfg *ProjectConfig) error {
-	dir := ProjectDir(projectDir)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return fmt.Errorf("creating project config dir: %w", err)
-	}
-	data, err := json.MarshalIndent(cfg, "", "  ")
+// Clear removes the stored cloud settings.
+func Clear() error {
+	p, err := GlobalPath()
 	if err != nil {
-		return fmt.Errorf("encoding project config: %w", err)
+		return err
 	}
-	return os.WriteFile(ProjectPath(projectDir), data, 0644)
+	if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
 }
 
-func (p *ProjectConfig) CloudPath(r *RemoteConfig) string {
-	return fmt.Sprintf("%s/%s", r.DefaultBucket, p.Prefix)
+// Configured reports whether a bucket is set, i.e. volumes can be cloud-backed.
+func (r *RemoteConfig) Configured() bool {
+	return r != nil && r.DefaultBucket != ""
 }
 
-func (p *ProjectConfig) OpenRemote(ctx context.Context, r *RemoteConfig) (fs.Fs, error) {
-	return r.NewFs(ctx, r.DefaultBucket, p.Prefix)
-}
-
+// NewFs opens the remote at bucket/prefix. Everything is stored under a single
+// bucket, so volumes across machines share chunks.
 func (r *RemoteConfig) NewFs(ctx context.Context, bucket, prefix string) (fs.Fs, error) {
 	ri, err := fs.Find("s3")
 	if err != nil {
@@ -145,6 +152,6 @@ func (r *RemoteConfig) NewFs(ctx context.Context, bucket, prefix string) (fs.Fs,
 		"force_path_style":  "true",
 	}
 
-	cfg := fs.ConfigMap(ri.Prefix, ri.Options, "runmesh", userCfg)
-	return ri.NewFs(ctx, "runmesh", bucket+"/"+prefix, cfg)
+	cfg := fs.ConfigMap(ri.Prefix, ri.Options, remoteName, userCfg)
+	return ri.NewFs(ctx, remoteName, bucket+"/"+prefix, cfg)
 }

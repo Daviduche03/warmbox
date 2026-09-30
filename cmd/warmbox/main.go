@@ -31,12 +31,12 @@ import (
 	_ "github.com/rclone/rclone/backend/all"
 	rfs "github.com/rclone/rclone/fs"
 
-	"runmesh/workspace/internal/api"
-	"runmesh/workspace/internal/catalog"
-	"runmesh/workspace/internal/config"
-	"runmesh/workspace/internal/desktop"
-	"runmesh/workspace/internal/egress"
-	"runmesh/workspace/internal/volume"
+	"warmbox/internal/api"
+	"warmbox/internal/catalog"
+	"warmbox/internal/config"
+	"warmbox/internal/desktop"
+	"warmbox/internal/egress"
+	"warmbox/internal/volume"
 )
 
 // version is the release string reported by `warmbox version` and /api/status.
@@ -77,6 +77,8 @@ func main() {
 		cmdVolume(os.Args[2:])
 	case "snapshot":
 		cmdSnapshot(os.Args[2:])
+	case "cloud":
+		cmdCloud(os.Args[2:])
 	default:
 		unknownCommand(os.Args[1])
 	}
@@ -194,6 +196,10 @@ Usage:
   warmbox snapshot list
   warmbox snapshot rm <id>
 
+  warmbox cloud set --bucket <name> --endpoint <url> --access-key <k> --secret-key <s>
+  warmbox cloud show        Show where volume bytes are stored
+  warmbox cloud clear       Forget the cloud settings (back to local storage)
+
 The daemon needs vfkit (brew install vfkit) and a pre-baked guest image
 (see deploy/guest/Dockerfile).
 `)
@@ -236,6 +242,7 @@ func addCommonFlags(fs *flag.FlagSet, cfg *desktop.Config) {
 	fs.UintVar(&cfg.MemMiB, "mem", cfg.MemMiB, "memory per VM (MiB)")
 	fs.UintVar(&cfg.CPUs, "cpus", cfg.CPUs, "vCPUs per VM")
 	fs.IntVar(&cfg.PoolSize, "pool", cfg.PoolSize, "warm pool size")
+	fs.DurationVar(&cfg.PoolIdleTimeout, "pool-idle-timeout", cfg.PoolIdleTimeout, "drain warm-pool VMs after this long without a lease, reclaiming their RAM (0 = keep warm)")
 	fs.StringVar(&cfg.ShareDir, "share", cfg.ShareDir, "host directory shared with guests via virtiofs (mounted at /workspace)")
 	fs.StringVar(&cfg.ShareTag, "share-tag", cfg.ShareTag, "virtiofs mount tag")
 	fs.StringVar(&cfg.Token, "token", cfg.Token, "deprecated and ignored; use account login")
@@ -331,6 +338,7 @@ func writeLaunchAgent(cfg *desktop.Config, pool int) error {
 		"--workdir", cfg.WorkDir,
 		"--addr", cfg.APIAddr,
 		"--pool", fmt.Sprint(pool),
+		"--pool-idle-timeout", cfg.PoolIdleTimeout.String(),
 		"--vfkit", cfg.VfkitPath,
 		"--token", serviceToken(),
 	}
@@ -512,7 +520,7 @@ func cmdDaemon(args []string) {
 		}
 	}
 
-	p := desktop.NewPool(mgr, cfg.PoolSize, os.Stderr)
+	p := desktop.NewPool(mgr, cfg.PoolSize, cfg.PoolIdleTimeout, os.Stderr)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -574,11 +582,11 @@ func cmdDaemon(args []string) {
 	mgr.Shutdown()
 }
 
-// newVolumeStore builds a volume store backed by runmesh/R2 when credentials
-// are configured, otherwise by a local directory so volumes still work for
-// local development. It returns the store and a short human description of
-// where volume bytes are kept (surfaced in the dashboard). The store is nil if
-// none could be created.
+// newVolumeStore builds a volume store backed by the configured cloud remote
+// (S3/R2) when credentials are set, otherwise by a local directory so volumes
+// still work for local development. It returns the store and a short human
+// description of where volume bytes are kept (surfaced in the dashboard). The
+// store is nil if none could be created.
 func newVolumeStore(ctx context.Context, cfg *desktop.Config) (*volume.Store, string) {
 	chunk := int64(cfg.VolumeChunkMiB) << 20
 
@@ -602,7 +610,7 @@ func newVolumeStore(ctx context.Context, cfg *desktop.Config) (*volume.Store, st
 		fmt.Fprintf(os.Stderr, "warmbox: volumes disabled: %v\n", err)
 		return nil, "disabled"
 	}
-	fmt.Fprintf(os.Stderr, "warmbox: volumes backed by local dir %s (no runmesh remote configured)\n", local)
+	fmt.Fprintf(os.Stderr, "warmbox: volumes backed by local dir %s (no cloud remote configured; run `warmbox cloud set`)\n", local)
 	return volume.NewStore(f, cfg.VolumePrefix, cfg.VolumeDir, cfg.VolumeBase, chunk), "local"
 }
 
@@ -1161,6 +1169,111 @@ func parseInterspersed(fs *flag.FlagSet, args []string) []string {
 		positional = append(positional, rest[0])
 		args = rest[1:]
 	}
+}
+
+// cmdCloud reads and writes the cloud settings (S3/R2) that back volumes.
+func cmdCloud(args []string) {
+	orDash := func(s string) string {
+		if s == "" {
+			return "(not set)"
+		}
+		return s
+	}
+	mask := func(s string) string {
+		if s == "" {
+			return "(not set)"
+		}
+		if len(s) <= 4 {
+			return "****"
+		}
+		return s[:4] + strings.Repeat("*", 8)
+	}
+
+	if len(args) < 1 {
+		cloudUsage()
+		os.Exit(1)
+	}
+	switch args[0] {
+	case "set":
+		fs := flag.NewFlagSet("cloud set", flag.ExitOnError)
+		bucket := fs.String("bucket", "", "bucket name (required)")
+		endpoint := fs.String("endpoint", "", "S3 endpoint URL")
+		provider := fs.String("provider", "Cloudflare", "rclone s3 provider")
+		region := fs.String("region", "", "region")
+		access := fs.String("access-key", "", "access key id")
+		secret := fs.String("secret-key", "", "secret access key")
+		_ = fs.Parse(args[1:])
+		if *bucket == "" {
+			cloudUsage()
+			os.Exit(1)
+		}
+		// Keep whatever is already stored (e.g. an encryption key) unless a
+		// flag overrides it.
+		cfg, _ := config.LoadGlobal()
+		if cfg == nil {
+			cfg = &config.RemoteConfig{}
+		}
+		cfg.Provider = *provider
+		cfg.Endpoint = *endpoint
+		cfg.Region = *region
+		cfg.AccessKey = *access
+		cfg.SecretKey = *secret
+		cfg.DefaultBucket = *bucket
+		if err := config.SaveGlobal(cfg); err != nil {
+			fatal("Error: %v", err)
+		}
+		p, _ := config.GlobalPath()
+		fmt.Fprintf(os.Stderr, "warmbox: cloud settings saved to %s\n", p)
+		fmt.Fprintln(os.Stderr, "  restart the daemon to pick them up:  warmbox service restart")
+
+	case "show":
+		fs := flag.NewFlagSet("cloud show", flag.ExitOnError)
+		_ = fs.Parse(args[1:])
+		cfg, err := config.LoadGlobal()
+		if err != nil {
+			fatal("Error: %v", err)
+		}
+		p, _ := config.GlobalPath()
+		if !cfg.Configured() {
+			fmt.Fprintf(os.Stderr, "no cloud remote configured (%s)\n", p)
+			fmt.Fprintln(os.Stderr, "  volumes are stored locally; set one with:  warmbox cloud set --bucket <name>")
+			return
+		}
+		fmt.Printf("config:   %s\n", p)
+		fmt.Printf("provider: %s\n", orDash(cfg.Provider))
+		fmt.Printf("bucket:   %s\n", cfg.DefaultBucket)
+		fmt.Printf("endpoint: %s\n", orDash(cfg.Endpoint))
+		fmt.Printf("region:   %s\n", orDash(cfg.Region))
+		fmt.Printf("key:      %s\n", mask(cfg.AccessKey))
+		fmt.Printf("secret:   %s\n", mask(cfg.SecretKey))
+
+	case "clear":
+		fs := flag.NewFlagSet("cloud clear", flag.ExitOnError)
+		_ = fs.Parse(args[1:])
+		if err := config.Clear(); err != nil {
+			fatal("Error: %v", err)
+		}
+		fmt.Fprintln(os.Stderr, "warmbox: cloud settings cleared; volumes fall back to local storage")
+		fmt.Fprintln(os.Stderr, "  restart the daemon:  warmbox service restart")
+
+	default:
+		cloudUsage()
+		os.Exit(1)
+	}
+}
+
+func cloudUsage() {
+	fmt.Fprint(os.Stderr, `Manage the cloud remote that stores volume bytes (S3 or Cloudflare R2).
+
+Usage:
+  warmbox cloud set --bucket <name> [--endpoint <url>] [--access-key <k>] [--secret-key <s>]
+  warmbox cloud show      Show where volume bytes are stored
+  warmbox cloud clear     Forget the settings and fall back to local storage
+
+Example (Cloudflare R2):
+  warmbox cloud set --endpoint https://<account>.r2.cloudflarestorage.com \
+      --access-key <id> --secret-key <secret> --bucket warmbox
+`)
 }
 
 func cmdVolume(args []string) {

@@ -1,14 +1,11 @@
-// Package cloudstore is the shared storage engine for runmesh and warmbox: a
-// content-addressed chunk store on any rclone remote (S3/R2, or a local dir),
-// plus small JSON documents (manifests, metadata).
+// Package cloudstore is warmbox's storage engine: a content-addressed chunk
+// store on any rclone remote (S3/R2, or a local dir), plus small JSON documents
+// (manifests, metadata).
 //
 // Chunks are addressed by the SHA-256 of their contents, so identical data is
 // stored once and shared across volumes — which makes clones O(1) and lets a
-// local chunk cache serve many volumes without re-downloading.
-//
-// This package is meant to be the one engine used by internal/volume (disks),
-// internal/sync (runmesh projects) and internal/fuse (cloud mounts). Volume is
-// migrated first; sync/cloudfs follow.
+// local chunk cache serve many volumes without re-downloading. internal/volume
+// (disks) is the caller.
 package cloudstore
 
 import (

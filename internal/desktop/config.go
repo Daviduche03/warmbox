@@ -7,6 +7,7 @@ package desktop
 import (
 	"os"
 	"path/filepath"
+	"time"
 )
 
 // Config holds everything the orchestrator needs to boot guest microVMs.
@@ -113,6 +114,11 @@ type Config struct {
 	// PoolSize is the number of pre-booted idle VMs kept warm.
 	PoolSize int
 
+	// PoolIdleTimeout, when > 0, reclaims warm-pool VMs that have gone unused
+	// for this long, handing their RAM back to the host. 0 keeps them warm
+	// indefinitely (creates stay instant, at a standing RAM cost).
+	PoolIdleTimeout time.Duration
+
 	// ShareDir, when non-empty, is a host directory exposed to every guest as
 	// a virtiofs share (mounted at /workspace in the guest).
 	ShareDir string
@@ -166,6 +172,7 @@ func DefaultConfig() *Config {
 		GuestVNCPort:      5900,
 		AgentPort:         7077,
 		PoolSize:          2,
+		PoolIdleTimeout:   15 * time.Minute,
 		ShareTag:          "workspace",
 		VolumeDir:         filepath.Join(wd, "volumes"),
 		VolumeBase:        filepath.Join(wd, "volume-base.img"),

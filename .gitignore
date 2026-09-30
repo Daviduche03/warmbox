@@ -1,6 +1,5 @@
 # Compiled binaries
 /warmbox
-/runmesh
 *.exe
 *.test
 *.out

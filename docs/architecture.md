@@ -1,4 +1,4 @@
-# Architecture — unify runmesh + warmbox, cloud-native
+# Architecture — cloud-native volumes and snapshots
 
 Status: **decided direction; W1 (catalog) + W2 (fast create/commit) landed.**
 Supersedes the "local file + cloud backup" behavior in `docs/volumes.md`.
@@ -40,9 +40,9 @@ full custom streaming block layer from day one (too much to get right up front).
 ## Components
 
 ```
-cmd/warmbox, cmd/runmesh        two CLIs, one core
+cmd/warmbox                     the CLI + daemon
 ├─ internal/cloudstore          rclone/S3 + content-addressed chunks + manifest + cache
-│     used by: volume, sync (runmesh), fuse/cloudfs
+│     used by: internal/volume
 ├─ internal/volume              a volume == a cloudstore namespace (create=manifest)
 ├─ internal/snapshot            save/restore VM state (disk + memory)          [next]
 ├─ internal/catalog             SQLite: volumes, desktops, snapshots, leases
@@ -93,12 +93,10 @@ etcd) or object-store locks; the `catalog` package hides that behind an interfac
    from an 8 GiB base went ~8.9 s → **~0.1 s** (first create pays ~0.6 s to build
    the base manifest once). **✅ landed.**
 3. **`internal/cloudstore`** — shared content-addressed chunk engine + JSON
-   docs. **Volume migrated ✅.** Note: `internal/sync` (runmesh projects) is
-   *file-level* — it copies arbitrary files, not disk chunks — and `cloudfs` is a
-   general object filesystem, so neither needs the chunk engine; the shared piece
-   they do use (building an rclone `fs.Fs` from config) already lives in
-   `internal/config`. So "one engine" means cloudstore for chunked disks, config
-   for remote construction.
+   docs. **Volume migrated ✅.** Chunked disks are the only consumer now (the
+   runmesh-era project sync and cloud-fs packages were removed); the one thing
+   shared with the rest of the app is building an rclone `fs.Fs` from config,
+   which lives in `internal/config`.
 4. **Lazy volume reads** — a shared local chunk cache shipped (identical chunks
    downloaded once per host, and re-attach reuses it). True on-demand reads for a
    multi-GB used set would need a FUSE-served image on the host (**macFUSE
@@ -126,5 +124,3 @@ etcd) or object-store locks; the `catalog` package hides that behind an interfac
 - Whether the live feed to `/dev/vdb` is a **streaming block proxy** or a
   **user-space filesystem** feeding a loop/NBD device; the manifest layer is the
   same either way.
-- How `runmesh`'s project sync and a volume's chunk space share content
-  addressing (dedup across both would be a big win).
