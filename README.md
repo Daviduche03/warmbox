@@ -52,6 +52,17 @@ Both boot the built-in image. The one real gap: EFI *disk* images (Omarchy) need
 macOS today, because the QEMU backend has no OVMF firmware yet. Overlay images —
 the built-in one and `lxqt` — need no firmware and take the same path on both.
 
+`warmbox setup` installs the hypervisor for whichever host it finds, so this table
+is about what *can* run, not about what you have to install by hand:
+
+| host | backend | overlay images (`default`, `lxqt`) | EFI disk images (`omarchy`) |
+|---|---|---|---|
+| macOS 13+, Apple Silicon | vfkit | ✅ | ✅ |
+| Linux + KVM, x86_64 | QEMU | ✅ verified | ❌ no OVMF |
+| Linux + KVM, arm64 | QEMU | ✅ expected (untested) | ❌ no OVMF |
+| Intel Mac | — | unsupported — no nested virtualisation for QEMU, and vfkit is ARM64-only | ❌ |
+| Windows — WSL2 or native | QEMU/WHPX | not yet | ❌ |
+
 To **build from source** you also need **Docker** (for the guest image) and
 **Go 1.25+** — but an install from a release needs neither.
 
@@ -216,7 +227,8 @@ startup and you choose one per desktop:
 
 The built-in and `lxqt` images are *overlay* images (a shared read-only squashfs
 plus a writable upper); `omarchy` is an *EFI disk*. Both kinds are named images
-and are selected the same way. Build a variant with:
+and are selected the same way. `default` and `lxqt` boot on both hosts; `omarchy`
+needs macOS, since only vfkit brings its own EFI firmware. Build a variant with:
 
 ```sh
 DESKTOP=lxqt THEME=ambiance VARIANT=lxqt ./deploy/guest/build.sh   # -> images/lxqt
