@@ -57,24 +57,48 @@ func NewID() string {
 	return hex.EncodeToString(b)
 }
 
+// StartSpec describes the desktop to boot. Zero fields fall back to the
+// daemon's defaults (or the image's own meta.json overrides).
+type StartSpec struct {
+	ID string
+	// VolumeName/VolumeImage attach a persistent volume (its name for later
+	// commit, and the resolved local image path).
+	VolumeName  string
+	VolumeImage string
+	// ImageName is a named guest image under ImageDir; empty means the
+	// daemon's default.
+	ImageName string
+	// CPUs and MemMiB override the daemon's per-VM defaults when non-zero.
+	CPUs   uint
+	MemMiB uint
+}
+
 // Start launches a new microVM from the default image and returns it (state =
 // booting). Callers wait for readiness with WaitReady.
-func (m *Manager) Start(id string) (*VM, error) { return m.start(id, "", "", m.cfg.Image) }
+func (m *Manager) Start(id string) (*VM, error) { return m.start(StartSpec{ID: id}) }
 
 // StartWithVolume launches a microVM whose writable layer is the given volume
 // image (a raw ext4 disk) attached read-write as /dev/vdb. volumeName names it
 // for later commit/release.
 func (m *Manager) StartWithVolume(id, volumeName, image string) (*VM, error) {
-	return m.start(id, volumeName, image, m.cfg.Image)
+	return m.start(StartSpec{ID: id, VolumeName: volumeName, VolumeImage: image})
 }
 
 // StartImage launches a microVM from a named image under cfg.ImageDir,
 // optionally attached to a persistent volume.
 func (m *Manager) StartImage(id, volumeName, volumeImage, imageName string) (*VM, error) {
-	return m.start(id, volumeName, volumeImage, imageName)
+	return m.start(StartSpec{
+		ID: id, VolumeName: volumeName, VolumeImage: volumeImage, ImageName: imageName,
+	})
 }
 
-func (m *Manager) start(id, volumeName, volumeImage, imageName string) (*VM, error) {
+// StartDesktop boots exactly what the caller asked for, including explicit
+// vCPU/memory requests (which rule out a warm-pool VM: those are sized when
+// they are booted).
+func (m *Manager) StartDesktop(spec StartSpec) (*VM, error) { return m.start(spec) }
+
+func (m *Manager) start(spec StartSpec) (*VM, error) {
+	id, volumeName, volumeImage, imageName := spec.ID, spec.VolumeName, spec.VolumeImage, spec.ImageName
 	if id == "" {
 		id = NewID()
 	}
@@ -105,7 +129,8 @@ func (m *Manager) start(id, volumeName, volumeImage, imageName string) (*VM, err
 	}
 	meta := img.meta
 
-	// Per-image overrides win over the daemon defaults.
+	// Per-image overrides win over the daemon defaults; an explicit request
+	// wins over both (the caller asked for that size).
 	cpus, mem := m.cfg.CPUs, m.cfg.MemMiB
 	display, input := m.cfg.GPU, m.cfg.Input
 	if meta.CPUs > 0 {
@@ -113,6 +138,12 @@ func (m *Manager) start(id, volumeName, volumeImage, imageName string) (*VM, err
 	}
 	if meta.MemMiB > 0 {
 		mem = meta.MemMiB
+	}
+	if spec.CPUs > 0 {
+		cpus = spec.CPUs
+	}
+	if spec.MemMiB > 0 {
+		mem = spec.MemMiB
 	}
 	if meta.GPU != "" {
 		display = meta.GPU
@@ -139,7 +170,7 @@ func (m *Manager) start(id, volumeName, volumeImage, imageName string) (*VM, err
 		cmdline += fmt.Sprintf(" warmbox.proxy=%s:%s", hostAddr, portOf(m.cfg.EgressAddr))
 	}
 
-	spec := LaunchSpec{
+	launch := LaunchSpec{
 		ID:         id,
 		CPUs:       cpus,
 		MemMiB:     mem,
@@ -168,9 +199,9 @@ func (m *Manager) start(id, volumeName, volumeImage, imageName string) (*VM, err
 		} else {
 			_ = os.Remove(varPath)
 		}
-		spec.EFI = true
-		spec.EFIVars = varPath
-		spec.Disks = append(spec.Disks, Disk{Path: diskPath})
+		launch.EFI = true
+		launch.EFIVars = varPath
+		launch.Disks = append(launch.Disks, Disk{Path: diskPath})
 		// EFI boot has no kernel cmdline, so hand the guest its identity over a
 		// virtiofs share instead: the image's warmbox-ready unit reads it and
 		// reports readiness back to the daemon.
@@ -193,41 +224,41 @@ func (m *Manager) start(id, volumeName, volumeImage, imageName string) (*VM, err
 		if err := os.WriteFile(filepath.Join(cfgDir, "config.json"), conf, 0o644); err != nil {
 			return nil, fmt.Errorf("writing config.json: %w", err)
 		}
-		spec.Shares = append(spec.Shares, Share{Dir: cfgDir, Tag: "warmbox-config"})
+		launch.Shares = append(launch.Shares, Share{Dir: cfgDir, Tag: "warmbox-config"})
 	case haveImg && img.kind == "overlay":
 		// Startup is booted directly by warmbox, so the guest gets its identity
 		// on the kernel cmdline (as the built-in image does).
-		spec.Kernel = img.kernel
-		spec.Cmdline = cmdline
-		spec.Initrd = img.initrd
-		spec.Disks = append(spec.Disks, Disk{Path: img.squash, ReadOnly: true})
+		launch.Kernel = img.kernel
+		launch.Cmdline = cmdline
+		launch.Initrd = img.initrd
+		launch.Disks = append(launch.Disks, Disk{Path: img.squash, ReadOnly: true})
 	case m.overlayAvailable():
-		spec.Kernel = m.cfg.KernelPath
-		spec.Cmdline = cmdline
-		spec.Initrd = m.cfg.OverlayInitrdPath
-		spec.Disks = append(spec.Disks, Disk{Path: m.cfg.SquashPath, ReadOnly: true})
+		launch.Kernel = m.cfg.KernelPath
+		launch.Cmdline = cmdline
+		launch.Initrd = m.cfg.OverlayInitrdPath
+		launch.Disks = append(launch.Disks, Disk{Path: m.cfg.SquashPath, ReadOnly: true})
 	case m.diskAvailable():
 		diskPath := filepath.Join(dir, "rootfs.img")
 		if err := cloneFile(m.cfg.DiskPath, diskPath); err != nil {
 			return nil, fmt.Errorf("cloning rootfs image: %w", err)
 		}
-		spec.Kernel = m.cfg.KernelPath
-		spec.Cmdline = cmdline + " root=/dev/vda rootfstype=ext4 rootwait rw"
-		spec.Initrd = m.cfg.BootInitrdPath
-		spec.Disks = append(spec.Disks, Disk{Path: diskPath})
+		launch.Kernel = m.cfg.KernelPath
+		launch.Cmdline = cmdline + " root=/dev/vda rootfstype=ext4 rootwait rw"
+		launch.Initrd = m.cfg.BootInitrdPath
+		launch.Disks = append(launch.Disks, Disk{Path: diskPath})
 	default:
-		spec.Kernel = m.cfg.KernelPath
-		spec.Cmdline = cmdline
-		spec.Initrd = m.cfg.InitrdPath
+		launch.Kernel = m.cfg.KernelPath
+		launch.Cmdline = cmdline
+		launch.Initrd = m.cfg.InitrdPath
 	}
 	if volumeImage != "" {
-		spec.Disks = append(spec.Disks, Disk{Path: volumeImage})
+		launch.Disks = append(launch.Disks, Disk{Path: volumeImage})
 	}
 	if m.cfg.ShareDir != "" && m.cfg.ShareTag != "" {
-		spec.Shares = append(spec.Shares, Share{Dir: m.cfg.ShareDir, Tag: m.cfg.ShareTag})
+		launch.Shares = append(launch.Shares, Share{Dir: m.cfg.ShareDir, Tag: m.cfg.ShareTag})
 	}
 
-	inst, err := m.backend.Launch(spec)
+	inst, err := m.backend.Launch(launch)
 	if err != nil {
 		return nil, err
 	}

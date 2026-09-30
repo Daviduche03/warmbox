@@ -34,6 +34,14 @@ type StatusResponse struct {
 	Images        []string `json:"images"`
 	VolumesBacked string   `json:"volumes_backed"`
 	DefaultImage  string   `json:"default_image"`
+	// Defaults are the per-VM sizes a desktop gets when a request does not
+	// name its own; the create form pre-fills them.
+	Defaults defaultsInfo `json:"defaults"`
+}
+
+type defaultsInfo struct {
+	CPUs   uint `json:"cpus"`
+	MemMiB uint `json:"mem_mib"`
 }
 
 type poolInfo struct {
@@ -63,6 +71,7 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 		Images:        s.mgr.Images(),
 		VolumesBacked: or(s.info.VolumesBacked, "local storage"),
 		DefaultImage:  or(s.info.DefaultImage, s.cfg.Image),
+		Defaults:      defaultsInfo{CPUs: s.cfg.CPUs, MemMiB: s.cfg.MemMiB},
 	}
 	if out.Images == nil {
 		out.Images = []string{}

@@ -99,6 +99,8 @@ export interface DaemonStatus {
   images: string[];
   volumes_backed: string;
   default_image: string;
+  /** Per-VM sizes a desktop gets unless the create request names its own. */
+  defaults: { cpus: number; mem_mib: number };
 }
 
 export interface ExecResult {
@@ -199,6 +201,8 @@ export const api = {
     create: (opts: {
       volume?: string;
       image?: string;
+      cpus?: number;
+      mem_mib?: number;
       allow?: string[];
       deny?: string[];
     } = {}) =>
@@ -225,6 +229,18 @@ export const api = {
       request<ExecResult>(`/api/desktops/${id}/exec`, {
         method: "POST",
         ...json({ cmd, cwd, timeout_ms: timeoutMs }),
+      }),
+  },
+
+  settings: {
+    get: () =>
+      request<{ max_desktops_per_workspace: number; desktops_in_workspace: number }>(
+        "/api/settings",
+      ),
+    update: (body: { max_desktops_per_workspace: number }) =>
+      request<{ max_desktops_per_workspace: number }>("/api/settings", {
+        method: "PATCH",
+        ...json(body),
       }),
   },
 

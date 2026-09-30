@@ -90,9 +90,10 @@ func (s *Server) authenticateUsers(r *http.Request) (*authCtx, bool) {
 		}
 	}
 	token := bearerToken(r)
-	queryToken := r.URL.Query().Get("token")
-	if token == "" {
-		token = queryToken
+	// A token in the query string is a convenience for console URLs, but URLs
+	// leak (logs, history, referrers) — never let one authorize a mutation.
+	if token == "" && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
+		token = r.URL.Query().Get("token")
 	}
 	if token == "" {
 		return nil, false
@@ -183,7 +184,8 @@ func (s *Server) hasLoginCookie(r *http.Request) bool {
 // Workspace membership endpoints need owner: they create trust boundaries.
 func minRoleFor(method, path string) int {
 	switch {
-	case strings.HasPrefix(path, "/api/users"):
+	case strings.HasPrefix(path, "/api/users"),
+		strings.HasPrefix(path, "/api/settings"):
 		return catalog.RoleRank(catalog.RoleAdmin)
 	case strings.HasPrefix(path, "/api/cloud"):
 		// Node-level storage credentials; the owner sets where bytes live.
@@ -577,7 +579,19 @@ func (s *Server) changePassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.catalog.SetPasswordHash(ac.userID, string(next)); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not update password"})
+		s.fail(w, http.StatusInternalServerError, "could not update password", err)
+		return
+	}
+	// A new password retires every existing session — a stolen cookie must not
+	// outlive the password it was taken with — then this browser gets a fresh
+	// one so whoever changed it stays signed in.
+	if err := s.catalog.DeleteSessionsForUser(ac.userID); err != nil {
+		s.fail(w, http.StatusInternalServerError, "could not update password", err)
+		return
+	}
+	if err := s.openSession(w, r, ac.userID, ac.workspaceID); err != nil {
+		writeJSON(w, http.StatusInternalServerError,
+			map[string]string{"error": "password updated; sign in again"})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "password updated"})

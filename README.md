@@ -44,9 +44,38 @@ boots in ~1s from a shared read-only rootfs) and a full **Omarchy**
   daemon with `--backend qemu`. Verified on x86_64 KVM. Note: the Linux backend
   cannot boot EFI disk images yet (no OVMF), so image guests are macOS-only.
 
-Plus: **Docker** (to build the built-in guest image) and **Go 1.25+**.
+To **build from source** you also need **Docker** (for the guest image) and
+**Go 1.25+** — but an install from a release needs neither.
 
-## Quickstart
+## Install
+
+Prebuilt binaries ship with a prebuilt guest image, so there is no Docker step:
+
+```sh
+brew install Daviduche03/warmbox/warmbox   # macOS, or Linuxbrew
+warmbox setup                              # fetch noVNC + the guest image
+warmbox service install --pool 1           # run the daemon in the background
+```
+
+Then open <http://localhost:7070> (or `warmbox create` for a desktop and its
+URL). `warmbox setup` prints what it found and what to do next.
+
+`setup` downloads the guest image for your host architecture — the guest has to
+match the hypervisor, so there is one image per arch — verifies it against the
+published sha256, and installs it. It is resumable: an interrupted download
+picks up where it left off, and re-running it is safe. Point it somewhere else
+with `--image-url` (plus `--image-sha256` if you don't publish a `.sha256`).
+
+<details>
+<summary>Without Homebrew</summary>
+
+Download the tarball for your platform from the
+[releases page](https://github.com/Daviduche03/warmbox/releases), unpack it, and
+run the same three commands (`./warmbox setup`, `./warmbox service install`).
+
+</details>
+
+## Quickstart (from source)
 
 ```sh
 # 1. Build the built-in guest image (kernel + rootfs + a 2 GiB base disk).
@@ -55,7 +84,7 @@ Plus: **Docker** (to build the built-in guest image) and **Go 1.25+**.
 
 # 2. Build the CLI and fetch noVNC.
 go build -o warmbox ./cmd/warmbox
-./warmbox setup
+./warmbox setup --no-image      # the image is already built above
 
 # 3. Run the daemon (warm pool + REST API + noVNC bridge).
 ./warmbox daemon
@@ -63,6 +92,9 @@ go build -o warmbox ./cmd/warmbox
 # 4. Provision a desktop; prints a URL to open in your browser.
 ./warmbox create
 ```
+
+Maintainers publish an image with `warmbox image pack --builtin -o <file>`,
+which also writes the `.sha256` that `setup` verifies.
 
 Each desktop gets a short URL (`http://localhost:7070/d/<id>`); open it and
 noVNC fills the page. The token is dropped from the address bar after the first

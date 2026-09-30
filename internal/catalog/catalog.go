@@ -10,6 +10,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"os"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -92,6 +93,16 @@ func Open(path string) (*DB, error) {
 	if err := migrateScoping(d); err != nil {
 		db.Close()
 		return nil, err
+	}
+	if err := migrateSettings(d); err != nil {
+		db.Close()
+		return nil, err
+	}
+	// The database holds password hashes and session/token digests, so keep it
+	// owner-only (sqlite creates it with the process umask). ":memory:" has no
+	// file to protect.
+	if path != "" {
+		_ = os.Chmod(path, 0o600)
 	}
 	return d, nil
 }

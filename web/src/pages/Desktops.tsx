@@ -58,12 +58,15 @@ function joinList(a?: string[]): string {
 }
 
 export function DesktopsPage() {
-	const { desktops, images, status, refresh } = useStore();
+	const { desktops, images, status, volumes, refresh } = useStore();
 	const [creating, setCreating] = useState(false);
 	const [image, setImage] = useState<string>("");
 	const [allow, setAllow] = useState<string>("");
 	const [deny, setDeny] = useState<string>("");
 	const [createError, setCreateError] = useState<string>();
+	const [cpus, setCpus] = useState("");
+	const [memMiB, setMemMiB] = useState("");
+	const [volume, setVolume] = useState("");
 	const [error, setError] = useState<string>();
 	const [pendingDestroy, setPendingDestroy] = useState<string>();
 	const [policyFor, setPolicyFor] = useState<string>();
@@ -81,6 +84,9 @@ export function DesktopsPage() {
 			try {
 				await api.desktops.create({
 					image: selected,
+					...(volume ? { volume } : {}),
+					...(Number(cpus) > 0 ? { cpus: Number(cpus) } : {}),
+					...(Number(memMiB) > 0 ? { mem_mib: Number(memMiB) } : {}),
 					allow: parseList(allow),
 					deny: parseList(deny),
 				});
@@ -88,6 +94,9 @@ export function DesktopsPage() {
 				setImage("");
 				setAllow("");
 				setDeny("");
+				setCpus("");
+				setMemMiB("");
+				setVolume("");
 				await refresh();
 			} catch (e) {
 				setCreateError(e instanceof Error ? e.message : "create failed");
@@ -264,6 +273,9 @@ export function DesktopsPage() {
 						setImage("");
 						setAllow("");
 						setDeny("");
+						setCpus("");
+						setMemMiB("");
+						setVolume("");
 					}
 				}}
 				open={creating}
@@ -306,6 +318,84 @@ export function DesktopsPage() {
 									))}
 								</SelectContent>
 							</Select>
+						</div>
+						<div className="grid grid-cols-2 gap-3">
+							<div className="space-y-2">
+								<label className="text-sm" htmlFor="new-desktop-cpus">
+									vCPUs
+								</label>
+								<Input
+									disabled={busy}
+									id="new-desktop-cpus"
+									inputMode="numeric"
+									min={1}
+									onChange={(e) => setCpus(e.target.value)}
+									placeholder={
+										status?.defaults?.cpus
+											? `${status.defaults.cpus} (default)`
+											: "default"
+									}
+									type="number"
+									value={cpus}
+								/>
+							</div>
+							<div className="space-y-2">
+								<label className="text-sm" htmlFor="new-desktop-mem">
+									Memory (MiB)
+								</label>
+								<Input
+									disabled={busy}
+									id="new-desktop-mem"
+									inputMode="numeric"
+									min={256}
+									onChange={(e) => setMemMiB(e.target.value)}
+									placeholder={
+										status?.defaults?.mem_mib
+											? `${status.defaults.mem_mib} (default)`
+											: "default"
+									}
+									type="number"
+									value={memMiB}
+								/>
+							</div>
+						</div>
+						<p className="text-muted-foreground text-xs">
+							Leave a size blank for the daemon default. A custom size or an
+							attached volume boots on demand instead of coming from the warm
+							pool.
+						</p>
+						<div className="space-y-2">
+							<label className="text-sm" htmlFor="new-desktop-volume">
+								Volume
+							</label>
+							<Select
+								disabled={busy}
+								onValueChange={setVolume}
+								value={volume || "none"}
+							>
+								<SelectTrigger
+									aria-label="Volume to attach"
+									className="w-full"
+									id="new-desktop-volume"
+									size="sm"
+								>
+									<SelectValue />
+								</SelectTrigger>
+								<SelectContent>
+									<SelectItem value="none">
+										None — ephemeral guest disk
+									</SelectItem>
+									{volumes.map((v) => (
+										<SelectItem key={v.name} value={v.name}>
+											{v.name}
+										</SelectItem>
+									))}
+								</SelectContent>
+							</Select>
+							<p className="text-muted-foreground text-xs">
+								A volume keeps your files across destroys; without one the guest
+								disk is thrown away.
+							</p>
 						</div>
 						<div className="space-y-2">
 							<label className="text-sm" htmlFor="new-desktop-allow">

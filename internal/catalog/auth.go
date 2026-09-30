@@ -225,9 +225,27 @@ func (d *DB) SetPasswordHash(id, hash string) error {
 }
 
 // DeleteUser removes a user. Memberships, sessions and API tokens cascade.
+// DeleteUser removes a user and everything pointing at them: memberships,
+// sessions and API tokens. Leaving those rows behind would keep ghosts in
+// member lists and owner counts (the foreign keys only cascade from workspaces
+// and the users row itself).
 func (d *DB) DeleteUser(id string) error {
-	_, err := d.db.Exec(`DELETE FROM users WHERE id = ?`, id)
-	return err
+	tx, err := d.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	for _, q := range []string{
+		`DELETE FROM memberships WHERE user_id = ?`,
+		`DELETE FROM sessions WHERE user_id = ?`,
+		`DELETE FROM api_tokens WHERE user_id = ?`,
+		`DELETE FROM users WHERE id = ?`,
+	} {
+		if _, err := tx.Exec(q, id); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // --- workspaces ---

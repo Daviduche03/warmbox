@@ -95,8 +95,15 @@ type Config struct {
 	// (the host's vmnet/NAT gateway, e.g. 192.168.64.1).
 	HostAddr string
 
-	// APIAddr is the listen address for the orchestrator's HTTP server.
+	// APIAddr is the listen address for the orchestrator's HTTP server
+	// (dashboard + API). Loopback by default: nothing outside this host should
+	// reach the dashboard.
 	APIAddr string
+
+	// GuestAddr is where guests post readiness callbacks. Empty derives it from
+	// HostAddr and APIAddr's port; "off" disables the listener (only correct
+	// when APIAddr already answers on the gateway address).
+	GuestAddr string
 
 	// MemMiB / CPUs size each microVM.
 	MemMiB uint
@@ -165,7 +172,7 @@ func DefaultConfig() *Config {
 		ImageDir:          filepath.Join(wd, "images"),
 		NoVNCDir:          filepath.Join(wd, "novnc"),
 		HostAddr:          "192.168.64.1",
-		APIAddr:           ":7070",
+		APIAddr:           "127.0.0.1:7070",
 		MemMiB:            4096,
 		CPUs:              4,
 		Display:           "1280x800",

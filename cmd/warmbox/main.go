@@ -7,8 +7,6 @@ import (
 	"archive/tar"
 	"compress/gzip"
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -175,12 +173,14 @@ Usage:
   warmbox service <cmd>     Manage the background daemon (launchd on macOS,
                             systemd on Linux):
                             install | start | stop | restart | status
-  warmbox setup             Check host prerequisites, fetch noVNC
+  warmbox setup             Check prerequisites, then fetch noVNC and the guest image
   warmbox login             Sign in as a user (stores a session)
   warmbox logout            End the CLI session
   warmbox create            Provision a desktop, print its noVNC URL
   warmbox images            List the named guest images the daemon can boot
   warmbox image pack <name> Pack an image to <name>.tar.zst (compressed)
+  warmbox image pack --builtin -o <file>
+                            Pack the built-in image for release
   warmbox image pull <name> <file|url>
                             Expand a packed image into the images directory
   warmbox image list        List the local images (offline)
@@ -238,7 +238,8 @@ func addCommonFlags(fs *flag.FlagSet, cfg *desktop.Config) {
 	fs.StringVar(&cfg.NoVNCDir, "novnc", cfg.NoVNCDir, "noVNC asset directory")
 	fs.StringVar(&cfg.VfkitPath, "vfkit", cfg.VfkitPath, "vfkit binary")
 	fs.StringVar(&cfg.Backend, "backend", cfg.Backend, "hypervisor backend (vfkit)")
-	fs.StringVar(&cfg.APIAddr, "addr", cfg.APIAddr, "HTTP listen address")
+	fs.StringVar(&cfg.APIAddr, "addr", cfg.APIAddr, "HTTP listen address (dashboard + API)")
+	fs.StringVar(&cfg.GuestAddr, "guest-addr", cfg.GuestAddr, "address for guest readiness callbacks (default: the guest gateway on the daemon port; \"off\" disables)")
 	fs.StringVar(&cfg.HostAddr, "host", cfg.HostAddr, "address guests use to reach this host")
 	fs.UintVar(&cfg.MemMiB, "mem", cfg.MemMiB, "memory per VM (MiB)")
 	fs.UintVar(&cfg.CPUs, "cpus", cfg.CPUs, "vCPUs per VM")
@@ -308,21 +309,10 @@ func preflightAddr(addr string) {
 	fatal("can't listen on %s: %v", addr, lerr)
 }
 
-// serviceToken returns the daemon token from ~/.warmbox/token, generating one
-// if it does not exist yet.
-func serviceToken() string {
-	home, _ := os.UserHomeDir()
-	p := filepath.Join(home, ".warmbox", "token")
-	if b, err := os.ReadFile(p); err == nil && strings.TrimSpace(string(b)) != "" {
-		return strings.TrimSpace(string(b))
-	}
-	buf := make([]byte, 24)
-	_, _ = rand.Read(buf)
-	tok := hex.EncodeToString(buf)
-	_ = os.MkdirAll(filepath.Dir(p), 0o755)
-	_ = os.WriteFile(p, []byte(tok+"\n"), 0o600)
-	return tok
-}
+// serviceToken used to mint the shared daemon token at ~/.warmbox/token. The
+// daemon now ignores --token entirely (accounts own access), so new service
+// installs no longer write it; the flag itself stays accepted so plists written
+// by older versions keep starting.
 
 func writeLaunchAgent(cfg *desktop.Config, pool int) error {
 	if vf, err := exec.LookPath(cfg.VfkitPath); err == nil {
@@ -341,7 +331,6 @@ func writeLaunchAgent(cfg *desktop.Config, pool int) error {
 		"--pool", fmt.Sprint(pool),
 		"--pool-idle-timeout", cfg.PoolIdleTimeout.String(),
 		"--vfkit", cfg.VfkitPath,
-		"--token", serviceToken(),
 	}
 	if cfg.Image != "" {
 		args = append(args, "--image", cfg.Image)
@@ -394,7 +383,8 @@ func serviceLaunchd(args []string) {
 	pool := 0
 	fs := flag.NewFlagSet("service", flag.ExitOnError)
 	fs.StringVar(&cfg.WorkDir, "workdir", cfg.WorkDir, "state directory")
-	fs.StringVar(&cfg.APIAddr, "addr", cfg.APIAddr, "HTTP listen address")
+	fs.StringVar(&cfg.APIAddr, "addr", cfg.APIAddr, "HTTP listen address (dashboard + API)")
+	fs.StringVar(&cfg.GuestAddr, "guest-addr", cfg.GuestAddr, "address for guest readiness callbacks (default: the guest gateway on the daemon port; \"off\" disables)")
 	fs.StringVar(&cfg.Image, "image", cfg.Image, "default image")
 	fs.IntVar(&pool, "pool", 0, "warm pool size (0 = boot on demand; 1+ = instant create, holds RAM)")
 	sub := ""
@@ -640,7 +630,8 @@ func serviceSystemd(args []string) {
 	backend := "qemu"
 	fs := flag.NewFlagSet("service", flag.ExitOnError)
 	fs.StringVar(&cfg.WorkDir, "workdir", cfg.WorkDir, "state directory")
-	fs.StringVar(&cfg.APIAddr, "addr", cfg.APIAddr, "HTTP listen address")
+	fs.StringVar(&cfg.APIAddr, "addr", cfg.APIAddr, "HTTP listen address (dashboard + API)")
+	fs.StringVar(&cfg.GuestAddr, "guest-addr", cfg.GuestAddr, "address for guest readiness callbacks (default: the guest gateway on the daemon port; \"off\" disables)")
 	fs.StringVar(&cfg.Image, "image", cfg.Image, "default image")
 	fs.IntVar(&pool, "pool", 0, "warm pool size (0 = boot on demand; 1+ = instant create, holds RAM)")
 	fs.StringVar(&backend, "backend", backend, "hypervisor backend (qemu on Linux)")
@@ -761,7 +752,7 @@ func cmdDaemon(args []string) {
 	// built-in guest artifacts are only required when there is no image.
 	if len(images) == 0 && cfg.EFIDisk == "" {
 		if _, err := os.Stat(cfg.KernelPath); err != nil {
-			fatal("missing guest kernel %s — build it with ./deploy/guest/build.sh", cfg.KernelPath)
+			fatal("missing guest kernel %s\n  run `warmbox setup` to download the guest image\n  (or build one with ./deploy/guest/build.sh)", cfg.KernelPath)
 		}
 		// Boot needs an overlay base, an ext4 disk, or the all-RAM initramfs.
 		haveOverlay := stat(cfg.SquashPath) && stat(cfg.OverlayInitrdPath)
@@ -833,13 +824,79 @@ func cmdDaemon(args []string) {
 			stop()
 		}
 	}()
+	// Guests dial the gateway address, never loopback, so their readiness
+	// callbacks get a separate listener that serves nothing else. Keeping the
+	// dashboard on --addr means it is not reachable from the network.
+	guestSrv := serveGuestCallbacks(apiSrv, cfg)
 
 	<-ctx.Done()
 	fmt.Fprintln(os.Stderr, "warmbox: shutting down")
 	shutCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	_ = srv.Shutdown(shutCtx)
+	if guestSrv != nil {
+		_ = guestSrv.Shutdown(shutCtx)
+	}
 	mgr.Shutdown()
+}
+
+// serveGuestCallbacks listens for guest readiness callbacks on the gateway
+// address guests are told to dial. The vmnet interface may not exist until the
+// first VM boots, so it retries instead of failing startup. Returns the server
+// (nil when no separate listener is needed) for shutdown.
+func serveGuestCallbacks(apiSrv *api.Server, cfg *desktop.Config) *http.Server {
+	addr := guestListenAddr(cfg)
+	if addr == "" {
+		return nil
+	}
+	srv := &http.Server{Handler: apiSrv.GuestHandler()}
+	go func() {
+		warned := false
+		for {
+			ln, err := net.Listen("tcp", addr)
+			if err == nil {
+				fmt.Fprintf(os.Stderr, "warmbox: guest callbacks on %s\n", addr)
+				if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
+					fmt.Fprintf(os.Stderr, "warmbox: guest listener: %v\n", err)
+				}
+				return
+			}
+			if !warned {
+				fmt.Fprintf(os.Stderr, "warmbox: waiting for %s before guests can report ready (%v)\n", addr, err)
+				warned = true
+			}
+			time.Sleep(2 * time.Second)
+		}
+	}()
+	return srv
+}
+
+// guestListenAddr is where the guest-only listener belongs: the gateway guests
+// dial, on the daemon's port. Empty when the main listener already covers it
+// (wildcard bind, or the same address) or when it has been turned off.
+func guestListenAddr(cfg *desktop.Config) string {
+	if cfg.GuestAddr == "off" {
+		return ""
+	}
+	if cfg.GuestAddr != "" {
+		return cfg.GuestAddr
+	}
+	if cfg.HostAddr == "" {
+		return ""
+	}
+	host, port, err := net.SplitHostPort(cfg.APIAddr)
+	if err != nil || port == "" {
+		return ""
+	}
+	if host == "" {
+		// A wildcard bind already answers on the gateway address.
+		return ""
+	}
+	addr := net.JoinHostPort(cfg.HostAddr, port)
+	if addr == cfg.APIAddr {
+		return ""
+	}
+	return addr
 }
 
 // newVolumeStore builds a volume store backed by the configured cloud remote
@@ -909,35 +966,62 @@ func backfillCatalog(ctx context.Context, cat *catalog.DB, store *volume.Store, 
 	}
 }
 
+// Where the prebuilt guest image comes from. The image is built per host arch —
+// the guest has to match the hypervisor the host can offer — and published under
+// the same tag as the binary, next to its .sha256.
+const (
+	releaseRepo  = "Daviduche03/warmbox"
+	imagePattern = "warmbox-image-%s-%s.tar.zst" // version, GOARCH
+)
+
+func defaultImageURL(version, arch string) string {
+	return fmt.Sprintf("https://github.com/%s/releases/download/%s/%s",
+		releaseRepo, version, fmt.Sprintf(imagePattern, version, arch))
+}
+
+// builtinImagePresent reports whether the files the daemon needs to boot are
+// already in place.
+func builtinImagePresent(cfg *desktop.Config) bool {
+	for _, p := range []string{cfg.KernelPath, cfg.InitrdPath, cfg.SquashPath} {
+		if _, err := os.Stat(p); err != nil {
+			return false
+		}
+	}
+	return true
+}
+
 func cmdSetup(args []string) {
 	cfg := desktop.DefaultConfig()
 	fs := flag.NewFlagSet("setup", flag.ExitOnError)
 	fs.StringVar(&cfg.WorkDir, "workdir", cfg.WorkDir, "state directory")
 	fs.StringVar(&cfg.KernelPath, "kernel", cfg.KernelPath, "path to uncompressed vmlinux")
 	fs.StringVar(&cfg.InitrdPath, "initrd", cfg.InitrdPath, "path to initramfs.zst")
+	fs.StringVar(&cfg.SquashPath, "squash", cfg.SquashPath, "path to rootfs.squashfs")
 	fs.StringVar(&cfg.NoVNCDir, "novnc", cfg.NoVNCDir, "noVNC asset directory")
+	fs.StringVar(&cfg.Backend, "backend", cfg.Backend, "hypervisor backend (vfkit, qemu)")
+	imageURL := fs.String("image-url", "", "guest image archive (default: the release for this version)")
+	imageSHA := fs.String("image-sha256", "", "expected sha256 (default: fetched from <url>.sha256)")
+	force := fs.Bool("force", false, "re-download the guest image even if it is already installed")
+	noImage := fs.Bool("no-image", false, "skip the guest image; check everything else")
 	_ = fs.Parse(args)
 
 	if err := cfg.EnsureDirs(); err != nil {
 		fatal("Error: %v", err)
 	}
 
-	if _, err := exec.LookPath(cfg.VfkitPath); err != nil {
-		fmt.Fprintf(os.Stderr, "✗ vfkit not found — install it: brew install vfkit\n")
-	} else {
-		fmt.Fprintf(os.Stderr, "✓ vfkit found\n")
-	}
+	fmt.Fprintln(os.Stderr, "warmbox setup")
+	checkHypervisor(cfg)
 
-	for _, p := range []string{cfg.KernelPath, cfg.InitrdPath} {
-		if _, err := os.Stat(p); err == nil {
-			fmt.Fprintf(os.Stderr, "✓ %s\n", p)
-		} else {
-			fmt.Fprintf(os.Stderr, "✗ missing %s\n", p)
+	switch {
+	case *noImage:
+		fmt.Fprintln(os.Stderr, "… skipping the guest image (--no-image)")
+	case !*force && builtinImagePresent(cfg):
+		fmt.Fprintf(os.Stderr, "✓ guest image in %s\n", cfg.WorkDir)
+	default:
+		if err := installGuestImage(cfg, *imageURL, *imageSHA, *force); err != nil {
+			fmt.Fprintf(os.Stderr, "✗ guest image: %v\n", err)
 		}
 	}
-	fmt.Fprintf(os.Stderr, "  build the guest image with:\n")
-	fmt.Fprintf(os.Stderr, "    ./deploy/guest/build.sh        # builds + extracts to %s\n", cfg.WorkDir)
-	fmt.Fprintf(os.Stderr, "  (it produces vmlinux and initramfs.zst in the workdir)\n")
 
 	if _, err := os.Stat(filepath.Join(cfg.NoVNCDir, "vnc.html")); err == nil {
 		fmt.Fprintf(os.Stderr, "✓ noVNC at %s\n", cfg.NoVNCDir)
@@ -949,6 +1033,79 @@ func cmdSetup(args []string) {
 			fmt.Fprintf(os.Stderr, "✓ noVNC installed\n")
 		}
 	}
+
+	fmt.Fprintln(os.Stderr, "\nnext:")
+	fmt.Fprintln(os.Stderr, "  warmbox service install --pool 1   # run the daemon in the background")
+	fmt.Fprintln(os.Stderr, "  warmbox create                     # a desktop; prints its URL")
+}
+
+// checkHypervisor reports whether the hypervisor this host would actually use is
+// present. On Linux the default backend is still vfkit (macOS only), so say what
+// the daemon needs rather than checking a binary that cannot work there.
+func checkHypervisor(cfg *desktop.Config) {
+	switch {
+	case cfg.Backend == "qemu":
+		checkQEMU()
+	case runtime.GOOS == "darwin":
+		if _, err := exec.LookPath(cfg.VfkitPath); err != nil {
+			fmt.Fprintln(os.Stderr, "✗ vfkit not found — install it: brew install vfkit")
+		} else {
+			fmt.Fprintln(os.Stderr, "✓ vfkit found")
+		}
+	default:
+		fmt.Fprintln(os.Stderr, "! default backend is vfkit (macOS only) — run the daemon with --backend qemu")
+		checkQEMU()
+	}
+}
+
+func checkQEMU() {
+	bin := desktop.QEMUSystemBinary()
+	if _, err := exec.LookPath(bin); err != nil {
+		fmt.Fprintf(os.Stderr, "✗ %s not found — install QEMU (e.g. apt install qemu-system-x86)\n", bin)
+		return
+	}
+	fmt.Fprintf(os.Stderr, "✓ %s found\n", bin)
+	if _, err := os.Stat("/dev/kvm"); err != nil {
+		fmt.Fprintln(os.Stderr, "✗ /dev/kvm missing — enable virtualization (or join the kvm group)")
+	} else {
+		fmt.Fprintln(os.Stderr, "✓ /dev/kvm")
+	}
+}
+
+// installGuestImage downloads the guest image archive and installs it into the
+// directory the daemon will read the image from, verifying the published
+// checksum first.
+func installGuestImage(cfg *desktop.Config, url, sha string, force bool) error {
+	// The image files live next to the kernel. Use that directory rather than
+	// WorkDir: a custom --workdir does not move the image paths, and installing
+	// somewhere the daemon never looks would look like success and then fail at
+	// boot.
+	dir := filepath.Dir(cfg.KernelPath)
+	for _, p := range []string{cfg.InitrdPath, cfg.SquashPath} {
+		if filepath.Dir(p) != dir {
+			return fmt.Errorf("image paths span two directories (%s and %s);\n  point --kernel/--initrd/--squash at one directory, or install the image yourself", dir, filepath.Dir(p))
+		}
+	}
+
+	if url == "" {
+		url = defaultImageURL(version, runtime.GOARCH)
+	}
+	if force {
+		_ = os.Remove(filepath.Join(dir, ".image-download.tar.zst"))
+	}
+	if sha == "" {
+		s, err := desktop.FetchChecksum(url + ".sha256")
+		if err != nil {
+			return fmt.Errorf("no prebuilt guest image for %s/%s:\n  %v\n  build one yourself:  ./deploy/guest/build.sh\n  (or pass --image-url and --image-sha256)", version, runtime.GOARCH, err)
+		}
+		sha = s
+	}
+	fmt.Fprintf(os.Stderr, "… fetching the guest image for %s (several hundred MB, resumable)\n  %s\n", runtime.GOARCH, url)
+	if err := desktop.FetchBuiltin(dir, url, sha, os.Stderr); err != nil {
+		return fmt.Errorf("%v\n  (re-run to resume; pass --force to start clean)", err)
+	}
+	fmt.Fprintf(os.Stderr, "✓ guest image installed in %s\n", dir)
+	return nil
 }
 
 const noVNCTarball = "https://github.com/novnc/noVNC/archive/refs/tags/v1.6.0.tar.gz"
@@ -1289,17 +1446,40 @@ func cmdImage(args []string) {
 	case "pack":
 		fs := flag.NewFlagSet("image pack", flag.ExitOnError)
 		out := fs.String("o", "", "output path (default <images>/<name>.tar.zst)")
+		builtin := fs.Bool("builtin", false, "pack the built-in image (the files directly in the workdir)")
 		_ = fs.Parse(args[1:])
 		rest := fs.Args()
-		if len(rest) < 1 {
-			fatal("Usage: warmbox image pack <name> [-o out.tar.zst]")
+
+		var (
+			p     string
+			label string
+			err   error
+		)
+		if *builtin {
+			label = "built-in image"
+			p, err = desktop.PackBuiltin(cfg.WorkDir, *out)
+		} else {
+			if len(rest) < 1 {
+				fatal("Usage: warmbox image pack <name> [-o out.tar.zst]\n       warmbox image pack --builtin -o out.tar.zst")
+			}
+			label = rest[0]
+			p, err = desktop.Pack(cfg.ImageDir, rest[0], *out)
 		}
-		p, err := desktop.Pack(cfg.ImageDir, rest[0], *out)
 		if err != nil {
 			fatal("Error: %v", err)
 		}
+		// Ship the checksum alongside, so `warmbox setup` can verify a download.
+		sum, err := desktop.SHA256File(p)
+		if err != nil {
+			fatal("Error: %v", err)
+		}
+		side := p + ".sha256"
+		if err := os.WriteFile(side, []byte(sum+"  "+filepath.Base(p)+"\n"), 0o644); err != nil {
+			fatal("Error writing %s: %v", side, err)
+		}
 		fi, _ := os.Stat(p)
-		fmt.Fprintf(os.Stderr, "packed %s -> %s (%.2f GiB)\n", rest[0], p, float64(fi.Size())/(1<<30))
+		fmt.Fprintf(os.Stderr, "packed %s -> %s (%.2f GiB)\n  sha256 %s\n  wrote %s\n",
+			label, p, float64(fi.Size())/(1<<30), sum, side)
 	case "pull":
 		fs := flag.NewFlagSet("image pull", flag.ExitOnError)
 		_ = fs.Parse(args[1:])

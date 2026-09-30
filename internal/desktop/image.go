@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 )
 
 // BuiltinImage is the name Images() reports for the built-in image: the Alpine +
@@ -117,12 +118,38 @@ func (m *Manager) Images() []string {
 	return append(out, named...)
 }
 
+// validImageName rejects anything that could step outside the images directory
+// (or name a file rather than a directory).
+func validImageName(name string) bool {
+	if name == "" || name == "." || name == ".." {
+		return false
+	}
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case r == '-', r == '_', r == '.':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 // resolveImage returns how to boot a named image, plus any per-image overrides.
 func (m *Manager) resolveImage(name string) (resolved, error) {
+	if !validImageName(name) {
+		return resolved{}, fmt.Errorf("invalid image name %q", name)
+	}
 	dir := filepath.Join(m.cfg.ImageDir, name)
+	// Belt and braces: whatever the name, the directory we read from must stay
+	// inside ImageDir. A request-supplied name is not a path.
+	if rel, err := filepath.Rel(m.cfg.ImageDir, dir); err != nil ||
+		rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return resolved{}, fmt.Errorf("invalid image name %q", name)
+	}
 	kind, ok := imageKind(dir)
 	if !ok {
-		return resolved{}, fmt.Errorf("unknown image %q (need disk.raw, or vmlinux + rootfs.squashfs + initramfs-overlay in %s)", name, dir)
+		return resolved{}, fmt.Errorf("unknown image %q", name)
 	}
 	r := resolved{name: name, kind: kind}
 	switch kind {

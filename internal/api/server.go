@@ -170,6 +170,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/workspaces", s.createWorkspace)
 	mux.HandleFunc("POST /api/workspaces/{id}/members", s.addWorkspaceMember)
 	mux.HandleFunc("DELETE /api/workspaces/{id}/members/{userId}", s.removeWorkspaceMember)
+	mux.HandleFunc("GET /api/settings", s.getSettings)
+	mux.HandleFunc("PATCH /api/settings", s.updateSettings)
 	mux.HandleFunc("GET /api/tokens", s.listTokens)
 	mux.HandleFunc("POST /api/tokens", s.createToken)
 	mux.HandleFunc("DELETE /api/tokens/{id}", s.deleteToken)
@@ -193,7 +195,40 @@ func (s *Server) Handler() http.Handler {
 	// The middleware itself decides what is public (shell, setup, login,
 	// readiness) and what needs an identity, so it always wraps the mux —
 	// even with no shared token configured.
-	return s.withAuth(mux)
+	return s.securityHeaders(s.withAuth(mux))
+}
+
+// GuestHandler serves just the callback guests make (readiness), for the
+// guest-facing listener. Guests hold no credentials, so nothing here may read
+// or change user state, and the source is still checked.
+func (s *Server) GuestHandler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /internal/ready", func(w http.ResponseWriter, r *http.Request) {
+		if !s.guestSource(r) {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		s.ready(w, r)
+	})
+	return mux
+}
+
+// securityHeaders applies conservative browser defaults to every response: no
+// framing of the dashboard, no MIME sniffing, no referrer leakage, and a CSP
+// the app satisfies (same-origin scripts, inline styles for the charts,
+// same-origin websockets for the console, blob workers for noVNC).
+func (s *Server) securityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("Content-Security-Policy",
+			"default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'self'; "+
+				"img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; "+
+				"script-src 'self'; worker-src 'self' blob:; connect-src 'self' ws: wss:")
+		h.Set("Referrer-Policy", "no-referrer")
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("X-Frame-Options", "SAMEORIGIN")
+		next.ServeHTTP(w, r)
+	})
 }
 
 // withAuth gates every stateful route. The dashboard shell stays public — it
@@ -269,6 +304,16 @@ func isShellPath(p string) bool {
 	return strings.Contains(base, ".")
 }
 
+// fail reports an operational failure without echoing internals: the detail
+// goes to the daemon log, the caller gets a generic message. Use it for
+// store/db/fs errors; our own validation messages are safe to return verbatim.
+func (s *Server) fail(w http.ResponseWriter, code int, msg string, err error) {
+	if err != nil && s.log != nil {
+		fmt.Fprintf(s.log, "api: %s: %v\n", msg, err)
+	}
+	writeJSON(w, code, map[string]string{"error": msg})
+}
+
 func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
@@ -299,46 +344,118 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Volume string   `json:"volume"`
 		Image  string   `json:"image"`
+		CPUs   uint     `json:"cpus"`
+		MemMiB uint     `json:"mem_mib"`
 		Allow  []string `json:"allow"`
 		Deny   []string `json:"deny"`
 	}
 	if r.Body != nil {
 		_ = json.NewDecoder(r.Body).Decode(&req)
 	}
+	if !validResources(w, req.CPUs, req.MemMiB) {
+		return
+	}
+	if !s.desktopQuotaOK(w, r) {
+		return
+	}
 	pol := s.effectivePolicy(req.Allow, req.Deny)
-	if req.Volume != "" {
-		s.createWithVolume(w, r, req.Volume, pol)
-		return
+	custom := req.CPUs > 0 || req.MemMiB > 0
+	switch {
+	case req.Volume != "":
+		s.createWithVolume(w, r, req.Volume, pol, req.CPUs, req.MemMiB)
+	case req.Image != "":
+		s.createImage(w, r, req.Image, pol, req.CPUs, req.MemMiB)
+	case custom:
+		// Default image, explicitly sized: boot it rather than hand out a
+		// default-sized warm VM.
+		s.createImage(w, r, "", pol, req.CPUs, req.MemMiB)
+	default:
+		vm, err := s.pool.Acquire(r.Context())
+		if err != nil {
+			s.fail(w, http.StatusServiceUnavailable, "could not start a desktop", err)
+			return
+		}
+		ws, _ := s.callerScope(r)
+		vm.SetWorkspace(ws)
+		s.setPolicy(vm.ID, pol)
+		s.recordDesktop(vm.ID, "", "ready", "", 0, ws)
+		writeJSON(w, http.StatusCreated, map[string]any{
+			"id":  vm.ID,
+			"vnc": "/d/" + vm.ID,
+			"ws":  "/websockify/" + vm.ID,
+		})
 	}
-	if req.Image != "" {
-		s.createImage(w, r, req.Image, pol)
-		return
-	}
+}
 
-	vm, err := s.pool.Acquire(r.Context())
-	if err != nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
-		return
+// Resource requests are bounded: a member may size their own desktop, not hand
+// the host something absurd.
+const (
+	maxDesktopCPUs   = 32
+	maxDesktopMemMiB = 65536
+	minDesktopMemMiB = 256
+)
+
+func validResources(w http.ResponseWriter, cpus, mem uint) bool {
+	if cpus > maxDesktopCPUs {
+		writeJSON(w, http.StatusBadRequest,
+			map[string]string{"error": fmt.Sprintf("cpus must be 1-%d", maxDesktopCPUs)})
+		return false
+	}
+	if mem != 0 && (mem < minDesktopMemMiB || mem > maxDesktopMemMiB) {
+		writeJSON(w, http.StatusBadRequest,
+			map[string]string{"error": fmt.Sprintf("memory must be %d-%d MiB", minDesktopMemMiB, maxDesktopMemMiB)})
+		return false
+	}
+	return true
+}
+
+// desktopQuotaOK enforces the per-workspace desktop limit set in Settings
+// (0 means unlimited).
+func (s *Server) desktopQuotaOK(w http.ResponseWriter, r *http.Request) bool {
+	limit := s.desktopLimit()
+	if limit <= 0 {
+		return true
 	}
 	ws, _ := s.callerScope(r)
-	vm.SetWorkspace(ws)
-	s.setPolicy(vm.ID, pol)
-	s.recordDesktop(vm.ID, "", "ready", "", 0, ws)
-	writeJSON(w, http.StatusCreated, map[string]any{
-		"id":  vm.ID,
-		"vnc": "/d/" + vm.ID,
-		"ws":  "/websockify/" + vm.ID,
-	})
+	n := 0
+	for _, info := range s.mgr.List() {
+		if info.Workspace != "" && info.Workspace == ws {
+			n++
+		}
+	}
+	if n >= limit {
+		writeJSON(w, http.StatusTooManyRequests, map[string]string{
+			"error": fmt.Sprintf("this workspace already holds %d desktop(s), its limit; destroy one or raise the limit in Settings", limit),
+		})
+		return false
+	}
+	return true
+}
+
+// desktopLimit reads the configured cap; 0 (the default) is unlimited.
+func (s *Server) desktopLimit() int {
+	if s.catalog == nil {
+		return 0
+	}
+	v, err := s.catalog.GetSetting(catalog.SettingMaxDesktopsPerWorkspace)
+	if err != nil {
+		return 0
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(v))
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
 }
 
 // createImage provisions a desktop from a named image. If it is the daemon's
-// default image it can come from the warm pool (instant); other images boot on
-// demand (each is a different disk).
-func (s *Server) createImage(w http.ResponseWriter, r *http.Request, name string, pol egress.Policy) {
-	if desktop.SameImage(name, s.cfg.Image) {
+// default image and the caller asked for no particular size it can come from
+// the warm pool (instant); anything else boots on demand.
+func (s *Server) createImage(w http.ResponseWriter, r *http.Request, name string, pol egress.Policy, cpus, mem uint) {
+	if desktop.SameImage(name, s.cfg.Image) && cpus == 0 && mem == 0 {
 		vm, err := s.pool.Acquire(r.Context())
 		if err != nil {
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+			s.fail(w, http.StatusServiceUnavailable, "could not start a desktop", err)
 			return
 		}
 		ws, _ := s.callerScope(r)
@@ -354,9 +471,11 @@ func (s *Server) createImage(w http.ResponseWriter, r *http.Request, name string
 	}
 
 	id := desktop.NewID()
-	vm, err := s.mgr.StartImage(id, "", "", name)
+	vm, err := s.mgr.StartDesktop(desktop.StartSpec{
+		ID: id, ImageName: name, CPUs: cpus, MemMiB: mem,
+	})
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		s.fail(w, http.StatusBadRequest, "could not boot that image", err)
 		return
 	}
 	ws, _ := s.callerScope(r)
@@ -367,7 +486,7 @@ func (s *Server) createImage(w http.ResponseWriter, r *http.Request, name string
 	defer cancel()
 	if _, err := s.mgr.WaitReady(wctx, vm.ID); err != nil {
 		_ = s.mgr.Destroy(vm.ID)
-		writeJSON(w, http.StatusGatewayTimeout, map[string]string{"error": err.Error()})
+		s.fail(w, http.StatusGatewayTimeout, "the desktop did not become ready in time", err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{
@@ -385,7 +504,7 @@ func (s *Server) images(w http.ResponseWriter, r *http.Request) {
 // createWithVolume boots a VM whose writable layer is a persistent volume.
 // Volume-backed VMs cannot come from the warm pool (the disk must be attached
 // before boot), so they cold-boot. The volume must be visible to the caller.
-func (s *Server) createWithVolume(w http.ResponseWriter, r *http.Request, name string, pol egress.Policy) {
+func (s *Server) createWithVolume(w http.ResponseWriter, r *http.Request, name string, pol egress.Policy, cpus, mem uint) {
 	if !s.volumesEnabled(w) {
 		return
 	}
@@ -399,7 +518,7 @@ func (s *Server) createWithVolume(w http.ResponseWriter, r *http.Request, name s
 	ctx := r.Context()
 	image, err := s.volumes.EnsureLocal(ctx, name)
 	if err != nil {
-		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "preparing volume: " + err.Error()})
+		s.fail(w, http.StatusBadGateway, "could not prepare the volume", err)
 		return
 	}
 	id := desktop.NewID()
@@ -407,10 +526,12 @@ func (s *Server) createWithVolume(w http.ResponseWriter, r *http.Request, name s
 		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
 		return
 	}
-	vm, err := s.mgr.StartWithVolume(id, name, image)
+	vm, err := s.mgr.StartDesktop(desktop.StartSpec{
+		ID: id, VolumeName: name, VolumeImage: image, CPUs: cpus, MemMiB: mem,
+	})
 	if err != nil {
 		s.unlockVolume(name, id)
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		s.fail(w, http.StatusInternalServerError, "could not start the desktop", err)
 		return
 	}
 	vm.SetWorkspace(ws)
@@ -420,7 +541,7 @@ func (s *Server) createWithVolume(w http.ResponseWriter, r *http.Request, name s
 	defer cancel()
 	if _, err := s.mgr.WaitReady(wctx, vm.ID); err != nil {
 		_ = s.mgr.Destroy(vm.ID) // destroy hook commits + releases the volume
-		writeJSON(w, http.StatusGatewayTimeout, map[string]string{"error": err.Error()})
+		s.fail(w, http.StatusGatewayTimeout, "the desktop did not become ready in time", err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{
@@ -622,7 +743,7 @@ func (s *Server) agentProxy(w http.ResponseWriter, r *http.Request, id, agentPat
 			},
 		},
 		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, err error) {
-			http.Error(w, "agent error: "+err.Error(), http.StatusBadGateway)
+			s.fail(w, http.StatusBadGateway, "could not reach the desktop's agent", err)
 		},
 	}
 	proxy.ServeHTTP(w, r)
@@ -715,7 +836,7 @@ func (s *Server) expose(w http.ResponseWriter, r *http.Request) {
 			},
 		},
 		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, err error) {
-			http.Error(w, "proxy error: "+err.Error(), http.StatusBadGateway)
+			s.fail(w, http.StatusBadGateway, "could not reach that port on the desktop", err)
 		},
 	}
 	proxy.ServeHTTP(w, r)
@@ -809,6 +930,26 @@ func (s *Server) volumeCreate(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
+	// Cloning copies the source's bytes, so the source has to belong to the
+	// caller: without this a member could clone another workspace's volume (or
+	// snapshot) into their own and then read the files.
+	ws, admin := s.callerScope(r)
+	if s.catalog != nil {
+		if req.From != "" {
+			v, err := s.catalog.GetVolume(req.From)
+			if err != nil || !wsVisible(v.WorkspaceID, ws, admin) {
+				writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown volume"})
+				return
+			}
+		}
+		if req.FromSnapshot != "" {
+			sn, err := s.catalog.GetSnapshot(req.FromSnapshot)
+			if err != nil || !wsVisible(sn.WorkspaceID, ws, admin) {
+				writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown snapshot"})
+				return
+			}
+		}
+	}
 	var m *volume.Meta
 	if req.FromSnapshot != "" {
 		m, err = s.volumes.CreateFromSnapshot(r.Context(), req.Name, req.FromSnapshot)
@@ -819,7 +960,6 @@ func (s *Server) volumeCreate(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
-	ws, _ := s.callerScope(r)
 	if s.catalog != nil {
 		_ = s.catalog.UpsertVolume(&catalog.Volume{
 			Name:        m.Name,
@@ -848,7 +988,7 @@ func (s *Server) volumeList(w http.ResponseWriter, r *http.Request) {
 			vs, err = s.catalog.ListVolumesInWorkspace(ws)
 		}
 		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			s.fail(w, http.StatusInternalServerError, "could not list volumes", err)
 			return
 		}
 		if vs == nil {
@@ -859,7 +999,7 @@ func (s *Server) volumeList(w http.ResponseWriter, r *http.Request) {
 	}
 	vols, err := s.volumes.List(r.Context())
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		s.fail(w, http.StatusInternalServerError, "could not list volumes", err)
 		return
 	}
 	if vols == nil {
@@ -907,7 +1047,7 @@ func (s *Server) volumeDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.volumes.Delete(r.Context(), name); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		s.fail(w, http.StatusInternalServerError, "could not delete volume", err)
 		return
 	}
 	if s.catalog != nil {
@@ -1002,7 +1142,7 @@ func (s *Server) snapshotList(w http.ResponseWriter, r *http.Request) {
 			snaps, err = s.catalog.ListSnapshotsInWorkspace(ws, r.URL.Query().Get("volume"))
 		}
 		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			s.fail(w, http.StatusInternalServerError, "could not list snapshots", err)
 			return
 		}
 		if snaps == nil {
@@ -1013,7 +1153,7 @@ func (s *Server) snapshotList(w http.ResponseWriter, r *http.Request) {
 	}
 	snaps, err := s.volumes.ListSnapshots(r.Context())
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		s.fail(w, http.StatusInternalServerError, "could not list snapshots", err)
 		return
 	}
 	if snaps == nil {
@@ -1027,8 +1167,18 @@ func (s *Server) snapshotDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := r.PathValue("id")
+	// Deleting is destructive, so prove the snapshot is the caller's before
+	// touching it; a hidden one 404s like every other scoped resource.
+	if s.catalog != nil {
+		ws, admin := s.callerScope(r)
+		sn, err := s.catalog.GetSnapshot(id)
+		if err != nil || !wsVisible(sn.WorkspaceID, ws, admin) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown snapshot"})
+			return
+		}
+	}
 	if err := s.volumes.DeleteSnapshot(r.Context(), id); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		s.fail(w, http.StatusInternalServerError, "could not delete snapshot", err)
 		return
 	}
 	if s.catalog != nil {

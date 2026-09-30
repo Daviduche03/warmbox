@@ -263,7 +263,8 @@ func (b *qemuBackend) Capabilities() Caps {
 	return Caps{GUI: true, SharedFS: true, Snapshot: false, Pause: true}
 }
 
-func qemuSystemBinary() string {
+// QEMUSystemBinary is the qemu-system-* binary for this host architecture.
+func QEMUSystemBinary() string {
 	if runtime.GOARCH == "arm64" {
 		return "qemu-system-aarch64"
 	}
@@ -276,7 +277,7 @@ func (b *qemuBackend) Launch(spec LaunchSpec) (*Instance, error) {
 	}
 	bin := b.path
 	if bin == "" {
-		bin = qemuSystemBinary()
+		bin = QEMUSystemBinary()
 	}
 
 	// QEMU user networking can't be reached host->guest, so forward host ports to

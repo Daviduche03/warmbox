@@ -22,10 +22,15 @@ import (
 // packMembers are the files that make up a packed image: either an EFI disk
 // (disk.raw [+ efi-vars.fd]) or an overlay image (vmlinux + rootfs.squashfs +
 // initramfs-overlay), plus an optional meta.json. Missing members are skipped.
+// It doubles as the allow-list for extraction, so a bundle can never write an
+// unexpected path.
 var packMembers = []string{
 	"disk.raw", "efi-vars.fd", "meta.json",
 	"vmlinux", "rootfs.squashfs", "initramfs-overlay",
 	"initramfs.zst", "initramfs-virt",
+	// volume-base.img is the sparse ext4 seed new volumes are cloned from. It
+	// belongs to the built-in image and is ~2 MB when compressed.
+	"volume-base.img",
 }
 
 // isPackableImage reports whether dir holds a bootable image.
@@ -53,7 +58,26 @@ func Pack(imageDir, name, out string) (string, error) {
 	if out == "" {
 		out = filepath.Join(imageDir, name+".tar.zst")
 	}
+	return packFrom(dir, out)
+}
 
+// PackBuiltin writes the built-in image — the files that sit directly in the
+// workdir, not under images/<name> — as one archive, so it can ship as a single
+// release artifact.
+func PackBuiltin(workDir, out string) (string, error) {
+	if out == "" {
+		return "", fmt.Errorf("an output path is required")
+	}
+	for _, m := range []string{"vmlinux", "initramfs.zst", "rootfs.squashfs"} {
+		if !packExists(filepath.Join(workDir, m)) {
+			return "", fmt.Errorf("built-in image is incomplete: %s is missing", filepath.Join(workDir, m))
+		}
+	}
+	return packFrom(workDir, out)
+}
+
+// packFrom archives the packable members of dir (skipping missing ones).
+func packFrom(dir, out string) (string, error) {
 	f, err := os.Create(out)
 	if err != nil {
 		return "", err
@@ -132,12 +156,18 @@ func Pull(imageDir, name, src string) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
+	return extractTo(dir, zr)
+}
 
-	tr := tar.NewReader(zr)
+// extractTo expands a zstd'd tar stream into dir, writing a hole for every
+// all-zero chunk (so a mostly-empty disk image doesn't allocate its full
+// logical size) and ignoring any member outside the allow-list.
+func extractTo(dir string, r io.Reader) error {
+	tr := tar.NewReader(r)
 	for {
 		hdr, err := tr.Next()
 		if err == io.EOF {
-			break
+			return nil
 		}
 		if err != nil {
 			return err
@@ -160,7 +190,6 @@ func Pull(imageDir, name, src string) error {
 		}
 		_ = os.Chmod(out, 0o644)
 	}
-	return nil
 }
 
 // copySparse copies src to dst, leaving a hole (seek) for every all-zero chunk
