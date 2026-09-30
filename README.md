@@ -1,18 +1,22 @@
 # warmbox
 
-Self-hosted GUI desktop microVMs on Apple Silicon, with portable cloud-backed
-disks. Boot a Linux desktop in a second, hand a browser a link, and keep the
-whole machine — files, installed apps, settings — on a disk that lives in object
-storage (S3/R2) and can be cloned or restored on another host.
+Self-hosted GUI desktop microVMs with portable cloud-backed disks. Boot a Linux
+desktop in a second, hand a browser a link, and keep the whole machine — files,
+installed apps, settings — on a disk that lives in object storage (S3/R2) and can
+be cloned or restored on another host.
 
-Two guest images ship out of the box: a tiny **Alpine + XFCE** desktop (~776 MB,
-boots in ~1s from a shared read-only rootfs) and a full **Omarchy**
-(Arch + Hyprland, ~8.4 GB) built as an EFI disk. You pick the OS at create time.
+Two host platforms, both first-class: **macOS on Apple Silicon** (via `vfkit`)
+and **Linux with KVM** (via QEMU). What still differs between them is a
+capability gap, not a preference — see [Requirements](#requirements).
 
-> **Status: experimental alpha.** macOS / Apple Silicon is the primary target;
-> Linux + KVM works for the built-in image. Not hardened: plaintext HTTP with no
-> TLS, the guest's VNC server accepts anyone who can reach it, and the guest runs
-> as **root**. The API itself *is* gated by accounts and workspaces — see
+Two guest images: a tiny **Alpine + XFCE** desktop (~776 MB, boots in ~1s from a
+shared read-only rootfs) and a full **Omarchy** (Arch + Hyprland, ~8.4 GB). You
+pick the OS at create time. The built-in image is a downloadable release
+artifact; named images are built locally for now.
+
+> **Status: experimental alpha.** Not hardened: plaintext HTTP with no TLS, the
+> guest's VNC server accepts anyone who can reach it, and the guest runs as
+> **root**. The API itself *is* gated by accounts and workspaces — see
 > [Limitations](#limitations) — but the transport is unencrypted, so don't expose
 > it to an untrusted network.
 
@@ -22,9 +26,9 @@ boots in ~1s from a shared read-only rootfs) and a full **Omarchy**
   every VM; the writable layer is a per-VM *volume* stored as content-addressed
   chunks in an S3-compatible bucket (via [rclone](https://rclone.org)). Start a VM
   on any host, attach the volume, and it is the same machine.
-- **Fast boot.** Create clones the golden image with an APFS copy-on-write copy
-  (instant, shared blocks) and boots it; a warm pool of pre-booted VMs makes a
-  desktop ready in ~1s.
+- **Fast boot.** Create clones the golden image cheaply (an APFS copy-on-write
+  copy on macOS: instant, shared blocks) and boots it; a warm pool of pre-booted
+  VMs makes a desktop ready in ~1s.
 - **Choose your OS at create time.** `warmbox create --image omarchy` boots a
   clone of the Omarchy disk; no image argument uses the built-in desktop.
 - **Browser access.** Each desktop is streamed over noVNC — no client to install.
@@ -39,11 +43,14 @@ boots in ~1s from a shared read-only rootfs) and a full **Omarchy**
 
 ## Requirements
 
-**Host** — one of:
-- **macOS on Apple Silicon**, with `vfkit` (`brew install vfkit`); or
-- **Linux with KVM** and `qemu-system-x86_64` / `qemu-system-aarch64` — run the
-  daemon with `--backend qemu`. Verified on x86_64 KVM. Note: the Linux backend
-  cannot boot EFI disk images yet (no OVMF), so image guests are macOS-only.
+**Host** — either:
+- **macOS on Apple Silicon** — `brew install vfkit`; or
+- **Linux with KVM** — `qemu-system-x86_64` (or `-aarch64`) plus `/dev/kvm`. The
+  daemon needs `--backend qemu`; `warmbox service install` passes it for you.
+
+Both boot the built-in image. The one real gap: EFI *disk* images (Omarchy) need
+macOS today, because the QEMU backend has no OVMF firmware yet. Overlay images —
+the built-in one and `lxqt` — need no firmware and take the same path on both.
 
 To **build from source** you also need **Docker** (for the guest image) and
 **Go 1.25+** — but an install from a release needs neither.
@@ -299,7 +306,7 @@ bucket up.
 | Agent API: tty, screenshot/input (computer-use) | ❌ not yet |
 | Linux host (Cloud Hypervisor / Firecracker) | ❌ not yet |
 | Windows host (WSL2 / native WHPX) | ❌ not yet |
-| Memory snapshot / ~100 ms restore | ❌ blocked on macOS |
+| Memory snapshot / ~100 ms restore | ❌ not yet (needs a different backend) |
 | TLS / per-guest VNC auth | ❌ not yet |
 | GPU / audio | ❌ not supported |
 
@@ -322,11 +329,12 @@ bucket up.
   host — and therefore through the authenticated daemon — rather than from the
   LAN. All of it assumes a machine you trust; don't expose it to an untrusted
   network.
-- **No memory snapshots.** Apple's framework exposes no VM state save/restore, so
-  fast "restore anywhere" needs a Linux backend (see `docs/snapshots.md`). Pause
-  is not a substitute: it freezes the guest's CPUs in place but its memory stays
-  allocated. To actually reclaim RAM, destroy the desktop (its volume keeps your
-  files) or let the warm pool drain.
+- **No memory snapshots.** Neither hypervisor we drive today can checkpoint a
+  running VM's memory (Apple's framework exposes no VM state save/restore), so
+  fast "restore anywhere" needs a different backend (see `docs/snapshots.md`).
+  Pause is not a substitute: it freezes the guest's CPUs in place but its memory
+  stays allocated. To actually reclaim RAM, destroy the desktop (its volume keeps
+  your files) or let the warm pool drain.
 - **Guests have no GPU.** The hypervisor exposes virtio-gpu without 3D (AVF on
   macOS, virtio on QEMU), so a Wayland desktop composites through Mesa
   `llvmpipe`; the Omarchy image is tuned for it (small output, effects off). X11
