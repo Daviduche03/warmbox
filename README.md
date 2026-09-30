@@ -69,14 +69,28 @@ noVNC fills the page. The token is dropped from the address bar after the first
 load. To run the daemon in the background instead of the foreground:
 
 ```sh
-./warmbox service install --pool 1   # macOS launchd; pool 1 = ~1s creates
+./warmbox service install --pool 1   # launchd on macOS, systemd on Linux
 ./warmbox service status             # start | stop | restart | status
 ```
 
-On **Linux**, add `--backend qemu` to the daemon (KVM + `qemu-system-*`). QEMU's
-user-mode networking isn't reachable host→guest, so the backend forwards a host
-port to each guest's VNC; everything else is identical. Build the guest image for
-the host arch with `PLATFORM=linux/amd64 ./deploy/guest/build.sh`.
+On Linux it installs a **systemd** unit instead: a system unit at
+`/etc/systemd/system/warmbox.service` when you run it as root, or a per-user
+unit (`~/.config/systemd/user/`, with lingering enabled so it starts at boot)
+otherwise. Logs live in the journal — `journalctl -u warmbox.service -f`.
+
+Warm VMs hold RAM even when nobody is creating anything, so the pool drains
+itself after 15 minutes without a lease (`--pool-idle-timeout 30m`, `0` keeps it
+warm forever); the next create pays a cold boot instead. Desktops can also be
+frozen from the dashboard's row menu: **Pause** stops the guest's CPUs and keeps
+its memory, **Resume** picks the session back up, and **Destroy** is what hands
+the RAM back. Pause works on both backends (vfkit's REST API, QEMU's monitor).
+
+On **Linux**, add `--backend qemu` to the daemon (KVM + `qemu-system-*`).
+`warmbox service install` passes that flag for you and manages the daemon as a
+systemd unit, so the same command works on both hosts. QEMU's user-mode
+networking isn't reachable host→guest, so the backend forwards a host port to
+each guest's VNC; everything else is identical. Build the guest image for the
+host arch with `PLATFORM=linux/amd64 ./deploy/guest/build.sh`.
 
 ## Images
 
@@ -170,6 +184,9 @@ bucket up.
 | Area | State |
 |---|---|
 | Guest desktop (XFCE over noVNC), warm pool | ✅ works |
+| Accounts, workspaces, per-workspace scoping | ✅ works (bcrypt + session/API-token auth) |
+| Pause / resume a desktop | ✅ works (CPU only — the guest keeps its memory) |
+| Warm-pool idle drain | ✅ works (`--pool-idle-timeout`, default 15m) |
 | Named images + create-time selection | ✅ works |
 | Omarchy guest (EFI disk image) | ✅ works (macOS) |
 | Persistent, cloud-backed volumes (chunked) | ✅ works |
@@ -195,10 +212,17 @@ bucket up.
   Virtualization.framework; ARM64 guests only. The Linux/QEMU backend boots the
   built-in image but not EFI disks.
 - **Local-only security posture.** Off by default: no TLS, guest VNC is
-  `-SecurityTypes None`, the guest runs as **root**, the API token is optional.
-  Don't expose it.
+  `-SecurityTypes None`, the guest runs as **root**. Accounts and workspaces gate
+  the API, and every route that reaches a desktop — console streams (`/d/`,
+  `/websockify/`, `/vnc/`), the agent API, published guest ports (`/p/`) — is
+  scoped to the caller's workspace; warm-pool VMs are daemon capacity and are not
+  listed or controllable as desktops. The transport is still plaintext, so don't
+  expose it to an untrusted network.
 - **No memory snapshots.** Apple's framework exposes no VM state save/restore, so
-  fast "restore anywhere" needs a Linux backend (see `docs/snapshots.md`).
+  fast "restore anywhere" needs a Linux backend (see `docs/snapshots.md`). Pause
+  is not a substitute: it freezes the guest's CPUs in place but its memory stays
+  allocated. To actually reclaim RAM, destroy the desktop (its volume keeps your
+  files) or let the warm pool drain.
 - **Guests have no GPU.** AVF exposes virtio-gpu without 3D, so a Wayland desktop
   composites through Mesa `llvmpipe`; the Omarchy image is tuned for it (small
   output, effects off). X11 is lighter for remote display.

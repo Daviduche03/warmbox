@@ -289,6 +289,32 @@ func clientIP(r *http.Request) string {
 	return r.RemoteAddr
 }
 
+// guestSource reports whether a request came from somewhere a guest could reach
+// us: the subnet guests are told to dial (vfkit's vmnet NAT), link-local, or
+// loopback (QEMU's user-mode networking appears to come from the host). It
+// reads RemoteAddr, never a forwarded header — those are client-supplied.
+func (s *Server) guestSource(r *http.Request) bool {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+	if ip.IsLoopback() || ip.IsLinkLocalUnicast() {
+		return true
+	}
+	// The guest-facing gateway is configurable, so derive its subnet from the
+	// configured address (192.168.64.1 -> 192.168.64.0/24).
+	if gw := net.ParseIP(s.cfg.HostAddr); gw != nil {
+		if _, subnet, err := net.ParseCIDR(gw.String() + "/24"); err == nil && subnet.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
 // --- token minting ---
 
 func mintToken(nbytes int) (raw, hash string, err error) {

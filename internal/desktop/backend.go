@@ -1,6 +1,7 @@
 package desktop
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -76,9 +77,8 @@ type LaunchSpec struct {
 type Instance struct {
 	Cmd      *exec.Cmd
 	Forwards map[int]string
-	// Control is the backend's live control endpoint, in whatever shape that
-	// backend's Pause/Resume expect ("host:port" for vfkit's REST API, a unix
-	// socket path for QEMU's QMP monitor). Empty when unavailable.
+	// Control is the backend's live control endpoint: a unix socket path
+	// (vfkit's REST API, QEMU's QMP monitor). Empty when unavailable.
 	Control string
 }
 
@@ -173,16 +173,14 @@ func (b *vfkitBackend) Launch(spec LaunchSpec) (*Instance, error) {
 	if spec.PidFile != "" {
 		args = append(args, "--pidfile", spec.PidFile)
 	}
-	// Open vfkit's REST API on a loopback port so the manager can freeze and
-	// thaw this VM (POST /vm/state).
+	// Open vfkit's REST API on a unix socket — the API is unauthenticated, so
+	// it lives in the per-VM directory (mode 0700) rather than on a loopback
+	// port any local process could reach. The manager freezes and thaws the VM
+	// through it (POST /vm/state).
 	control := ""
 	if spec.ControlDir != "" {
-		port, err := freePort()
-		if err != nil {
-			return nil, err
-		}
-		control = fmt.Sprintf("127.0.0.1:%d", port)
-		args = append(args, "--restful-uri", "tcp://"+control)
+		control = filepath.Join(spec.ControlDir, "vfkit.sock")
+		args = append(args, "--restful-uri", "unix://"+control)
 	}
 	if b.gui {
 		args = append(args, "--gui")
@@ -204,23 +202,32 @@ func (b *vfkitBackend) Pause(inst *Instance) error  { return vfkitSetState(inst,
 func (b *vfkitBackend) Resume(inst *Instance) error { return vfkitSetState(inst, "Resume") }
 
 // vfkitSetState posts a state transition to vfkit's REST API (valid: Pause,
-// Resume, Stop, HardStop).
+// Resume, Stop, HardStop) over its unix socket.
 func vfkitSetState(inst *Instance, state string) error {
 	if inst == nil || inst.Control == "" {
 		return fmt.Errorf("vm has no control channel")
 	}
-	req, err := http.NewRequest(http.MethodPost, "http://"+inst.Control+"/vm/state",
+	req, err := http.NewRequest(http.MethodPost, "http://vfkit/vm/state",
 		strings.NewReader(`{"state":"`+state+`"}`))
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, "unix", inst.Control)
+			},
+		},
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("vfkit %s: %w", state, err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
+	// vfkit accepts a state change asynchronously and answers 202.
+	if resp.StatusCode/100 != 2 {
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 		return fmt.Errorf("vfkit %s: %s %s", state, resp.Status, strings.TrimSpace(string(msg)))
 	}

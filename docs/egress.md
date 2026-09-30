@@ -33,7 +33,11 @@ through it:
 - overlay images (built-in, `lxqt`): on the kernel cmdline (`warmbox.proxy=…`),
   which `deploy/guest/init` turns into `http_proxy`/`https_proxy` for the agent
   and any program it runs.
-- EFI images (`omarchy`): over the config share (`"proxy"`), a follow-up.
+- EFI images (`omarchy`): the host writes the same address into the config share
+  (`"proxy"`), **but the image doesn't read it yet** — it only consumes `id`,
+  `host`, `port` and `volume`. So on Omarchy the policy reaches the guest's
+  environment not at all today; wiring the share's `proxy` key into the session
+  and the agent is a follow-up.
 
 Every decision is logged: `egress: ALLOW api.openai.com:443`, `egress: DENY …`.
 
@@ -78,15 +82,15 @@ boundary) and the policy engine works; the enforcement half is the next step."
 
 1. **Host firewall enforcement** — the piece that makes it a boundary. Linux
    first (nftables); macOS via `pf`.
-2. **Per-desktop policy** — the proxy already resolves policy per client IP
-   (`New(…, resolve)`); wire it to each VM's policy from `warmbox create`.
-3. **Credential surrogation** — the agent holds a surrogate token with no real
+2. **Credential surrogation** — the agent holds a surrogate token with no real
    rights; the proxy injects the real secret only for approved destinations
    (Muse's `hatch-authd`). This is the enterprise feature.
-4. **Taint tracking (lite)** — if a process has read private data, tighten its
+3. **Taint tracking (lite)** — if a process has read private data, tighten its
    network. Even a coarse version captures most of the value.
-5. **Denied-by-default DNS** — resolve guest DNS through the proxy so names
+4. **Denied-by-default DNS** — resolve guest DNS through the proxy so names
    that aren't allowed don't resolve at all.
+5. **Proxy on image guests** — read the config share's `proxy` key in the
+   Omarchy image so EFI guests get the same routing the built-in image does.
 
 See also [`deploy/omarchy/README.md`](../deploy/omarchy/README.md) for the image
 side, and `docs/agent-api.md` for the guest channel that agents actually use.

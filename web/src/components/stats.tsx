@@ -37,15 +37,16 @@ export function DashboardStats() {
 			key: "desktops",
 			label: "Desktops",
 			value: desktops.length,
-			context: [
-				`${byState.ready} ready`,
-				`${byState.busy} busy`,
-				`${byState.booting} booting`,
-				byState.paused ? `${byState.paused} paused` : undefined,
-				byState.dead ? `${byState.dead} dead` : undefined,
-			]
-				.filter(Boolean)
-				.join(" · "),
+			context:
+				[
+					byState.ready ? `${byState.ready} ready` : undefined,
+					byState.busy ? `${byState.busy} busy` : undefined,
+					byState.booting ? `${byState.booting} booting` : undefined,
+					byState.paused ? `${byState.paused} paused` : undefined,
+					byState.dead ? `${byState.dead} dead` : undefined,
+				]
+					.filter(Boolean)
+					.join(" · ") || "none running",
 		},
 		{
 			key: "idle",

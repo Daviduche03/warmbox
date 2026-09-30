@@ -34,7 +34,7 @@ type Range = 0 | 300 | 60;
 type ActivityRow = {
 	t: number;
 	ready: number;
-	busy: number;
+	paused: number;
 	booting: number;
 };
 
@@ -48,7 +48,7 @@ function timeLabel(t: number, withSeconds = false): string {
 
 const chartConfig = {
 	ready: { label: "Ready", color: "var(--chart-1)" },
-	busy: { label: "Busy", color: "var(--chart-2)" },
+	paused: { label: "Paused", color: "var(--chart-2)" },
 	booting: { label: "Booting", color: "var(--chart-3)" },
 } satisfies ChartConfig;
 
@@ -74,7 +74,7 @@ export function ConversationVolumeChart({
 	// Minutes repeat while the window is short — show seconds until it doesn't.
 	const withSeconds = span !== null && span < 180_000;
 	const axis = integerAxis(
-		Math.max(0, ...chartRows.map((r) => r.ready + r.busy + r.booting))
+		Math.max(0, ...chartRows.map((r) => r.ready + r.paused + r.booting))
 	);
 
 	// One sample draws as nothing at all — say so rather than leave a blank frame.
@@ -214,13 +214,13 @@ export function ConversationVolumeChart({
 							type="monotone"
 						/>
 						<Area
-							dataKey="busy"
+							dataKey="paused"
 							dot={false}
-							fill="var(--color-busy)"
+							fill="var(--color-paused)"
 							fillOpacity={0.35}
 							isAnimationActive={false}
 							stackId="pool"
-							stroke="var(--color-busy)"
+							stroke="var(--color-paused)"
 							strokeWidth={2}
 							type="monotone"
 						/>

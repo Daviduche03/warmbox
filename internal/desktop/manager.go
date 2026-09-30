@@ -79,7 +79,9 @@ func (m *Manager) start(id, volumeName, volumeImage, imageName string) (*VM, err
 		id = NewID()
 	}
 	dir := m.cfg.VMDir(id)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	// 0700: the directory holds this VM's control socket, which is
+	// unauthenticated by design (vfkit's REST API has no auth).
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("creating vm dir: %w", err)
 	}
 

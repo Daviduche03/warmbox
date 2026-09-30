@@ -1,7 +1,8 @@
 # Snapshots & fast resume — feasibility and plan
 
 Goal: restore a running sandbox **anywhere in ~100 ms**. Status: **S1 (disk
-snapshots) landed; S2/S3 open; memory checkpoint is blocked on macOS.**
+snapshots) landed; pause/resume (in-place freeze) landed; S3 open; memory
+checkpoint is blocked on macOS.**
 
 ## What a snapshot must contain
 
@@ -18,9 +19,11 @@ state**. Fast restore needs both; a disk-only snapshot still pays a full boot.
 
 - **vfkit / Apple Virtualization.framework (macOS):** the public API exposes
   start/stop and `pause()`/`resume()`, but **no serializable VM state
-  save/restore**. vfkit v0.6.4 has no snapshot/pause/save options (`--help`
-  confirms). So a portable ~100 ms checkpoint is **not possible on macOS today**.
-  `pause()` only freezes in the host process — instant resume, same host, RAM held.
+  save/restore**. There is no `--save`/`--restore` on the command line (v0.6.4);
+  pause and resume are reachable through vfkit's REST API (`--restful-uri`,
+  `POST /vm/state`), which is what warmbox drives. So a portable ~100 ms
+  checkpoint is **not possible on macOS today**. `pause()` only freezes in the
+  host process — instant resume, same host, RAM held.
 - **Cloud Hypervisor / Firecracker / QEMU (Linux):** support real
   snapshot/restore of memory + disk. This is the path to portable ~100 ms restore.
   Firecracker (E2B's substrate) is the proof it works.
@@ -58,8 +61,11 @@ Linux backend.
   create|list|rm`, `volume create --from-snapshot`, catalog `snapshots` table.
   A snapshot is a frozen, content-addressed manifest, so create/restore is O(1)
   and shares every chunk. Portable, but restore still boots (~2–3 s).
-- **S2 — paused warm pool (macOS).** Add `Pause/Resume` to the vfkit backend and a
-  pool of paused sandboxes. Instant same-host acquire.
+- **S2 — paused warm pool (macOS).** **Pause/Resume landed:** both backends
+  freeze in place (vfkit via its REST API, QEMU via its monitor), wired through
+  `POST /api/desktops/{id}/pause|resume` and the dashboard's row menu. Still
+  open: a pool of *paused* sandboxes for instant same-host acquire, and the
+  capacity changes that go with it.
 - **S3 — Linux backend with true checkpoint.** Cloud Hypervisor (or Firecracker)
   behind the `Backend` interface, using its snapshot API for portable ~100 ms
   restore. This is where the headline number comes from.

@@ -204,6 +204,14 @@ func (s *Server) Handler() http.Handler {
 func (s *Server) withAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/internal/ready" {
+			// A guest has no credentials, so this route stays open — but only
+			// to the networks a guest can dial from. Otherwise anything on the
+			// LAN could mark a VM ready at an address of its choosing, and the
+			// daemon would then dial that address for VNC and agent traffic.
+			if !s.guestSource(r) {
+				http.Error(w, "forbidden", http.StatusForbidden)
+				return
+			}
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -278,8 +286,9 @@ func (s *Server) callerScope(r *http.Request) (string, bool) {
 }
 
 // wsVisible reports whether a tagged resource is visible to the caller.
-// Untagged rows predate scoping (or are unleased pool capacity) and stay
-// visible everywhere; tagged rows only to their workspace, or to admins.
+// Untagged rows predate scoping and stay visible everywhere; tagged rows only
+// to their workspace, or to admins. (Desktops are stricter: an untagged one is
+// unleased warm-pool capacity and is not listed at all — see Server.list.)
 // Callers answer 404 for hidden rows so one workspace cannot probe another's
 // inventory.
 func wsVisible(rowWS, ws string, admin bool) bool {
@@ -314,7 +323,7 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 	ws, _ := s.callerScope(r)
 	vm.SetWorkspace(ws)
 	s.setPolicy(vm.ID, pol)
-	s.recordDesktop(vm.ID, "", "busy", "", 0, ws)
+	s.recordDesktop(vm.ID, "", "ready", "", 0, ws)
 	writeJSON(w, http.StatusCreated, map[string]any{
 		"id":  vm.ID,
 		"vnc": "/d/" + vm.ID,
@@ -335,7 +344,7 @@ func (s *Server) createImage(w http.ResponseWriter, r *http.Request, name string
 		ws, _ := s.callerScope(r)
 		vm.SetWorkspace(ws)
 		s.setPolicy(vm.ID, pol)
-		s.recordDesktop(vm.ID, "", "busy", "", 0, ws)
+		s.recordDesktop(vm.ID, "", "ready", "", 0, ws)
 		writeJSON(w, http.StatusCreated, map[string]any{
 			"id":  vm.ID,
 			"vnc": "/d/" + vm.ID,
@@ -453,6 +462,11 @@ func (s *Server) list(w http.ResponseWriter, r *http.Request) {
 	ws, admin := s.callerScope(r)
 	var infos []desktop.Info
 	for _, info := range s.mgr.List() {
+		// Unleased VMs are warm-pool capacity, not desktops: they show up in the
+		// daemon's pool stats, not in anyone's desktop list.
+		if info.Workspace == "" {
+			continue
+		}
 		if !wsVisible(info.Workspace, ws, admin) {
 			continue
 		}
@@ -492,7 +506,16 @@ func (s *Server) get(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) destroy(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	if _, ok := s.visibleVM(w, r, id); !ok {
+	vm, ok := s.visibleVM(w, r, id)
+	if !ok {
+		return
+	}
+	// Warm-pool capacity is the daemon's, not a user's: tearing it down would
+	// just make the pool boot another one.
+	if vm.Info().Workspace == "" {
+		writeJSON(w, http.StatusConflict, map[string]string{
+			"error": "that vm is warm-pool capacity, not one of your desktops",
+		})
 		return
 	}
 	if err := s.mgr.Destroy(id); err != nil {
@@ -509,7 +532,16 @@ func (s *Server) destroy(w http.ResponseWriter, r *http.Request) {
 // what is reclaimed is CPU. Destroy is what hands RAM back.
 func (s *Server) pause(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	if _, ok := s.visibleVM(w, r, id); !ok {
+	vm, ok := s.visibleVM(w, r, id)
+	if !ok {
+		return
+	}
+	// Unleased VMs are warm-pool capacity: the pool hands them out on the next
+	// create, so freezing one would deliver a frozen desktop.
+	if vm.Info().Workspace == "" {
+		writeJSON(w, http.StatusConflict, map[string]string{
+			"error": "that vm is warm-pool capacity, not one of your desktops",
+		})
 		return
 	}
 	if err := s.mgr.Pause(id); err != nil {
@@ -551,9 +583,8 @@ func (s *Server) ready(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) websockify(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	vm, ok := s.mgr.Get(id)
+	vm, ok := s.visibleVM(w, r, id)
 	if !ok {
-		http.Error(w, "unknown desktop", http.StatusNotFound)
 		return
 	}
 	target := vm.Target(s.cfg.GuestVNCPort)
@@ -652,9 +683,8 @@ func (s *Server) agentSessionOutput(w http.ResponseWriter, r *http.Request) {
 func (s *Server) expose(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	port := r.PathValue("port")
-	vm, ok := s.mgr.Get(id)
+	vm, ok := s.visibleVM(w, r, id)
 	if !ok {
-		http.Error(w, "unknown desktop", http.StatusNotFound)
 		return
 	}
 	ip := vm.IP()

@@ -137,7 +137,9 @@ func (p *Pool) Acquire(ctx context.Context) (*VM, error) {
 			vm := p.idle[n-1]
 			p.idle = p.idle[:n-1]
 			p.mu.Unlock()
-			vm.SetState(StateBusy)
+			// A lease is marked by VM.Workspace, not by a state change: the
+			// desktop is ready and stays ready, so the dashboard does not have
+			// to show a healthy VM as "busy".
 			fmt.Fprintf(p.log, "pool: leased vm %s\n", vm.ID)
 			return vm, nil
 		}
@@ -151,7 +153,6 @@ func (p *Pool) Acquire(ctx context.Context) (*VM, error) {
 		}
 		vm, err := p.bootOne(ctx)
 		if err == nil {
-			vm.SetState(StateBusy)
 			return vm, nil
 		}
 		// Back off and retry unless the context is done.

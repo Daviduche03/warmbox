@@ -14,7 +14,9 @@ type State string
 const (
 	StateBooting State = "booting"
 	StateReady   State = "ready"
-	StateBusy    State = "busy"
+	// StateBusy is reserved for long-running in-guest operations. A lease does
+	// not set it — VM.Workspace marks which workspace holds a desktop.
+	StateBusy State = "busy"
 	// StatePaused is a frozen VM: its vCPUs are stopped but its memory is
 	// still held by the host process (pause saves CPU, not RAM).
 	StatePaused State = "paused"
@@ -29,7 +31,8 @@ type VM struct {
 	Started time.Time
 	Volume  string
 	// Workspace tags which workspace leased this VM. Empty means unleased
-	// warm-pool capacity, visible everywhere until handed out.
+	// warm-pool capacity: the daemon's own spare, reported in the pool stats
+	// and deliberately kept out of the desktop list.
 	Workspace string
 
 	forwards map[int]string

@@ -172,7 +172,8 @@ func usage() {
 
 Usage:
   warmbox daemon            Run the orchestrator (web dashboard + REST API)
-  warmbox service <cmd>     Manage the background daemon (macOS launchd):
+  warmbox service <cmd>     Manage the background daemon (launchd on macOS,
+                            systemd on Linux):
                             install | start | stop | restart | status
   warmbox setup             Check host prerequisites, fetch noVNC
   warmbox login             Sign in as a user (stores a session)
@@ -301,7 +302,7 @@ func preflightAddr(addr string) {
 		lerr = err
 		time.Sleep(500 * time.Millisecond)
 	}
-	if launchdLoaded() {
+	if serviceRunning() {
 		fatal("another daemon is already listening on %s (the background service).\n  stop it first:  warmbox service stop\n  (or run this on a different --addr)", addr)
 	}
 	fatal("can't listen on %s: %v", addr, lerr)
@@ -374,11 +375,21 @@ func writeLaunchAgent(cfg *desktop.Config, pool int) error {
 	return os.WriteFile(launchAgentPath(), []byte(plist), 0o644)
 }
 
-// cmdService manages the warmbox daemon as a background service (macOS launchd).
+// cmdService manages the warmbox daemon as a background service: launchd on
+// macOS, systemd on Linux.
 func cmdService(args []string) {
-	if runtime.GOOS != "darwin" {
-		fatal("service management is implemented for macOS (launchd) so far; on Linux run the daemon under systemd yourself")
+	switch runtime.GOOS {
+	case "darwin":
+		serviceLaunchd(args)
+	case "linux":
+		serviceSystemd(args)
+	default:
+		fatal("service management supports macOS (launchd) and Linux (systemd); elsewhere run `warmbox daemon` under your init system")
 	}
+}
+
+// serviceLaunchd manages the daemon as a launchd user agent (macOS).
+func serviceLaunchd(args []string) {
 	cfg := desktop.DefaultConfig()
 	pool := 0
 	fs := flag.NewFlagSet("service", flag.ExitOnError)
@@ -481,6 +492,249 @@ func cmdService(args []string) {
 	}
 }
 
+// --- systemd (Linux) ---
+
+// warmboxUnit is the systemd unit name; the launchd equivalent is warmboxLabel.
+const warmboxUnit = "warmbox.service"
+
+// systemdUserScope reports whether we manage a per-user unit rather than a
+// machine-wide one: root installs a system unit (usable for KVM and networking
+// without extra grants), everyone else a user unit.
+func systemdUserScope() bool { return os.Geteuid() != 0 }
+
+func systemdUnitPath() string {
+	if !systemdUserScope() {
+		return filepath.Join("/etc/systemd/system", warmboxUnit)
+	}
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".config", "systemd", "user", warmboxUnit)
+}
+
+// systemctlArgs prefixes the verb with --user when we manage a user unit.
+func systemctlArgs(verb ...string) []string {
+	if systemdUserScope() {
+		return append([]string{"--user"}, verb...)
+	}
+	return verb
+}
+
+func systemctlOut() string {
+	if systemdUserScope() {
+		return "--user "
+	}
+	return ""
+}
+
+// systemdActive reports whether the unit exists and is running.
+func systemdActive() bool {
+	if runtime.GOOS != "linux" {
+		return false
+	}
+	cmd := exec.Command("systemctl", systemctlArgs("is-active", "--quiet", warmboxUnit)...)
+	cmd.Stdout, cmd.Stderr = nil, nil
+	return cmd.Run() == nil
+}
+
+// serviceRunning reports whether the background service is running: launchd on
+// macOS, systemd on Linux. Used to explain a port that is already taken.
+func serviceRunning() bool {
+	switch runtime.GOOS {
+	case "darwin":
+		return launchdLoaded()
+	case "linux":
+		return systemdActive()
+	}
+	return false
+}
+
+// systemdQuote renders one ExecStart argument the way systemd parses it.
+func systemdQuote(s string) string {
+	if s != "" && !strings.ContainsAny(s, " \t\n\"'\\") {
+		return s
+	}
+	return `"` + strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(s) + `"`
+}
+
+// writeSystemdUnit renders the unit from the same settings the launchd plist
+// carries, so both hosts describe the same daemon.
+func writeSystemdUnit(cfg *desktop.Config, pool int, backend string) error {
+	self, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	args := []string{
+		self, "daemon",
+		"--workdir", cfg.WorkDir,
+		"--addr", cfg.APIAddr,
+		"--pool", fmt.Sprint(pool),
+		"--pool-idle-timeout", cfg.PoolIdleTimeout.String(),
+		"--backend", backend,
+	}
+	if cfg.Image != "" {
+		args = append(args, "--image", cfg.Image)
+	}
+	quoted := make([]string, 0, len(args))
+	for _, a := range args {
+		quoted = append(quoted, systemdQuote(a))
+	}
+	// A system unit waits for the network and is wanted by multi-user.target. The
+	// per-user manager has no network-online.target, so a user unit just wants
+	// default.target (and stops when the user's last session ends unless
+	// lingering is on — see lingerHint).
+	after, wantedBy := "After=network-online.target\nWants=network-online.target\n", "multi-user.target"
+	if systemdUserScope() {
+		after, wantedBy = "", "default.target"
+	}
+	// A system service inherits almost no environment, and warmbox resolves its
+	// default paths (~/.warmbox/vmlinux, …) from $HOME. Without HOME the daemon
+	// ends up looking for ".warmbox/vmlinux" relative to the root directory and
+	// dies at startup, so set it explicitly.
+	home, herr := os.UserHomeDir()
+	if herr != nil || home == "" {
+		return fmt.Errorf("can't determine the home directory to run the service from: %w", herr)
+	}
+	unit := fmt.Sprintf(`[Unit]
+Description=warmbox — self-hosted GUI desktop microVMs
+%s
+[Service]
+Type=simple
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=HOME=%s
+ExecStart=%s
+Restart=always
+RestartSec=2
+# The daemon parents each VM process, so stop the whole tree together.
+KillMode=mixed
+TimeoutStopSec=30
+
+[Install]
+WantedBy=%s
+`, after, systemdQuote(home), strings.Join(quoted, " "), wantedBy)
+
+	if err := os.MkdirAll(filepath.Dir(systemdUnitPath()), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(systemdUnitPath(), []byte(unit), 0o644)
+}
+
+// lingerHint makes a user service survive logout (and therefore start at boot).
+// Without it, systemd stops the unit when the last session ends.
+func lingerHint() {
+	user := os.Getenv("USER")
+	if user == "" {
+		user = fmt.Sprint(os.Getuid())
+	}
+	cmd := exec.Command("loginctl", "enable-linger", user)
+	cmd.Stdout, cmd.Stderr = nil, nil
+	if cmd.Run() == nil {
+		fmt.Fprintln(os.Stderr, "enabled lingering: the service starts at boot, no login needed")
+		return
+	}
+	fmt.Fprintf(os.Stderr, "note: a user service stops when you log out. To start it at boot:\n  sudo loginctl enable-linger %s\n", user)
+}
+
+// serviceSystemd manages the daemon as a systemd unit (Linux).
+func serviceSystemd(args []string) {
+	cfg := desktop.DefaultConfig()
+	pool := 0
+	backend := "qemu"
+	fs := flag.NewFlagSet("service", flag.ExitOnError)
+	fs.StringVar(&cfg.WorkDir, "workdir", cfg.WorkDir, "state directory")
+	fs.StringVar(&cfg.APIAddr, "addr", cfg.APIAddr, "HTTP listen address")
+	fs.StringVar(&cfg.Image, "image", cfg.Image, "default image")
+	fs.IntVar(&pool, "pool", 0, "warm pool size (0 = boot on demand; 1+ = instant create, holds RAM)")
+	fs.StringVar(&backend, "backend", backend, "hypervisor backend (qemu on Linux)")
+	sub := ""
+	if len(args) > 0 {
+		sub = args[0]
+		_ = fs.Parse(args[1:])
+	}
+
+	setFlags := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { setFlags[f.Name] = true })
+
+	unitPath := systemdUnitPath()
+	sc := func(a ...string) error {
+		cmd := exec.Command("systemctl", systemctlArgs(a...)...)
+		cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+		return cmd.Run()
+	}
+	// Rewrite the unit when asked to (install), when flags are given, or when no
+	// unit exists yet — but not on a bare start/restart, which must keep the
+	// configured pool/image.
+	needWrite := sub == "install" || len(setFlags) > 0 || !stat(unitPath)
+
+	switch sub {
+	case "install", "start":
+		if err := cfg.EnsureDirs(); err != nil {
+			fatal("Error: %v", err)
+		}
+		if needWrite {
+			if err := writeSystemdUnit(cfg, pool, backend); err != nil {
+				fatal("Error: %v", err)
+			}
+		}
+		if err := sc("daemon-reload"); err != nil {
+			fatal("Error: %v", err)
+		}
+		if sub == "install" {
+			if err := sc("enable", warmboxUnit); err != nil {
+				fatal("Error: %v", err)
+			}
+		}
+		verb := "start"
+		if systemdActive() {
+			verb = "restart"
+		}
+		if err := sc(verb, warmboxUnit); err != nil {
+			fatal("Error: %v", err)
+		}
+		fmt.Fprintf(os.Stderr, "started %s\n", warmboxUnit)
+		fmt.Fprintf(os.Stderr, "unit: %s\nlogs: journalctl %s-u %s -f\n", unitPath, systemctlOut(), warmboxUnit)
+		if sub == "install" && systemdUserScope() {
+			lingerHint()
+		}
+	case "stop":
+		if !systemdActive() {
+			fmt.Fprintln(os.Stderr, "not running")
+			return
+		}
+		if err := sc("stop", warmboxUnit); err != nil {
+			fatal("Error: %v", err)
+		}
+		fmt.Fprintln(os.Stderr, "stopped")
+	case "restart":
+		if needWrite {
+			if err := writeSystemdUnit(cfg, pool, backend); err != nil {
+				fatal("Error: %v", err)
+			}
+			if err := sc("daemon-reload"); err != nil {
+				fatal("Error: %v", err)
+			}
+		}
+		verb := "start"
+		if systemdActive() {
+			verb = "restart"
+		}
+		if err := sc(verb, warmboxUnit); err != nil {
+			fatal("Error (install first?): %v", err)
+		}
+		fmt.Fprintln(os.Stderr, "restarted")
+	case "status":
+		if !stat(unitPath) {
+			fmt.Fprintf(os.Stderr, "not installed (%s)\n", unitPath)
+			return
+		}
+		if !systemdActive() {
+			fmt.Fprintln(os.Stderr, "not running")
+		}
+		_ = sc("status", "--no-pager", warmboxUnit)
+		fmt.Fprintf(os.Stderr, "unit: %s\nlogs: journalctl %s-u %s -f\n", unitPath, systemctlOut(), warmboxUnit)
+	default:
+		fatal("Usage: warmbox service <install|start|stop|restart|status> [--pool N] [--image NAME]")
+	}
+}
+
 func cmdDaemon(args []string) {
 	cfg := desktop.DefaultConfig()
 	fs := flag.NewFlagSet("daemon", flag.ExitOnError)
@@ -494,6 +748,12 @@ func cmdDaemon(args []string) {
 		fatal("Error: %v", err)
 	}
 	preflightAddr(cfg.APIAddr)
+	// Clear anything a previous daemon left behind before booting new VMs: we
+	// hold the address now, so survivors belong to a crashed run (RAM, control
+	// sockets and attached volumes included).
+	if n := desktop.Reap(cfg, os.Stderr); n > 0 {
+		fmt.Fprintf(os.Stderr, "warmbox: reaped %d leftover vm(s) from a previous run\n", n)
+	}
 	mgr := desktop.NewManager(cfg, os.Stderr)
 	images := mgr.Images()
 

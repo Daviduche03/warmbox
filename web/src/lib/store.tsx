@@ -20,7 +20,7 @@ import {
 export interface Sample {
   t: number;
   ready: number;
-  busy: number;
+  paused: number;
   booting: number;
   /** Counts carried alongside the state split so trend cards can compute their own deltas. */
   desktops: number;
@@ -143,7 +143,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       const sample: Sample = {
         t: Date.now(),
         ready: ds.filter((x) => x.state === "ready").length,
-        busy: ds.filter((x) => x.state === "busy").length,
+        paused: ds.filter((x) => x.state === "paused").length,
         booting: ds.filter((x) => x.state === "booting").length,
         desktops: ds.length,
         idle: st?.pool.idle ?? 0,

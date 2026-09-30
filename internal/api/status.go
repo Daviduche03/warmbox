@@ -47,7 +47,9 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 	ws, admin := s.callerScope(r)
 	ndesktops := 0
 	for _, info := range s.mgr.List() {
-		if wsVisible(info.Workspace, ws, admin) {
+		// Unleased VMs are warm-pool capacity (reported separately below), not
+		// desktops of anyone's.
+		if info.Workspace != "" && wsVisible(info.Workspace, ws, admin) {
 			ndesktops++
 		}
 	}

@@ -21,7 +21,7 @@ import { EmptyState } from "@/components/empty-state";
 import { useStore } from "@/lib/store";
 import { pct } from "@/lib/metrics";
 
-type StateKey = "ready" | "busy" | "booting" | "dead";
+type StateKey = "ready" | "paused" | "booting" | "dead";
 
 type StateDatum = {
 	state: StateKey;
@@ -31,7 +31,7 @@ type StateDatum = {
 
 const chartConfig = {
 	ready: { label: "Ready", color: "var(--chart-1)" },
-	busy: { label: "Busy", color: "var(--chart-2)" },
+	paused: { label: "Paused", color: "var(--chart-2)" },
 	booting: { label: "Booting", color: "var(--chart-3)" },
 	dead: { label: "Dead", color: "var(--chart-4)" },
 } satisfies ChartConfig;
@@ -49,7 +49,7 @@ export function ChannelBreakdownChart({
 	const readyCount = count("ready");
 
 	const chartData: StateDatum[] = (
-		["ready", "busy", "booting", "dead"] as const
+		["ready", "paused", "booting", "dead"] as const
 	)
 		.map((state) => ({
 			state,
