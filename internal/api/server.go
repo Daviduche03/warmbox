@@ -237,13 +237,24 @@ func (s *Server) GuestHandler() http.Handler {
 // framing of the dashboard, no MIME sniffing, no referrer leakage, and a CSP
 // the app satisfies (same-origin scripts, inline styles for the charts,
 // same-origin websockets for the console, blob workers for noVNC).
+//
+// noVNC is the one exception, and it is a deliberate one. vnc.html boots from an
+// inline module script — `import UI from "./app/ui.js"; …` — which script-src
+// 'self' refuses. A refused bootstrap is completely silent: noVNC's UI never
+// starts, so it never opens the websocket, so the daemon has nothing to log and
+// the page sits on its loading screen forever. Allowing that script by hash
+// would work exactly until a noVNC release changed it, and then break the
+// console just as silently, so the CSP stops at our own documents: noVNC is a
+// vendored app we serve, not a page we wrote.
 func (s *Server) securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h := w.Header()
-		h.Set("Content-Security-Policy",
-			"default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'self'; "+
-				"img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; "+
-				"script-src 'self'; worker-src 'self' blob:; connect-src 'self' ws: wss:")
+		if !strings.HasPrefix(r.URL.Path, "/vnc/") {
+			h.Set("Content-Security-Policy",
+				"default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'self'; "+
+					"img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; "+
+					"script-src 'self'; worker-src 'self' blob:; connect-src 'self' ws: wss:")
+		}
 		h.Set("Referrer-Policy", "no-referrer")
 		h.Set("X-Content-Type-Options", "nosniff")
 		h.Set("X-Frame-Options", "SAMEORIGIN")
@@ -1011,7 +1022,7 @@ func (s *Server) websockify(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "desktop not ready", http.StatusServiceUnavailable)
 		return
 	}
-	vnc.Proxy(w, r, target)
+	vnc.Proxy(w, r, target, s.log)
 }
 
 // agentProxy forwards a request to warmbox-agent inside the guest, preserving
