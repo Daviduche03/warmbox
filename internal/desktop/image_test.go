@@ -322,3 +322,37 @@ func TestExcerptKeepsOnlyTheTail(t *testing.T) {
 		t.Errorf("zero-value String() = %q", got)
 	}
 }
+
+// A pool that cannot boot must stop trying every tick. A failed attempt now
+// fails in about a second, so without a growing delay a host with a broken
+// hypervisor boots a VM per second forever.
+func TestPoolBacksOffAfterAFailedBoot(t *testing.T) {
+	cases := []struct {
+		current, want time.Duration
+	}{
+		{0, 5 * time.Second},
+		{5 * time.Second, 10 * time.Second},
+		{30 * time.Second, time.Minute},
+		{time.Minute, 2 * time.Minute},
+		{2 * time.Minute, 2 * time.Minute},  // capped
+		{10 * time.Minute, 2 * time.Minute}, // and stays capped
+	}
+	for _, c := range cases {
+		if got := nextBackoff(c.current); got != c.want {
+			t.Errorf("nextBackoff(%s) = %s, want %s", c.current, got, c.want)
+		}
+	}
+}
+
+// The pool must resume promptly once a boot works again.
+func TestPoolBackoffResetsAfterASuccessfulBoot(t *testing.T) {
+	p := NewPool(nil, 1, 0, io.Discard)
+	p.backoff, p.retryAt = time.Minute, time.Now().Add(time.Minute)
+	// What the success path does, without standing up a manager and a VM.
+	p.mu.Lock()
+	p.backoff, p.retryAt = 0, time.Time{}
+	p.mu.Unlock()
+	if p.backoff != 0 || !p.retryAt.IsZero() {
+		t.Errorf("backoff = %s, retryAt = %s; want cleared", p.backoff, p.retryAt)
+	}
+}

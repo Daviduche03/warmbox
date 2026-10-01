@@ -28,6 +28,14 @@ type Pool struct {
 	// drained records that idle VMs were reclaimed for inactivity, so
 	// replenishing stays off until the next Acquire.
 	drained bool
+	// backoff delays the next boot after a failure, and retryAt is when that
+	// delay is up. Without it a host that cannot boot a VM retries on every
+	// tick: an attempt now fails in about a second (it used to sit inside
+	// WaitReady for 90), so a broken configuration turned into a boot loop
+	// that spams the log and burns CPU. Acquire is not gated by this — a
+	// person asking for a desktop still gets an immediate attempt.
+	backoff time.Duration
+	retryAt time.Time
 }
 
 // NewPool creates a warm pool over the given manager. An idleTimeout of 0 keeps
@@ -77,7 +85,7 @@ func (p *Pool) replenish(ctx context.Context) {
 		p.drained = true
 	}
 	need := 0
-	if !p.drained {
+	if !p.drained && time.Now().After(p.retryAt) {
 		need = p.size - len(p.idle) - p.pending
 		if need > 0 {
 			p.pending += need
@@ -100,12 +108,40 @@ func (p *Pool) replenish(ctx context.Context) {
 				// A VM finishing its boot is the pool's last change: start
 				// (or restart) the idle clock from here.
 				p.touched = time.Now()
+				p.backoff, p.retryAt = 0, time.Time{}
+			} else {
+				p.backoff = nextBackoff(p.backoff)
+				p.retryAt = time.Now().Add(p.backoff)
 			}
 			p.mu.Unlock()
 			if err != nil {
-				fmt.Fprintf(p.log, "pool: boot failed: %v\n", err)
+				fmt.Fprintf(p.log, "pool: boot failed (next attempt in %s): %v\n", p.backoffOf(), err)
 			}
 		}()
+	}
+}
+
+// backoffOf reads the current delay, for logging outside the lock.
+func (p *Pool) backoffOf() time.Duration {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.backoff
+}
+
+// nextBackoff grows the gap between boot attempts after a failure: 5s, 10s,
+// 20s, … capped at two minutes. Long enough that a host which cannot boot stops
+// shouting, short enough that fixing the host is noticed within a minute or so.
+func nextBackoff(current time.Duration) time.Duration {
+	const first, max = 5 * time.Second, 2 * time.Minute
+	switch {
+	case current <= 0:
+		return first
+	case current >= max:
+		return max
+	case current*2 > max:
+		return max
+	default:
+		return current * 2
 	}
 }
 
