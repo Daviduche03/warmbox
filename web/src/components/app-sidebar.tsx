@@ -17,7 +17,7 @@ import { Plus as PlusIcon } from "@phosphor-icons/react";
 
 export function AppSidebar() {
 	const route = useRoute();
-	const current = "#" + route.path;
+	const current = route.path;
 	const groups = withActiveRoute(navGroups, current);
 	const footers = withActiveRoute([{ items: footerNavLinks }], current)[0].items;
 
@@ -25,7 +25,7 @@ export function AppSidebar() {
 		<Sidebar collapsible="icon" variant="inset">
 			<SidebarHeader className="h-14 justify-center">
 				<SidebarMenuButton asChild>
-					<a href="#/">
+					<a href="/">
 						<span className="flex size-[18px] shrink-0 items-center justify-center [&>svg]:size-[18px]">
 							<LogoIcon />
 						</span>
@@ -41,7 +41,7 @@ export function AppSidebar() {
 							className="min-w-8 bg-primary text-primary-foreground duration-200 ease-linear hover:bg-primary/90 hover:text-primary-foreground active:bg-primary/90 active:text-primary-foreground"
 							tooltip="New desktop"
 						>
-							<a href="#/desktops">
+							<a href="/desktops">
 								<PlusIcon />
 								<span>New desktop</span>
 							</a>

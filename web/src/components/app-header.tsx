@@ -10,10 +10,10 @@ import { useRoute } from "@/lib/router";
 
 export function AppHeader() {
 	const route = useRoute();
-	const current = "#" + route.path;
+	const current = route.path;
 	const activeItem =
 		navLinks.find((item) => item.path === current) ??
-		navLinks.find((item) => item.path === "#/");
+		navLinks.find((item) => item.path === "/");
 
 	return (
 		<header

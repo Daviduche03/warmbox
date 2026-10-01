@@ -13,6 +13,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { useStore } from "@/lib/store";
 import { api } from "@/lib/api";
+import { navigate } from "@/lib/router";
 import { GearSix as SettingsIcon, SignOut } from "@phosphor-icons/react";
 
 /**
@@ -84,7 +85,7 @@ export function NavUser() {
 					))}
 				</DropdownMenuGroup>
 				<DropdownMenuSeparator />
-				<DropdownMenuItem onSelect={() => (window.location.hash = "/settings")}>
+				<DropdownMenuItem onSelect={() => navigate("/settings")}>
 					<SettingsIcon />
 					Settings
 				</DropdownMenuItem>

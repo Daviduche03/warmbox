@@ -82,7 +82,7 @@ export function RecentConversations({
 				)}
 				<div className="flex justify-center border-t py-3">
 					<Button asChild size="sm" variant="ghost">
-						<a href="#/desktops">
+						<a href="/desktops">
 							Manage desktops
 							<ArrowRightIcon aria-hidden="true" data-icon="inline-end" />
 						</a>

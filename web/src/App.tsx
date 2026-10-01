@@ -1,10 +1,11 @@
+import { useEffect } from "react";
 import { StoreProvider } from "@/lib/store";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { AppShell } from "@/components/app-shell";
 import { AuthGate } from "@/components/auth-gate";
 import { Dashboard } from "@/components/dashboard";
 import { EmptyState } from "@/components/empty-state";
-import { useRoute } from "@/lib/router";
+import { installRouter, useRoute } from "@/lib/router";
 import { DesktopsPage } from "@/pages/Desktops";
 import { VolumesPage } from "@/pages/Volumes";
 import { SnapshotsPage } from "@/pages/Snapshots";
@@ -53,6 +54,8 @@ function Routes() {
 }
 
 export default function App() {
+	useEffect(() => installRouter(), []);
+
 	return (
 		<StoreProvider>
 			<TooltipProvider>

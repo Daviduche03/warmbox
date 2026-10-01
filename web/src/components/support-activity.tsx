@@ -78,7 +78,7 @@ export function SupportActivity({
 			</CardContent>
 			<div className="flex items-center justify-center">
 				<Button asChild size="sm" variant="ghost">
-					<a href="#/activity">
+					<a href="/activity">
 						View all
 						<ArrowRightIcon aria-hidden="true" data-icon="inline-end" />
 					</a>

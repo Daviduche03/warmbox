@@ -14,7 +14,7 @@ export function LatestChange() {
 		badge: status?.version ?? "warmbox",
 		title: "Control plane",
 		description: "Live daemon state.", // TIP: Use a single line of text for the description. (max 5 words)
-		readMore: { href: "#/settings", label: "Daemon details" },
+		readMore: { href: "/settings", label: "Daemon details" },
 	} as const;
 
 	if (!isOpen) {

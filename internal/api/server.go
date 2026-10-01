@@ -287,21 +287,20 @@ func (s *Server) withAuth(next http.Handler) http.Handler {
 	})
 }
 
-// isShellPath reports whether a request is for the dashboard bundle itself —
-// index.html or a file the build dropped next to it (assets, favicon). API,
-// WebSocket and console routes are pinned explicitly so a dotted name can
-// never slip through the gate.
+// isShellPath reports whether a request may reach the dashboard without an
+// identity. That is the bundle itself (index.html, assets, favicon) and every
+// client-side route — /snapshots, /settings, … — because the SPA only renders
+// chrome there; the data still comes from the authenticated /api. API, WebSocket
+// and console routes are pinned explicitly so they can never slip through the
+// gate: everything else falls to webui, which serves a real file if one exists
+// and the SPA shell otherwise.
 func isShellPath(p string) bool {
 	for _, prefix := range []string{"/api/", "/internal/", "/websockify/", "/p/", "/d/", "/vnc/"} {
 		if strings.HasPrefix(p, prefix) {
 			return false
 		}
 	}
-	if p == "/" || p == "/index.html" {
-		return true
-	}
-	base := p[strings.LastIndexByte(p, '/')+1:]
-	return strings.Contains(base, ".")
+	return true
 }
 
 // fail reports an operational failure without echoing internals: the detail

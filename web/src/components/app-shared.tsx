@@ -22,13 +22,13 @@ export type SidebarNavGroup = {
 	items: SidebarNavItem[];
 };
 
-/** Hash paths; `#/` is the overview. Active state is resolved against the live route. */
+/** App paths; `/` is the overview. Active state is resolved against the live route. */
 export const navGroups: SidebarNavGroup[] = [
 	{
 		items: [
 			{
 				title: "Overview",
-				path: "#/",
+				path: "/",
 				icon: <LayoutGridIcon />,
 			},
 		],
@@ -38,22 +38,22 @@ export const navGroups: SidebarNavGroup[] = [
 		items: [
 			{
 				title: "Desktops",
-				path: "#/desktops",
+				path: "/desktops",
 				icon: <MonitorIcon />,
 			},
 			{
 				title: "Volumes",
-				path: "#/volumes",
+				path: "/volumes",
 				icon: <HardDriveIcon />,
 			},
 			{
 				title: "Snapshots",
-				path: "#/snapshots",
+				path: "/snapshots",
 				icon: <CameraIcon />,
 			},
 			{
 				title: "Images",
-				path: "#/images",
+				path: "/images",
 				icon: <LayersIcon />,
 			},
 		],
@@ -63,12 +63,12 @@ export const navGroups: SidebarNavGroup[] = [
 		items: [
 			{
 				title: "Activity",
-				path: "#/activity",
+				path: "/activity",
 				icon: <ActivityIcon />,
 			},
 			{
 				title: "Settings",
-				path: "#/settings",
+				path: "/settings",
 				icon: <SettingsIcon />,
 			},
 		],
@@ -90,7 +90,7 @@ export const navLinks: SidebarNavItem[] = [
 	...footerNavLinks,
 ];
 
-/** Marks the item (or one of its sub-items) whose path matches the current hash. */
+/** Marks the item (or one of its sub-items) whose path matches the current route. */
 export function withActiveRoute(groups: SidebarNavGroup[], current: string) {
 	return groups.map((group) => ({
 		...group,

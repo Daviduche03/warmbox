@@ -21,6 +21,7 @@ import {
 import { StatusIndicator } from "@/components/indicator";
 import { EmptyState } from "@/components/empty-state";
 import { useStore } from "@/lib/store";
+import { navigate } from "@/lib/router";
 import { Check as CheckIcon, Copy as CopyIcon, DotsThree as EllipsisIcon, Stack as LayersIcon } from "@phosphor-icons/react";
 
 /** Bootable images registered with the daemon, with the default one called out. */
@@ -101,7 +102,7 @@ export function TeamOnDuty({
 												Copy image name
 											</DropdownMenuItem>
 											<DropdownMenuItem
-												onSelect={() => (window.location.hash = "/images")}
+												onSelect={() => navigate("/images")}
 											>
 												<CheckIcon className="size-4 opacity-70" />
 												Manage images
