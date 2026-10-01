@@ -9,7 +9,8 @@ Let an agent (or the host / an SDK) **run commands, move files, and (optionally)
 drive the screen** inside a warmbox VM — without noVNC and without SSH keys.
 
 Non-goals: not a job scheduler/queue, not multi-tenant policy, and not a
-replacement for the GUI (it's an automation channel alongside it).
+replacement for the GUI (it's an automation channel alongside it — except on a
+headless image, where there is no GUI and this is the only channel).
 
 ## Shape: a guest agent + a host proxy
 

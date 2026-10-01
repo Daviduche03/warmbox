@@ -138,6 +138,18 @@ COPY --from=agentbuild /warmbox-agent /usr/local/bin/warmbox-agent
 COPY init /init
 RUN chmod +x /init /usr/local/bin/warmbox-agent
 
+# HEADLESS=1 marks the image as one with no screen: /init reads this file and
+# skips Xvnc and the desktop session, reporting ready off the agent port
+# instead. It is a file inside the image rather than a cmdline flag from the
+# host on purpose — the image then boots correctly under a daemon that has
+# never heard of headless, and no host/guest version has to be paired.
+# Deliberately last-ish so a normal build never re-runs the heavy layers.
+ARG HEADLESS=0
+RUN if [ "$HEADLESS" = "1" ]; then \
+        mkdir -p /etc/warmbox && \
+        echo "headless" > /etc/warmbox/headless; \
+    fi
+
 # Regenerate caches that the GUI stack needs at runtime.
 RUN update-mime-database /usr/share/mime 2>/dev/null || true
 RUN (gdk-pixbuf-query-loaders --update-cache 2>/dev/null || \

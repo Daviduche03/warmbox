@@ -12,6 +12,9 @@ import {
   ApiError,
   type DaemonStatus,
   type Desktop,
+  type ImageMeta,
+  type ImagesResponse,
+  type ImageStatus,
   type Me,
   type Snapshot,
   type Volume,
@@ -42,6 +45,10 @@ interface Store {
   volumes: Volume[];
   snapshots: Snapshot[];
   images: string[];
+  /** Per-image meta.json overrides, keyed by image name ({} on older daemons). */
+  imageMeta: Record<string, ImageMeta>;
+  /** Every image this build knows about, installed or not. */
+  catalogue: ImageStatus[];
   history: Sample[];
   events: Event[];
   loading: boolean;
@@ -69,6 +76,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [volumes, setVolumes] = useState<Volume[]>([]);
   const [snapshots, setSnapshots] = useState<Snapshot[]>([]);
   const [images, setImages] = useState<string[]>([]);
+  const [imageMeta, setImageMeta] = useState<Record<string, ImageMeta>>({});
+  const [catalogue, setCatalogue] = useState<ImageStatus[]>([]);
   const [history, setHistory] = useState<Sample[]>([]);
   const [events, setEvents] = useState<Event[]>([]);
   const [loading, setLoading] = useState(true);
@@ -110,7 +119,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         api.desktops.list().catch(() => ({ desktops: [] })),
         api.volumes.list().catch(() => ({ volumes: [] })),
         api.snapshots.list().catch(() => ({ snapshots: [] })),
-        api.images().catch(() => ({ images: [] })),
+        api.images().catch((): ImagesResponse => ({ images: [] })),
       ]);
       const ds = d.desktops ?? [];
       setStatus(st);
@@ -118,6 +127,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       setVolumes(v.volumes ?? []);
       setSnapshots(s.snapshots ?? []);
       setImages(im.images ?? []);
+      setImageMeta(im.image_meta ?? {});
+      setCatalogue(im.catalogue ?? []);
       setError(undefined);
       setUnauthorized(false);
 
@@ -191,6 +202,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         volumes,
         snapshots,
         images,
+        imageMeta,
+        catalogue,
         history,
         events,
         loading,

@@ -5,12 +5,16 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"runtime"
+	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,6 +23,8 @@ import (
 	"warmbox/internal/catalog"
 	"warmbox/internal/desktop"
 	"warmbox/internal/egress"
+	"warmbox/internal/imagecfg"
+	"warmbox/internal/release"
 	"warmbox/internal/update"
 	"warmbox/internal/vnc"
 	"warmbox/internal/volume"
@@ -42,6 +48,10 @@ type Server struct {
 	// GET /api/status; nil when the daemon did not wire one (tests).
 	updater *update.Manager
 
+	// pulls tracks guest-image downloads: the one in flight, and how the last
+	// one for each image ended.
+	pulls *pullRegistry
+
 	polMu    sync.Mutex
 	policies map[string]egress.Policy // per-desktop egress policy
 }
@@ -51,7 +61,11 @@ func New(mgr *desktop.Manager, p *desktop.Pool, cfg *desktop.Config, volumes *vo
 	if log == nil {
 		log = io.Discard
 	}
-	return &Server{mgr: mgr, pool: p, cfg: cfg, volumes: volumes, catalog: cat, log: log, started: time.Now(), web: web.Handler(), policies: map[string]egress.Policy{}}
+	return &Server{
+		mgr: mgr, pool: p, cfg: cfg, volumes: volumes, catalog: cat, log: log,
+		started: time.Now(), web: web.Handler(), policies: map[string]egress.Policy{},
+		pulls: newPullRegistry(),
+	}
 }
 
 // effectivePolicy merges a request's allow/deny with the daemon defaults. A
@@ -112,6 +126,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/desktops", s.create)
 	mux.HandleFunc("GET /api/status", s.status)
 	mux.HandleFunc("GET /api/images", s.images)
+	mux.HandleFunc("POST /api/images/{name}/pull", s.imagePull)
 
 	// Cloud storage (where volume bytes live) — owner-only, see minRoleFor.
 	mux.HandleFunc("GET /api/cloud", s.cloudGet)
@@ -366,7 +381,7 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 	custom := req.CPUs > 0 || req.MemMiB > 0
 	switch {
 	case req.Volume != "":
-		s.createWithVolume(w, r, req.Volume, pol, req.CPUs, req.MemMiB)
+		s.createWithVolume(w, r, req.Volume, req.Image, pol, req.CPUs, req.MemMiB)
 	case req.Image != "":
 		s.createImage(w, r, req.Image, pol, req.CPUs, req.MemMiB)
 	case custom:
@@ -383,11 +398,9 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 		vm.SetWorkspace(ws)
 		s.setPolicy(vm.ID, pol)
 		s.recordDesktop(vm.ID, "", "ready", "", 0, ws)
-		writeJSON(w, http.StatusCreated, map[string]any{
-			"id":  vm.ID,
-			"vnc": "/d/" + vm.ID,
-			"ws":  "/websockify/" + vm.ID,
-		})
+		out := map[string]any{"id": vm.ID}
+		screenLinks(out, vm)
+		writeJSON(w, http.StatusCreated, out)
 	}
 }
 
@@ -456,7 +469,12 @@ func (s *Server) desktopLimit() int {
 // default image and the caller asked for no particular size it can come from
 // the warm pool (instant); anything else boots on demand.
 func (s *Server) createImage(w http.ResponseWriter, r *http.Request, name string, pol egress.Policy, cpus, mem uint) {
-	if desktop.SameImage(name, s.cfg.Image) && cpus == 0 && mem == 0 {
+	// An unnamed create — or "default" — asks for the daemon's default image.
+	// Resolve it before the pool check below, so "is this the default?" compares
+	// like with like and an unnamed create can be served from the warm pool.
+	deflt := desktop.DefaultFor(s.cfg.Image)
+	name = desktop.CanonicalImage(name, s.cfg.Image)
+	if name == deflt && cpus == 0 && mem == 0 {
 		vm, err := s.pool.Acquire(r.Context())
 		if err != nil {
 			s.fail(w, http.StatusServiceUnavailable, "could not start a desktop", err)
@@ -466,11 +484,9 @@ func (s *Server) createImage(w http.ResponseWriter, r *http.Request, name string
 		vm.SetWorkspace(ws)
 		s.setPolicy(vm.ID, pol)
 		s.recordDesktop(vm.ID, "", "ready", "", 0, ws)
-		writeJSON(w, http.StatusCreated, map[string]any{
-			"id":  vm.ID,
-			"vnc": "/d/" + vm.ID,
-			"ws":  "/websockify/" + vm.ID,
-		})
+		out := map[string]any{"id": vm.ID}
+		screenLinks(out, vm)
+		writeJSON(w, http.StatusCreated, out)
 		return
 	}
 
@@ -479,7 +495,9 @@ func (s *Server) createImage(w http.ResponseWriter, r *http.Request, name string
 		ID: id, ImageName: name, CPUs: cpus, MemMiB: mem,
 	})
 	if err != nil {
-		s.fail(w, http.StatusBadRequest, "could not boot that image", err)
+		// Include the cause: "could not boot that image" alone does not tell a
+		// user that they typo'd a name or asked for one that is not installed.
+		s.fail(w, http.StatusBadRequest, "could not boot that image: "+err.Error(), err)
 		return
 	}
 	ws, _ := s.callerScope(r)
@@ -488,27 +506,274 @@ func (s *Server) createImage(w http.ResponseWriter, r *http.Request, name string
 	s.recordDesktop(id, "", "booting", "", 0, ws)
 	wctx, cancel := context.WithTimeout(r.Context(), 120*time.Second)
 	defer cancel()
-	if _, err := s.mgr.WaitReady(wctx, vm.ID); err != nil {
-		_ = s.mgr.Destroy(vm.ID)
-		s.fail(w, http.StatusGatewayTimeout, "the desktop did not become ready in time", err)
+	if !s.waitOrFail(w, wctx, vm) {
 		return
 	}
-	writeJSON(w, http.StatusCreated, map[string]any{
-		"id":  vm.ID,
-		"vnc": "/d/" + vm.ID,
-		"ws":  "/websockify/" + vm.ID,
-	})
+	out := map[string]any{"id": vm.ID}
+	screenLinks(out, vm)
+	writeJSON(w, http.StatusCreated, out)
 }
 
-// images lists the guest images the daemon can boot.
+// screenLinks adds a desktop's streaming endpoints to a create response.
+// A headless image has no screen, so the keys are omitted rather than handed
+// out as links to a page that can never load.
+func screenLinks(out map[string]any, vm *desktop.VM) {
+	info := vm.Info()
+	if info.Headless {
+		return
+	}
+	out["vnc"] = "/d/" + info.ID
+	out["ws"] = "/websockify/" + info.ID
+}
+
+// waitOrFail blocks until a freshly booted VM is ready, and on failure says
+// which of the three things happened — the client gave up, the boot timed out,
+// or the VM died — instead of one vague message for all of them. A VM that
+// exits during boot is the common one (a missing kernel, a bad image), and it
+// used to take the full timeout to report, which is why a failure looked like
+// nothing happening at all.
+func (s *Server) waitOrFail(w http.ResponseWriter, ctx context.Context, vm *desktop.VM) bool {
+	if _, err := s.mgr.WaitReady(ctx, vm.ID); err != nil {
+		_ = s.mgr.Destroy(vm.ID)
+		switch {
+		case errors.Is(err, context.Canceled):
+			s.fail(w, http.StatusGatewayTimeout, "the desktop was still booting when the client disconnected", err)
+		case errors.Is(err, context.DeadlineExceeded):
+			s.fail(w, http.StatusGatewayTimeout, "the desktop did not become ready in time", err)
+		default:
+			s.fail(w, http.StatusBadGateway, "the desktop failed to boot: "+err.Error(), err)
+		}
+		return false
+	}
+	return true
+}
+
+// ImageStatus is one row of the Images page: an image this build knows about,
+// whether it is installed, and what is happening to it.
+type ImageStatus struct {
+	Name     string `json:"name"`
+	Headless bool   `json:"headless"`
+	// Installed means the daemon can boot it right now.
+	Installed bool `json:"installed"`
+	// Pullable is false when there is nothing to download: either the image is
+	// not published, or it was built on this machine and this binary has never
+	// heard of it.
+	Pullable bool `json:"pullable"`
+	// State is "installed", "available", "pulling" or "failed".
+	State string `json:"state"`
+	// Detail explains a failure; Done and Total describe a download in flight.
+	Detail string `json:"detail,omitempty"`
+	Done   int64  `json:"done,omitempty"`
+	Total  int64  `json:"total,omitempty"`
+}
+
+// imageStatuses merges the two things that describe an image: whether it is
+// installed on this machine, and whether the registry this binary shipped with
+// knows about it.
+//
+// The union is the point. The registry alone would hide an image built here from
+// a local config; the installed list alone is why the page had nothing to say
+// about an image that exists and could be fetched, but has not been.
+func (s *Server) imageStatuses() []ImageStatus {
+	installed := s.mgr.ImageMetas()
+	out := make([]ImageStatus, 0, len(installed))
+	known := make(map[string]bool, len(installed))
+
+	for _, c := range imagecfg.Catalogue() {
+		known[c.Name] = true
+		st := ImageStatus{Name: c.Name, Headless: c.Headless, Pullable: c.Publish}
+		if meta, ok := installed[c.Name]; ok {
+			// The installed image is the authority on what it is: its meta.json
+			// is what the daemon actually acts on.
+			st.Installed, st.Headless, st.State = true, meta.Headless, "installed"
+		} else {
+			st.State = "available"
+		}
+		out = append(out, st)
+	}
+	for name, meta := range installed {
+		if known[name] {
+			continue
+		}
+		out = append(out, ImageStatus{
+			Name: name, Headless: meta.Headless, Installed: true, State: "installed",
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+
+	for i := range out {
+		st, ok := s.pulls.state(out[i].Name)
+		if !ok {
+			continue
+		}
+		if st.active {
+			out[i].State, out[i].Done, out[i].Total = "pulling", st.done, st.total
+			continue
+		}
+		if st.err != nil && !out[i].Installed {
+			out[i].State, out[i].Detail = "failed", st.err.Error()
+		}
+	}
+	return out
+}
+
+// imagePull starts a background download of a published image.
+//
+// It returns as soon as the job is registered: an image is hundreds of MB, and a
+// request that blocks for minutes is a request that looks like nothing happening
+// — which is exactly how a failed create read before the wait learned to fail
+// fast.
+func (s *Server) imagePull(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if _, admin := s.callerScope(r); !admin {
+		writeJSON(w, http.StatusForbidden, map[string]string{
+			"error": "installing an image changes the daemon for everyone; ask an admin",
+		})
+		return
+	}
+	c, ok := imagecfg.Find(imagecfg.Catalogue(), name)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{
+			"error": fmt.Sprintf("no image called %q in this build", name),
+		})
+		return
+	}
+	if !c.Publish {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": fmt.Sprintf("%q is not published — build it from a checkout with `warmbox image build %s`", name, name),
+		})
+		return
+	}
+	if r.URL.Query().Get("force") == "" && slices.Contains(s.mgr.Images(), name) {
+		writeJSON(w, http.StatusConflict, map[string]string{
+			"error": fmt.Sprintf("%q is already installed (add ?force=1 to replace it)", name),
+		})
+		return
+	}
+	job, started := s.pulls.start(name)
+	if !started {
+		writeJSON(w, http.StatusConflict, map[string]string{
+			"error": fmt.Sprintf("%q is already downloading", name),
+		})
+		return
+	}
+	fmt.Fprintf(s.log, "api: pulling image %s for %s\n", name, runtime.GOARCH)
+	go s.runImagePull(job, c)
+	w.WriteHeader(http.StatusAccepted)
+}
+
+// runImagePull is the work behind POST /api/images/{name}/pull: resolve the
+// published artifact and its checksum, then download and expand it where the
+// daemon will find it.
+func (s *Server) runImagePull(job *imagePull, c imagecfg.Config) {
+	url := release.ImageURL(c.Name, runtime.GOARCH)
+	sha, err := desktop.FetchChecksum(url + ".sha256")
+	if err != nil {
+		err = fmt.Errorf("no published image %q for %s/%s", c.Name, runtime.GOOS, runtime.GOARCH)
+	} else {
+		err = desktop.FetchImageProgress(s.cfg.ImageDir, c.Name, url, sha, job.report, nil)
+	}
+	if err != nil {
+		fmt.Fprintf(s.log, "image %s: pull failed: %v\n", c.Name, err)
+	} else {
+		fmt.Fprintf(s.log, "image %s: installed\n", c.Name)
+	}
+	job.finish(err)
+}
+
+// pullRegistry tracks image downloads: at most one in flight per image, with the
+// last outcome kept so the dashboard can show it.
+type pullRegistry struct {
+	mu   sync.Mutex
+	jobs map[string]*imagePull
+}
+
+func newPullRegistry() *pullRegistry {
+	return &pullRegistry{jobs: map[string]*imagePull{}}
+}
+
+// start registers a pull for name, or reports false when one is already running.
+func (r *pullRegistry) start(name string) (*imagePull, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if p, ok := r.jobs[name]; ok && p.snapshot().active {
+		return nil, false
+	}
+	p := &imagePull{name: name, active: true}
+	r.jobs[name] = p
+	return p, true
+}
+
+// state reports what is known about this image's current or last pull.
+func (r *pullRegistry) state(name string) (pullState, bool) {
+	r.mu.Lock()
+	p, ok := r.jobs[name]
+	r.mu.Unlock()
+	if !ok {
+		return pullState{}, false
+	}
+	return p.snapshot(), true
+}
+
+// imagePull is one download: its progress while it runs, and how it ended.
+type imagePull struct {
+	name string
+
+	mu     sync.Mutex
+	done   int64
+	total  int64
+	active bool
+	err    error
+}
+
+// pullState is a snapshot of a pull, safe to hand out.
+type pullState struct {
+	active bool
+	done   int64
+	total  int64
+	err    error
+}
+
+func (p *imagePull) snapshot() pullState {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return pullState{active: p.active, done: p.done, total: p.total, err: p.err}
+}
+
+// report records download progress (called from the download loop).
+func (p *imagePull) report(done, total int64) {
+	p.mu.Lock()
+	p.done, p.total = done, total
+	p.mu.Unlock()
+}
+
+// finish ends the job, successfully or not.
+func (p *imagePull) finish(err error) {
+	p.mu.Lock()
+	p.active, p.err = false, err
+	p.mu.Unlock()
+}
+
+// images lists the guest images the daemon can boot, plus the ones this build
+// knows about but that are not installed. images and image_meta are the plain
+// shape older clients read; catalogue is what the dashboard renders.
 func (s *Server) images(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"images": s.mgr.Images()})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"images":     s.mgr.Images(),
+		"image_meta": s.mgr.ImageMetas(),
+		"catalogue":  s.imageStatuses(),
+	})
 }
 
 // createWithVolume boots a VM whose writable layer is a persistent volume.
 // Volume-backed VMs cannot come from the warm pool (the disk must be attached
 // before boot), so they cold-boot. The volume must be visible to the caller.
-func (s *Server) createWithVolume(w http.ResponseWriter, r *http.Request, name string, pol egress.Policy, cpus, mem uint) {
+//
+// imageName is the guest image the caller asked for: attaching a volume does not
+// mean "whatever the daemon defaults to", and quietly booting a different image
+// than the one on screen is the kind of thing nobody notices until they are
+// staring at the wrong desktop.
+func (s *Server) createWithVolume(w http.ResponseWriter, r *http.Request, name, imageName string, pol egress.Policy, cpus, mem uint) {
 	if !s.volumesEnabled(w) {
 		return
 	}
@@ -520,7 +785,7 @@ func (s *Server) createWithVolume(w http.ResponseWriter, r *http.Request, name s
 		}
 	}
 	ctx := r.Context()
-	image, err := s.volumes.EnsureLocal(ctx, name)
+	volumeImage, err := s.volumes.EnsureLocal(ctx, name)
 	if err != nil {
 		s.fail(w, http.StatusBadGateway, "could not prepare the volume", err)
 		return
@@ -531,11 +796,12 @@ func (s *Server) createWithVolume(w http.ResponseWriter, r *http.Request, name s
 		return
 	}
 	vm, err := s.mgr.StartDesktop(desktop.StartSpec{
-		ID: id, VolumeName: name, VolumeImage: image, CPUs: cpus, MemMiB: mem,
+		ID: id, VolumeName: name, VolumeImage: volumeImage,
+		ImageName: imageName, CPUs: cpus, MemMiB: mem,
 	})
 	if err != nil {
 		s.unlockVolume(name, id)
-		s.fail(w, http.StatusInternalServerError, "could not start the desktop", err)
+		s.fail(w, http.StatusBadRequest, "could not boot that image: "+err.Error(), err)
 		return
 	}
 	vm.SetWorkspace(ws)
@@ -543,17 +809,13 @@ func (s *Server) createWithVolume(w http.ResponseWriter, r *http.Request, name s
 	s.recordDesktop(id, name, "booting", "", 0, ws)
 	wctx, cancel := context.WithTimeout(ctx, 90*time.Second)
 	defer cancel()
-	if _, err := s.mgr.WaitReady(wctx, vm.ID); err != nil {
-		_ = s.mgr.Destroy(vm.ID) // destroy hook commits + releases the volume
-		s.fail(w, http.StatusGatewayTimeout, "the desktop did not become ready in time", err)
+	if !s.waitOrFail(w, wctx, vm) {
+		// The destroy hook commits and releases the volume.
 		return
 	}
-	writeJSON(w, http.StatusCreated, map[string]any{
-		"id":     vm.ID,
-		"volume": name,
-		"vnc":    "/d/" + vm.ID,
-		"ws":     "/websockify/" + vm.ID,
-	})
+	out := map[string]any{"id": vm.ID, "volume": name}
+	screenLinks(out, vm)
+	writeJSON(w, http.StatusCreated, out)
 }
 
 // dashHTML is the short desktop page: noVNC fills the viewport. The iframe
@@ -566,13 +828,39 @@ iframe{border:0;width:100vw;height:100vh;display:block}</style></head>
  src="/vnc/%s/vnc.html?autoconnect=1&resize=scale&show_dot=1&path=/websockify/%s"></iframe>
 </body></html>`
 
+// headlessHTML is what /d/ shows for a desktop with no screen: the link is
+// still honoured rather than 404'd (bookmarks and API clients hold it), but
+// there is nothing to stream.
+const headlessHTML = `<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>warmbox</title>
+<style>html,body{margin:0;height:100%%;background:#111;color:#c9d1d9;font:14px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+main{max-width:34rem;margin:0 auto;padding:14vh 1.5rem 0}
+h1{font-size:1.05rem;font-weight:600;color:#fff;margin:0 0 .6rem}
+p{margin:0 0 .8rem}
+code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;background:#1c2128;padding:.1rem .35rem;border-radius:.25rem}
+a{color:#58a6ff}</style></head>
+<body><main>
+<h1>This desktop has no screen</h1>
+<p><code>%s</code> booted a headless image, so there is no desktop to stream.</p>
+<p>It is still fully usable through the agent API: run commands with
+<code>POST /api/desktops/%s/exec</code>, move files with <code>/files</code>,
+or start something long-lived with <code>/runs</code>.</p>
+<p><a href="/desktops">Back to desktops</a></p>
+</main></body></html>`
+
 // dash serves the short desktop URL. A request that still carries ?token= is
 // redirected to the bare path only when a login cookie already proves the
 // session — otherwise the query token IS the credential (API tokens don't set
 // cookies) and stripping it would lock the client out.
 func (s *Server) dash(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	if _, ok := s.visibleVM(w, r, id); !ok {
+	vm, ok := s.visibleVM(w, r, id)
+	if !ok {
+		return
+	}
+	if vm.Headless {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprintf(w, headlessHTML, id, id)
 		return
 	}
 	if r.URL.Query().Get("token") != "" && s.hasLoginCookie(r) {
@@ -710,6 +998,12 @@ func (s *Server) websockify(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	vm, ok := s.visibleVM(w, r, id)
 	if !ok {
+		return
+	}
+	// Nothing to proxy — the guest runs no X server, so this will never become
+	// ready. 409 rather than 503 so a client can tell the two apart.
+	if vm.Headless {
+		http.Error(w, "this desktop is headless: there is no screen to stream", http.StatusConflict)
 		return
 	}
 	target := vm.Target(s.cfg.GuestVNCPort)

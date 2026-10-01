@@ -1,0 +1,9 @@
+# Alpine + LXQt with the Ambiance theme. Same engine as xfce, different session
+# layer: the squashfs, overlay and VNC paths are identical.
+name: lxqt
+engine: overlay
+desktop: lxqt
+theme: ambiance
+browser: chromium
+headless: false
+publish: true

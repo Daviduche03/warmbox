@@ -59,7 +59,7 @@ function joinList(a?: string[]): string {
 }
 
 export function DesktopsPage() {
-	const { desktops, images, status, volumes, refresh } = useStore();
+	const { desktops, images, imageMeta, status, volumes, refresh } = useStore();
 	const [creating, setCreating] = useState(false);
 	const [image, setImage] = useState<string>("");
 	const [allow, setAllow] = useState<string>("");
@@ -212,17 +212,31 @@ export function DesktopsPage() {
 											<span className="line-clamp-1">{d.volume ?? "—"}</span>
 										</TableCell>
 										<TableCell>
-											<StateBadge state={d.state} />
+											<span className="flex items-center gap-2">
+												<StateBadge state={d.state} />
+												{d.headless ? (
+													<Badge variant="outline">Headless</Badge>
+												) : null}
+											</span>
 										</TableCell>
 										<TableCell className="pr-6 text-right">
 											<RowActions label={`Actions for ${d.id}`}>
-												<DropdownMenuItem
-													disabled={d.state === "dead" || d.state === "paused"}
-													onSelect={() => open(d.id)}
-												>
-													<SquareArrowOutUpRightIcon />
-													Open console
-												</DropdownMenuItem>
+												{d.headless ? (
+													<DropdownMenuItem disabled>
+														<SquareArrowOutUpRightIcon />
+														No screen (headless)
+													</DropdownMenuItem>
+												) : (
+													<DropdownMenuItem
+														disabled={
+															d.state === "dead" || d.state === "paused"
+														}
+														onSelect={() => open(d.id)}
+													>
+														<SquareArrowOutUpRightIcon />
+														Open console
+													</DropdownMenuItem>
+												)}
 												{d.state === "paused" ? (
 													<DropdownMenuItem onSelect={() => void resume(d.id)}>
 														<PlayIcon />
@@ -310,6 +324,7 @@ export function DesktopsPage() {
 										<SelectItem key={name} value={name}>
 											{name}
 											{name === status?.default_image ? " · default" : ""}
+											{imageMeta[name]?.headless ? " · headless" : ""}
 										</SelectItem>
 									))}
 								</SelectContent>

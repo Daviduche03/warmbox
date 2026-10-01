@@ -29,7 +29,8 @@ var packMembers = []string{
 	"vmlinux", "rootfs.squashfs", "initramfs-overlay",
 	"initramfs.zst", "initramfs-virt",
 	// volume-base.img is the sparse ext4 seed new volumes are cloned from. It
-	// belongs to the built-in image and is ~2 MB when compressed.
+	// travels with an image (~2 MB compressed) so a fresh install can create
+	// volumes without a second download.
 	"volume-base.img",
 }
 
@@ -59,21 +60,6 @@ func Pack(imageDir, name, out string) (string, error) {
 		out = filepath.Join(imageDir, name+".tar.zst")
 	}
 	return packFrom(dir, out)
-}
-
-// PackBuiltin writes the built-in image — the files that sit directly in the
-// workdir, not under images/<name> — as one archive, so it can ship as a single
-// release artifact.
-func PackBuiltin(workDir, out string) (string, error) {
-	if out == "" {
-		return "", fmt.Errorf("an output path is required")
-	}
-	for _, m := range []string{"vmlinux", "initramfs.zst", "rootfs.squashfs"} {
-		if !packExists(filepath.Join(workDir, m)) {
-			return "", fmt.Errorf("built-in image is incomplete: %s is missing", filepath.Join(workDir, m))
-		}
-	}
-	return packFrom(workDir, out)
 }
 
 // packFrom archives the packable members of dir (skipping missing ones).

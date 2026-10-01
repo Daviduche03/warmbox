@@ -34,13 +34,18 @@ import (
 	"warmbox/internal/config"
 	"warmbox/internal/desktop"
 	"warmbox/internal/egress"
+	"warmbox/internal/imagecfg"
+	"warmbox/internal/release"
 	"warmbox/internal/update"
 	"warmbox/internal/volume"
 )
 
 // version is the release string reported by `warmbox version` and /api/status.
-// Override at build time: go build -ldflags "-X main.version=v1.2.3".
-var version = "v0.1.0"
+// "dev" is a build that is not any release, so `warmbox version` says so and the
+// update check stays quiet rather than claiming a release is newer than a tree
+// it knows nothing about. Releases override it: goreleaser passes
+// -X main.version={{ .Tag }}.
+var version = "dev"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -179,11 +184,12 @@ Usage:
   warmbox logout            End the CLI session
   warmbox create            Provision a desktop, print its noVNC URL
   warmbox images            List the named guest images the daemon can boot
-  warmbox image pack <name> Pack an image to <name>.tar.zst (compressed)
-  warmbox image pack --builtin -o <file>
-                            Pack the built-in image for release
-  warmbox image pull <name> <file|url>
-                            Expand a packed image into the images directory
+  warmbox image build <name> Build an image from the registry in deploy/images
+                            (--all builds every image the checkout can build)
+  warmbox image pack <name> Pack an image into <name>.tar.zst (compressed)
+  warmbox image pull <name> [file|url]
+                            Expand an image into the images directory; with no
+                            source, the published image for this platform
   warmbox image list        List the local images (offline)
   warmbox list              List desktops
   warmbox destroy <id>      Destroy a desktop
@@ -223,16 +229,8 @@ func stat(path string) bool {
 
 func addCommonFlags(fs *flag.FlagSet, cfg *desktop.Config) {
 	fs.StringVar(&cfg.WorkDir, "workdir", cfg.WorkDir, "state directory")
-	fs.StringVar(&cfg.KernelPath, "kernel", cfg.KernelPath, "path to uncompressed vmlinux")
-	fs.StringVar(&cfg.InitrdPath, "initrd", cfg.InitrdPath, "path to all-RAM initramfs.zst")
-	fs.StringVar(&cfg.DiskPath, "disk", cfg.DiskPath, "base ext4 rootfs image for low-RAM disk boot (empty = all-RAM)")
-	fs.StringVar(&cfg.BootInitrdPath, "boot-initrd", cfg.BootInitrdPath, "Alpine boot initramfs for disk boot")
-	fs.StringVar(&cfg.SquashPath, "squash", cfg.SquashPath, "shared read-only squashfs base for overlay boot")
-	fs.StringVar(&cfg.OverlayInitrdPath, "overlay-initrd", cfg.OverlayInitrdPath, "boot initramfs for overlay boot")
-	fs.StringVar(&cfg.Image, "image", cfg.Image, "default guest image name to warm (empty = built-in)")
-	fs.StringVar(&cfg.ImageDir, "image-dir", cfg.ImageDir, "directory of named guest images (disk.raw + efi-vars.fd + meta.json)")
-	fs.StringVar(&cfg.EFIDisk, "efi-disk", cfg.EFIDisk, "legacy anonymous EFI disk image (when no named image is used)")
-	fs.StringVar(&cfg.EFIVars, "efi-vars", cfg.EFIVars, "seed EFI variable store copied per VM")
+	fs.StringVar(&cfg.Image, "image", cfg.Image, "default guest image to boot and warm (default: xfce)")
+	fs.StringVar(&cfg.ImageDir, "image-dir", cfg.ImageDir, "directory of guest images (<name>/ with meta.json)")
 	fs.StringVar(&cfg.GPU, "gpu", cfg.GPU, "virtio-gpu size, e.g. 1440x900 (empty = headless)")
 	fs.BoolVar(&cfg.Input, "input", cfg.Input, "attach virtio keyboard/pointing devices")
 	fs.BoolVar(&cfg.GUI, "gui", cfg.GUI, "open the hypervisor window (vfkit only; bring-up aid)")
@@ -791,27 +789,23 @@ func cmdDaemon(args []string) {
 	}
 	mgr := desktop.NewManager(cfg, os.Stderr)
 	images := mgr.Images()
-
-	// Named images (and a legacy --efi-disk) carry their own kernel, so the
-	// built-in guest artifacts are only required when there is no image.
-	if len(images) == 0 && cfg.EFIDisk == "" {
-		if _, err := os.Stat(cfg.KernelPath); err != nil {
-			fatal("missing guest kernel %s\n  run `warmbox setup` to download the guest image\n  (or build one with ./deploy/guest/build.sh)", cfg.KernelPath)
-		}
-		// Boot needs an overlay base, an ext4 disk, or the all-RAM initramfs.
-		haveOverlay := stat(cfg.SquashPath) && stat(cfg.OverlayInitrdPath)
-		haveDisk := stat(cfg.DiskPath) && stat(cfg.BootInitrdPath)
-		if !haveOverlay && !haveDisk && !stat(cfg.InitrdPath) {
-			fatal("missing guest rootfs — run ./deploy/guest/build.sh (need %s + %s, %s + %s, or %s)",
-				cfg.SquashPath, cfg.OverlayInitrdPath, cfg.DiskPath, cfg.BootInitrdPath, cfg.InitrdPath)
-		}
-	} else if len(images) > 0 {
-		fmt.Fprintf(os.Stderr, "warmbox: images: %v\n", images)
-		// Any image the daemon lists may be the default — overlay images
-		// (vmlinux + squashfs) as much as EFI disks, so validate against that
-		// same list rather than looking for disk.raw.
-		if cfg.Image != "" && !slices.Contains(images, desktop.CanonicalImage(cfg.Image)) {
-			fatal("default image %q not found under %s", cfg.Image, cfg.ImageDir)
+	if len(images) == 0 {
+		fatal("no guest image in %s\n  run `warmbox setup` to install one,\n  or build one with `warmbox image build <name>` (see deploy/images/)", cfg.ImageDir)
+	}
+	fmt.Fprintf(os.Stderr, "warmbox: images: %v\n", images)
+	// The default image must be one of them: a daemon whose --image points at
+	// something it cannot boot would fail every unnamed create instead of
+	// failing here, where the reason is obvious.
+	deflt := desktop.DefaultFor(cfg.Image)
+	if !slices.Contains(images, deflt) {
+		fatal("default image %q not found under %s (have: %v)", deflt, cfg.ImageDir, images)
+	}
+	// An image built against a newer guest agent may make calls this daemon
+	// cannot serve; say so now rather than at the first exec.
+	for name, meta := range mgr.ImageMetas() {
+		if meta.AgentAPI > desktop.AgentAPI {
+			fmt.Fprintf(os.Stderr, "warmbox: warning: image %q targets agent API %d, this daemon speaks %d\n",
+				name, meta.AgentAPI, desktop.AgentAPI)
 		}
 	}
 
@@ -858,7 +852,7 @@ func cmdDaemon(args []string) {
 		Version:       version,
 		Backend:       cfg.Backend,
 		VolumesBacked: backedBy,
-		DefaultImage:  desktop.CanonicalImage(cfg.Image),
+		DefaultImage:  desktop.DefaultFor(cfg.Image),
 	})
 	// "Is there something newer?" for the Daemon tab. It runs in the
 	// background and caches its answer: /api/status is polled, GitHub's API is
@@ -866,12 +860,14 @@ func cmdDaemon(args []string) {
 	// installed image's checksum lives beside the image, so a daemon started
 	// after `warmbox setup` picks the new one up on its own.
 	updater := update.New(update.Config{
-		Repo:         releaseRepo,
+		Repo:         release.Repo,
 		Current:      version,
 		Arch:         runtime.GOARCH,
-		ImageURL:     defaultImageURL(runtime.GOARCH),
-		ImageRelease: imageRelease,
-		ImageSHA:     func() string { return desktop.ReadImageSHA(filepath.Dir(cfg.KernelPath)) },
+		ImageURL:     release.ImageURL(desktop.DefaultFor(cfg.Image), runtime.GOARCH),
+		ImageRelease: release.ImagesTag,
+		ImageSHA: func() string {
+			return desktop.ReadImageSHA(filepath.Join(cfg.ImageDir, desktop.DefaultFor(cfg.Image)))
+		},
 	})
 	apiSrv.SetUpdater(updater)
 	updater.Start(ctx)
@@ -1025,33 +1021,16 @@ func backfillCatalog(ctx context.Context, cat *catalog.DB, store *volume.Store, 
 	}
 }
 
-// Where the prebuilt guest image comes from. The image is built per host arch —
-// the guest has to match the hypervisor the host can offer — and published under
-// the same tag as the binary, next to its .sha256.
-// Guest images live under a fixed release tag, not the binary's version: the
-// guest changes far less often than the CLI, and tying the two together meant
-// re-uploading ~800 MB on every release. `warmbox setup` asks for this tag, so
-// a new binary finds the image that is already published.
-const (
-	releaseRepo  = "Daviduche03/warmbox"
-	imageRelease = "images"
-	imagePattern = "warmbox-image-%s.tar.zst" // GOARCH
-)
-
-func defaultImageURL(arch string) string {
-	return fmt.Sprintf("https://github.com/%s/releases/download/%s/%s",
-		releaseRepo, imageRelease, fmt.Sprintf(imagePattern, arch))
-}
-
-// builtinImagePresent reports whether the files the daemon needs to boot are
-// already in place.
-func builtinImagePresent(cfg *desktop.Config) bool {
-	for _, p := range []string{cfg.KernelPath, cfg.InitrdPath, cfg.SquashPath} {
-		if _, err := os.Stat(p); err != nil {
-			return false
+// missingImages names the images the daemon expects but cannot find.
+func missingImages(cfg *desktop.Config, want ...string) []string {
+	have := desktop.ImagesIn(cfg.ImageDir)
+	var missing []string
+	for _, name := range want {
+		if !slices.Contains(have, name) {
+			missing = append(missing, name)
 		}
 	}
-	return true
+	return missing
 }
 
 // --- making the host ready ---------------------------------------------------
@@ -1169,10 +1148,11 @@ func ensureHypervisor(cfg *desktop.Config, allowInstall bool) bool {
 	return true
 }
 
-// buildGuestImage builds the guest image on this machine — there is no artifact
+// buildGuestImage builds one guest image on this machine — there is no artifact
 // to download for this platform, so it fetches the source for this version and
-// runs its build. Needs Docker, and about fifteen minutes.
-func buildGuestImage(allowInstall bool) error {
+// runs the same registry-driven build `warmbox image build` does. Needs Docker,
+// and about fifteen minutes.
+func buildGuestImage(cfg *desktop.Config, allowInstall bool, name string) error {
 	if !have("docker") {
 		if !allowInstall {
 			return fmt.Errorf("Docker is needed to build the guest image (--no-install given)")
@@ -1193,14 +1173,17 @@ func buildGuestImage(allowInstall bool) error {
 	defer os.RemoveAll(dir)
 
 	fmt.Fprintf(os.Stderr, "… fetching the source for %s\n", version)
-	url := fmt.Sprintf("https://github.com/%s/archive/refs/tags/%s.tar.gz", releaseRepo, version)
+	url := release.SourceURL(version)
 	if err := fetchTarball(url, dir); err != nil {
 		return fmt.Errorf("%v\n  (or build it by hand: ./deploy/guest/build.sh in a checkout)", err)
 	}
 
 	fmt.Fprintln(os.Stderr, "… building the guest image (about 15 minutes; the build prints its own progress)")
-	env := append(os.Environ(), "PLATFORM=linux/"+runtime.GOARCH)
-	if err := runCmd(dir, env, "./deploy/guest/build.sh"); err != nil {
+	c, err := imagecfg.LoadOne(imagecfg.Dir(dir), name)
+	if err != nil {
+		return fmt.Errorf("the source for %s has no image called %q: %v", version, name, err)
+	}
+	if err := buildImage(c, filepath.Join(dir, "deploy"), cfg.WorkDir, "linux/"+runtime.GOARCH, false); err != nil {
 		return fmt.Errorf("the guest image build failed: %v", err)
 	}
 	return nil
@@ -1210,18 +1193,18 @@ func cmdSetup(args []string) {
 	cfg := desktop.DefaultConfig()
 	fs := flag.NewFlagSet("setup", flag.ExitOnError)
 	fs.StringVar(&cfg.WorkDir, "workdir", cfg.WorkDir, "state directory")
-	fs.StringVar(&cfg.KernelPath, "kernel", cfg.KernelPath, "path to uncompressed vmlinux")
-	fs.StringVar(&cfg.InitrdPath, "initrd", cfg.InitrdPath, "path to initramfs.zst")
-	fs.StringVar(&cfg.SquashPath, "squash", cfg.SquashPath, "path to rootfs.squashfs")
+	fs.StringVar(&cfg.ImageDir, "image-dir", cfg.ImageDir, "directory of guest images")
+	fs.StringVar(&cfg.Image, "image", cfg.Image, "guest image to install and make the default (default: xfce)")
 	fs.StringVar(&cfg.NoVNCDir, "novnc", cfg.NoVNCDir, "noVNC asset directory")
 	fs.StringVar(&cfg.Backend, "backend", cfg.Backend, "hypervisor backend (vfkit, qemu)")
-	imageURL := fs.String("image-url", "", "guest image archive (default: the release for this version)")
+	imageURL := fs.String("image-url", "", "guest image archive (default: the published release for this image)")
 	imageSHA := fs.String("image-sha256", "", "expected sha256 (default: fetched from <url>.sha256)")
 	force := fs.Bool("force", false, "re-download the guest image even if it is already installed")
 	noImage := fs.Bool("no-image", false, "skip the guest image; check everything else")
 	noInstall := fs.Bool("no-install", false, "don't install missing prerequisites, just report them")
 	_ = fs.Parse(args)
 	allowInstall := !*noInstall
+	image := desktop.DefaultFor(cfg.Image)
 
 	if err := cfg.EnsureDirs(); err != nil {
 		fatal("Error: %v", err)
@@ -1233,10 +1216,10 @@ func cmdSetup(args []string) {
 	switch {
 	case *noImage:
 		fmt.Fprintln(os.Stderr, "… skipping the guest image (--no-image)")
-	case !*force && builtinImagePresent(cfg):
-		fmt.Fprintf(os.Stderr, "✓ guest image in %s\n", filepath.Dir(cfg.KernelPath))
+	case !*force && len(missingImages(cfg, image)) == 0:
+		fmt.Fprintf(os.Stderr, "✓ guest image %q in %s\n", image, filepath.Join(cfg.ImageDir, image))
 	default:
-		if err := installGuestImage(cfg, *imageURL, *imageSHA, *force, allowInstall); err != nil {
+		if err := installGuestImage(cfg, image, *imageURL, *imageSHA, *force, allowInstall); err != nil {
 			fmt.Fprintf(os.Stderr, "✗ guest image: %v\n", err)
 			ready = false
 		}
@@ -1286,30 +1269,19 @@ func dashboardURL(addr string) string {
 	return "http://" + net.JoinHostPort(host, port)
 }
 
-// installGuestImage downloads the guest image archive and installs it into the
-// directory the daemon will read the image from, verifying the published
-// checksum first.
-// installGuestImage gets the guest image onto this machine: it downloads the
-// published artifact when there is one, and builds it here when there is not.
-func installGuestImage(cfg *desktop.Config, url, sha string, force, allowInstall bool) error {
-	// The image files live next to the kernel. Use that directory rather than
-	// WorkDir: a custom --workdir does not move the image paths, and installing
-	// somewhere the daemon never looks would look like success and then fail at
-	// boot.
-	dir := filepath.Dir(cfg.KernelPath)
-	for _, p := range []string{cfg.InitrdPath, cfg.SquashPath} {
-		if filepath.Dir(p) != dir {
-			return fmt.Errorf("image paths span two directories (%s and %s);\n  point --kernel/--initrd/--squash at one directory", dir, filepath.Dir(p))
-		}
-	}
-
+// installGuestImage gets one guest image onto this machine: it downloads the
+// published archive when there is one, and builds it from source when there is
+// not. The archive is verified against the published checksum before anything
+// lands under ImageDir.
+func installGuestImage(cfg *desktop.Config, name, url, sha string, force, allowInstall bool) error {
 	explicit := url != ""
 	if !explicit {
-		url = defaultImageURL(runtime.GOARCH)
+		url = release.ImageURL(name, runtime.GOARCH)
 	}
 	if force {
-		_ = os.Remove(filepath.Join(dir, ".image-download.tar.zst"))
+		_ = os.Remove(filepath.Join(cfg.ImageDir, "."+name+".download.tar.zst"))
 	}
+	dir := filepath.Join(cfg.ImageDir, name)
 
 	if sha == "" {
 		s, err := desktop.FetchChecksum(url + ".sha256")
@@ -1319,27 +1291,45 @@ func installGuestImage(cfg *desktop.Config, url, sha string, force, allowInstall
 			}
 			// Nothing published for this platform, so make one here rather than
 			// leaving the user to do it.
-			fmt.Fprintf(os.Stderr, "… no published guest image for %s/%s\n", runtime.GOOS, runtime.GOARCH)
-			if err := buildGuestImage(allowInstall); err != nil {
+			fmt.Fprintf(os.Stderr, "… no published image %q for %s/%s\n", name, runtime.GOOS, runtime.GOARCH)
+			if err := buildGuestImage(cfg, allowInstall, name); err != nil {
 				return err
 			}
-			if !builtinImagePresent(cfg) {
-				return fmt.Errorf("the build finished but %s is still empty", dir)
+			if missing := missingImages(cfg, name); len(missing) > 0 {
+				return fmt.Errorf("the build finished but %s has no %q image", cfg.ImageDir, name)
 			}
-			fmt.Fprintf(os.Stderr, "✓ guest image built in %s\n", dir)
+			fmt.Fprintf(os.Stderr, "✓ guest image %q built in %s\n", name, dir)
 			// Not a published archive, so there is nothing to compare it to;
 			// the dashboard says "built locally" instead of offering an update.
 			_ = desktop.WriteImageSHA(dir, "local")
-			return nil
+			return seedVolumeBase(cfg, name)
 		}
 		sha = s
 	}
 
-	fmt.Fprintf(os.Stderr, "… fetching the guest image for %s (several hundred MB, resumable)\n  %s\n", runtime.GOARCH, url)
-	if err := desktop.FetchBuiltin(dir, url, sha, os.Stderr); err != nil {
+	fmt.Fprintf(os.Stderr, "… fetching the %s guest image for %s (several hundred MB, resumable)\n  %s\n", name, runtime.GOARCH, url)
+	if err := desktop.FetchImage(cfg.ImageDir, name, url, sha, os.Stderr); err != nil {
 		return fmt.Errorf("%v\n  (re-run to resume; pass --force to start clean)", err)
 	}
-	fmt.Fprintf(os.Stderr, "✓ guest image installed in %s\n", dir)
+	fmt.Fprintf(os.Stderr, "✓ guest image %q installed in %s\n", name, dir)
+	return seedVolumeBase(cfg, name)
+}
+
+// seedVolumeBase puts an image's volume-base.img where volumes look for it. The
+// base is a shared sparse ext4 seed that travels inside the image archive, so
+// the first image installed with one provides it for the whole machine.
+func seedVolumeBase(cfg *desktop.Config, name string) error {
+	if cfg.VolumeBase == "" || stat(cfg.VolumeBase) {
+		return nil
+	}
+	src := filepath.Join(cfg.ImageDir, name, "volume-base.img")
+	if !stat(src) {
+		return nil
+	}
+	if err := desktop.CopyFile(src, cfg.VolumeBase); err != nil {
+		return fmt.Errorf("installing the volume base: %w", err)
+	}
+	fmt.Fprintf(os.Stderr, "✓ volume base seeded from the %s image\n", name)
 	return nil
 }
 
@@ -1657,54 +1647,48 @@ func cmdCreate(args []string) {
 	if out.ID == "" {
 		fatal("daemon returned no desktop (status %s)", resp.Status)
 	}
-	fmt.Fprintf(os.Stderr, "desktop %s ready\n", out.ID)
-	fmt.Printf("%s%s\n", apiBase(addr), out.VNC)
+	// A headless image answers with no console URL: say so, and print the
+	// desktop's API resource instead of an empty path.
+	if out.VNC == "" {
+		fmt.Fprintf(os.Stderr, "desktop %s ready (headless — no screen)\n", out.ID)
+	} else {
+		fmt.Fprintf(os.Stderr, "desktop %s ready\n", out.ID)
+	}
+	loc := out.VNC
+	if loc == "" {
+		loc = "/api/desktops/" + out.ID
+	}
+	fmt.Printf("%s%s\n", apiBase(addr), loc)
 }
 
 // cmdImage packs/pulls guest images and lists them offline.
 func cmdImage(args []string) {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "Usage: warmbox image <pack|pull|list>")
+		fmt.Fprintln(os.Stderr, "Usage: warmbox image <build|pack|pull|list>")
 		os.Exit(1)
 	}
 	cfg := desktop.DefaultConfig()
 	switch args[0] {
+	case "build":
+		cmdImageBuild(args[1:])
 	case "list":
-		entries, _ := os.ReadDir(cfg.ImageDir)
-		n := 0
-		for _, e := range entries {
-			if e.IsDir() {
-				if _, err := os.Stat(filepath.Join(cfg.ImageDir, e.Name(), "disk.raw")); err == nil {
-					fmt.Println(e.Name())
-					n++
-				}
-			}
-		}
-		if n == 0 {
+		names := desktop.ImagesIn(cfg.ImageDir)
+		if len(names) == 0 {
 			fmt.Fprintln(os.Stderr, "(no images)")
+			return
+		}
+		for _, n := range names {
+			fmt.Println(n)
 		}
 	case "pack":
 		fs := flag.NewFlagSet("image pack", flag.ExitOnError)
 		out := fs.String("o", "", "output path (default <images>/<name>.tar.zst)")
-		builtin := fs.Bool("builtin", false, "pack the built-in image (the files directly in the workdir)")
-		_ = fs.Parse(args[1:])
-		rest := fs.Args()
-
-		var (
-			p     string
-			label string
-			err   error
-		)
-		if *builtin {
-			label = "built-in image"
-			p, err = desktop.PackBuiltin(cfg.WorkDir, *out)
-		} else {
-			if len(rest) < 1 {
-				fatal("Usage: warmbox image pack <name> [-o out.tar.zst]\n       warmbox image pack --builtin -o out.tar.zst")
-			}
-			label = rest[0]
-			p, err = desktop.Pack(cfg.ImageDir, rest[0], *out)
+		rest := parseArgsAnywhere(fs, args[1:])
+		if len(rest) < 1 {
+			fatal("Usage: warmbox image pack <name> [-o out.tar.zst]")
 		}
+		label := rest[0]
+		p, err := desktop.Pack(cfg.ImageDir, label, *out)
 		if err != nil {
 			fatal("Error: %v", err)
 		}
@@ -1722,18 +1706,261 @@ func cmdImage(args []string) {
 			label, p, float64(fi.Size())/(1<<30), sum, side)
 	case "pull":
 		fs := flag.NewFlagSet("image pull", flag.ExitOnError)
-		_ = fs.Parse(args[1:])
-		rest := fs.Args()
-		if len(rest) < 2 {
-			fatal("Usage: warmbox image pull <name> <file|url>")
+		sha := fs.String("sha256", "", "expected sha256 (default: fetched from <url>.sha256)")
+		rest := parseArgsAnywhere(fs, args[1:])
+		if len(rest) < 1 || len(rest) > 2 {
+			fatal("Usage: warmbox image pull <name> [file|url]\n" +
+				"       warmbox image pull <name>   # the published image for this platform")
 		}
-		if err := desktop.Pull(cfg.ImageDir, rest[0], rest[1]); err != nil {
+		name := rest[0]
+		src := release.ImageURL(name, runtime.GOARCH)
+		if len(rest) == 2 {
+			src = rest[1]
+		}
+		remote := strings.HasPrefix(src, "http://") || strings.HasPrefix(src, "https://")
+		if remote {
+			// A download is checked against the published checksum before it is
+			// expanded: an image is code that boots.
+			if *sha == "" {
+				s, err := desktop.FetchChecksum(src + ".sha256")
+				if err != nil {
+					if len(rest) == 2 {
+						fatal("Error: could not read %s.sha256: %v\n  pass --sha256 to pull it anyway", src, err)
+					}
+					fatal("Error: no published image %q for %s/%s\n  build it here instead: warmbox image build %s",
+						name, runtime.GOOS, runtime.GOARCH, name)
+				}
+				*sha = s
+			}
+			if err := desktop.FetchImage(cfg.ImageDir, name, src, *sha, os.Stderr); err != nil {
+				fatal("Error: %v", err)
+			}
+		} else if err := desktop.Pull(cfg.ImageDir, name, src); err != nil {
 			fatal("Error: %v", err)
 		}
-		fmt.Fprintf(os.Stderr, "pulled %s into %s\n", rest[0], filepath.Join(cfg.ImageDir, rest[0]))
+		fmt.Fprintf(os.Stderr, "pulled %s into %s\n", name, filepath.Join(cfg.ImageDir, name))
 	default:
-		fatal("unknown image command %q (pack|pull|list)", args[0])
+		fatal("unknown image command %q (build|pack|pull|list)", args[0])
 	}
+}
+
+// parseArgsAnywhere parses flags that appear before, between or after the
+// positional arguments. The flag package stops at the first positional, which
+// would make `warmbox image build lxqt --dry-run` treat --dry-run as an image
+// name. Returns the positionals, in order.
+func parseArgsAnywhere(fs *flag.FlagSet, args []string) []string {
+	var rest []string
+	for {
+		_ = fs.Parse(args)
+		args = fs.Args()
+		if len(args) == 0 {
+			return rest
+		}
+		rest = append(rest, args[0])
+		args = args[1:]
+	}
+}
+
+// cmdImageBuild builds images from the registry in deploy/images.
+//
+// It is a checkout operation, like ./deploy/guest/build.sh itself: a released
+// binary ships without an engine. What it adds is that the *definition* of an
+// image lives in one place instead of in someone's shell history, and that the
+// image's meta.json is generated from it rather than hand-written per engine.
+func cmdImageBuild(args []string) {
+	fs := flag.NewFlagSet("image build", flag.ExitOnError)
+	deployDir := fs.String("deploy", "", "the checkout's deploy/ directory (default: found)")
+	buildAll := fs.Bool("all", false, "build every image the checkout can build")
+	publishable := fs.Bool("publishable", false, "print the names of the images marked publish: true, one per line")
+	dryRun := fs.Bool("dry-run", false, "show what would run, building nothing")
+	platform := fs.String("platform", "", "docker build platform, e.g. linux/arm64 (default: the script's)")
+	rest := parseArgsAnywhere(fs, args)
+
+	dir, err := findDeployDir(*deployDir)
+	if err != nil {
+		fatal("Error: %v", err)
+	}
+	reg := filepath.Join(dir, "images")
+	cfgs, err := imagecfg.Load(reg)
+	if err != nil {
+		fatal("Error: %v", err)
+	}
+
+	workdir := desktop.DefaultConfig().WorkDir
+
+	// Scripting hook: the release workflow asks the registry which images ship
+	// rather than hard-coding a list that drifts from deploy/images/.
+	if *publishable {
+		for _, c := range cfgs {
+			if c.Publish {
+				fmt.Println(c.Name)
+			}
+		}
+		return
+	}
+
+	// No target names the registry itself, which is the point of having one.
+	if !*buildAll && len(rest) == 0 {
+		printRegistry(cfgs, workdir)
+		return
+	}
+
+	var targets []imagecfg.Config
+	if *buildAll {
+		for _, c := range cfgs {
+			if c.RequiresInputs() {
+				fmt.Fprintf(os.Stderr, "… skipping %s: the %s engine needs inputs from this host (%s)\n",
+					c.Name, c.Engine, c.Script(dir))
+				continue
+			}
+			targets = append(targets, c)
+		}
+	} else {
+		for _, name := range rest {
+			c, err := imagecfg.LoadOne(reg, name)
+			if err != nil {
+				fatal("Error: %v", err)
+			}
+			targets = append(targets, c)
+		}
+	}
+	if len(targets) == 0 {
+		fatal("nothing to build")
+	}
+
+	for _, c := range targets {
+		if err := buildImage(c, dir, workdir, *platform, *dryRun); err != nil {
+			fatal("Error: %v", err)
+		}
+	}
+}
+
+// buildImage renders one config into the environment its engine script already
+// understands and runs it. The script stays the build system; the config is how
+// the build is described.
+func buildImage(c imagecfg.Config, deployDir, workdir, platform string, dryRun bool) error {
+	script := c.Script(deployDir)
+	if _, err := os.Stat(script); err != nil {
+		return err
+	}
+
+	rendered := c.Env(platform)
+	keys := make([]string, 0, len(rendered))
+	for k := range rendered {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+
+	env := os.Environ()
+	for _, k := range keys {
+		env = append(env, k+"="+rendered[k])
+	}
+
+	if dryRun {
+		fmt.Fprintf(os.Stderr, "%s\n", script)
+		for _, k := range keys {
+			fmt.Fprintf(os.Stderr, "  %s=%s\n", k, rendered[k])
+		}
+		return nil
+	}
+
+	fmt.Fprintf(os.Stderr, "==> building %s (engine %s)\n", c.Name, c.Engine)
+	cmd := exec.Command(script)
+	cmd.Dir = filepath.Dir(deployDir)
+	cmd.Env = env
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("building %s: %w", c.Name, err)
+	}
+
+	// The run-time contract is meta.json. If the engine did not honour META_JSON
+	// the image would boot from a config nobody can see, so refuse it here
+	// rather than discovering it on a desktop that refuses to open.
+	out := c.OutDir(workdir)
+	if _, err := os.Stat(filepath.Join(out, "meta.json")); err != nil {
+		return fmt.Errorf("built %s but %s has no meta.json", c.Name, out)
+	}
+	fmt.Fprintf(os.Stderr, "✓ %s → %s\n  boot it with: warmbox create --image %s\n", c.Name, out, c.Name)
+	return nil
+}
+
+// printRegistry lists what can be built and what is already installed.
+func printRegistry(cfgs []imagecfg.Config, workdir string) {
+	fmt.Fprintf(os.Stderr, "images that can be built (deploy/images)\n\n")
+	fmt.Fprintf(os.Stderr, "  %-16s %-9s %-9s %-10s %s\n", "NAME", "ENGINE", "HEADLESS", "INSTALLED", "PUBLISHED")
+	for _, c := range cfgs {
+		headless, installed, published := "no", "no", "no"
+		if c.Headless {
+			headless = "yes"
+		}
+		if imageInstalled(c.OutDir(workdir)) {
+			installed = "yes"
+		}
+		if c.Publish {
+			published = "yes"
+		}
+		fmt.Fprintf(os.Stderr, "  %-16s %-9s %-9s %-10s %s\n", c.Name, c.Engine, headless, installed, published)
+	}
+	fmt.Fprintf(os.Stderr, "\nbuild one with: warmbox image build <name>\n")
+}
+
+// imageInstalled reports whether an image directory holds bootable artifacts —
+// either kind of image, whether or not it has a meta.json.
+func imageInstalled(dir string) bool {
+	for _, f := range []string{"vmlinux", "disk.raw"} {
+		if _, err := os.Stat(filepath.Join(dir, f)); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
+// findDeployDir locates a checkout's deploy/ directory: an explicit flag, then
+// $WARMBOX_DEPLOY, then the working directory and its parents, then wherever
+// this binary lives (so ./warmbox at a repo root works).
+func findDeployDir(explicit string) (string, error) {
+	var candidates []string
+	if explicit != "" {
+		candidates = append(candidates, explicit)
+	}
+	if env := os.Getenv("WARMBOX_DEPLOY"); env != "" {
+		candidates = append(candidates, env)
+	}
+	if wd, err := os.Getwd(); err == nil {
+		candidates = append(candidates, ancestors(wd)...)
+	}
+	if exe, err := os.Executable(); err == nil {
+		candidates = append(candidates, ancestors(filepath.Dir(exe))...)
+	}
+	for _, c := range candidates {
+		// Accept either the deploy directory or the repo root containing it.
+		for _, d := range []string{c, filepath.Join(c, "deploy")} {
+			if isDeployDir(d) {
+				return d, nil
+			}
+		}
+	}
+	return "", fmt.Errorf("no deploy/ directory found — run this from a checkout, or pass --deploy (or set WARMBOX_DEPLOY)")
+}
+
+// ancestors is dir and each of its parents, nearest first.
+func ancestors(dir string) []string {
+	var out []string
+	for {
+		out = append(out, dir)
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return out
+		}
+		dir = parent
+	}
+}
+
+func isDeployDir(dir string) bool {
+	st, err := os.Stat(filepath.Join(dir, "images"))
+	return err == nil && st.IsDir()
 }
 
 func cmdImages(args []string) {

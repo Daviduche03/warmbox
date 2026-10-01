@@ -9,10 +9,12 @@ Two host platforms, both first-class: **macOS on Apple Silicon** (via `vfkit`)
 and **Linux with KVM** (via QEMU). What still differs between them is a
 capability gap, not a preference — see [Requirements](#requirements).
 
-Two guest images: a tiny **Alpine + XFCE** desktop (~776 MB, boots in ~1s from a
-shared read-only rootfs) and a full **Omarchy** (Arch + Hyprland, ~8.4 GB). You
-pick the OS at create time. The built-in image is a downloadable release
-artifact; named images are built locally for now.
+Guest images: a tiny **Alpine + XFCE** desktop (~776 MB, boots in ~1s from a
+shared read-only rootfs), the same base with **LXQt** or with **no screen at
+all**, and a full **Omarchy** (Arch + Hyprland, ~8.4 GB). You pick one at create
+time. Every image is defined once, in [`deploy/images/`](deploy/images), and
+built with `warmbox image build <name>`; the ones marked `publish` are also
+downloadable release artifacts.
 
 > **Status: experimental alpha.** Not hardened: plaintext HTTP with no TLS, the
 > guest's VNC server accepts anyone who can reach it, and the guest runs as
@@ -30,7 +32,8 @@ artifact; named images are built locally for now.
   copy on macOS: instant, shared blocks) and boots it; a warm pool of pre-booted
   VMs makes a desktop ready in ~1s.
 - **Choose your OS at create time.** `warmbox create --image omarchy` boots a
-  clone of the Omarchy disk; no image argument uses the built-in desktop.
+  clone of the Omarchy disk; `--image headless` boots a VM with no screen at all
+  (agent API only); no image argument uses the daemon's default image.
 - **Browser access.** Each desktop is streamed over noVNC — no client to install.
 - **Agent API.** `exec` + file read/write/list inside any guest over HTTP, no SSH
   keys (`docs/agent-api.md`).
@@ -48,14 +51,14 @@ artifact; named images are built locally for now.
 - **Linux with KVM** — `qemu-system-x86_64` (or `-aarch64`) plus `/dev/kvm`. The
   daemon needs `--backend qemu`; `warmbox service install` passes it for you.
 
-Both boot the built-in image. The one real gap: EFI *disk* images (Omarchy) need
-macOS today, because the QEMU backend has no OVMF firmware yet. Overlay images —
-the built-in one and `lxqt` — need no firmware and take the same path on both.
+Both boot every overlay image (`xfce`, `lxqt`, `headless`). The one real gap: EFI
+*disk* images (Omarchy) need macOS today, because the QEMU backend has no OVMF
+firmware yet — overlay images need no firmware and take the same path on both.
 
 `warmbox setup` installs the hypervisor for whichever host it finds, so this table
 is about what *can* run, not about what you have to install by hand:
 
-| host | backend | overlay images (`default`, `lxqt`) | EFI disk images (`omarchy`) |
+| host | backend | overlay images (`xfce`, `lxqt`, `headless`) | EFI disk images (`omarchy`) |
 |---|---|---|---|
 | macOS 13+, Apple Silicon | vfkit | ✅ | ✅ |
 | Linux + KVM, x86_64 | QEMU | ✅ verified | ❌ no OVMF |
@@ -116,12 +119,11 @@ three commands (`./warmbox setup`, `./warmbox service install`).
 ## Quickstart (from source)
 
 ```sh
-# 1. Build the built-in guest image (kernel + rootfs + a 2 GiB base disk).
-#    First run is slow (Docker + squashfs); artifacts land in ~/.warmbox.
-./deploy/guest/build.sh
+# 1. Build the default guest image from the registry (deploy/images/xfce.yaml).
+#    First run is slow (Docker + squashfs); artifacts land in ~/.warmbox/images.
+./warmbox image build xfce
 
-# 2. Build the CLI and fetch noVNC.
-go build -o warmbox ./cmd/warmbox
+# 2. Fetch noVNC.
 ./warmbox setup --no-image      # the image is already built above
 
 # 3. Run the daemon (warm pool + REST API + noVNC bridge).
@@ -131,8 +133,14 @@ go build -o warmbox ./cmd/warmbox
 ./warmbox create
 ```
 
-Maintainers publish an image with `warmbox image pack --builtin -o <file>`,
-which also writes the `.sha256` that `setup` verifies.
+Maintainers publish each image with
+
+```sh
+./warmbox image pack xfce -o warmbox-image-xfce-$(go env GOARCH).tar.zst
+```
+
+which also writes the `.sha256` that `setup` verifies; the release workflow does
+this for every image marked `publish: true`.
 
 ### Releasing
 
@@ -141,10 +149,11 @@ builds the binaries for darwin/arm64 and linux/{amd64,arm64}, publishes them wit
 `checksums.txt`, and updates the Homebrew cask.
 
 The guest images live in their own release, tagged **`images`**, as
-`warmbox-image-<arch>.tar.zst` plus its `.sha256` — deliberately **not** tied to
-the CLI's version, because the guest changes far less often and a new release
-should not need 800 MB re-uploaded. The **guest image** workflow builds and
-publishes them; it is manual because it takes ~15 minutes per architecture and
+`warmbox-image-<name>-<arch>.tar.zst` plus its `.sha256` — deliberately **not**
+tied to the CLI's version, because the guest changes far less often and a new
+release should not need 800 MB re-uploaded. The **guest image** workflow asks the
+registry what to build (`warmbox image build --publishable`) and publishes each
+one; it is manual because every image is minutes of build per architecture and
 must never be able to block a binary release.
 
 Two things must exist before the first release:
@@ -160,12 +169,12 @@ Two things worth knowing:
 
 - The image workflow builds both architectures: amd64 on a standard runner, arm64
   on GitHub's free `ubuntu-24.04-arm` runner. If that runner is ever unavailable,
-  build the arm64 image on an Apple Silicon Mac, where it already lives:
+  build the arm64 images on an Apple Silicon Mac, where they already live:
 
   ```sh
-  make image-pack
-  gh release upload images warmbox-image-arm64.tar.zst \
-      warmbox-image-arm64.tar.zst.sha256
+  make image-pack IMAGE_NAME=xfce
+  gh release upload images warmbox-image-xfce-arm64.tar.zst \
+      warmbox-image-xfce-arm64.tar.zst.sha256
   ```
 
 - Neither is required for `warmbox setup` to work: when no image is published for
@@ -203,44 +212,92 @@ On **Linux**, add `--backend qemu` to the daemon (KVM + `qemu-system-*`).
 systemd unit, so the same command works on both hosts. QEMU's user-mode
 networking isn't reachable host→guest, so the backend forwards a host port to
 each guest's VNC; everything else is identical. Build the guest image for the
-host arch with `PLATFORM=linux/amd64 ./deploy/guest/build.sh`.
+host arch with `./warmbox image build xfce --platform linux/amd64`.
 
 ## Images
 
-A named image is a directory under `$WARMBOX_HOME/images/<name>/` holding
-`disk.raw` (a bootable disk), an optional `efi-vars.fd` seed, and an optional
-`meta.json` (`{"gpu","mem_mib","cpus","input"}`). The daemon discovers them at
-startup and you choose one per desktop:
+Every guest image warmbox can build is defined by one file in
+[`deploy/images/`](deploy/images). That config is the source of truth: it picks
+the engine that builds the image, and it generates the image's `meta.json`, which
+is all the daemon reads at run time.
+
+```sh
+./warmbox image build                     # what can be built, and what is installed
+./warmbox image build lxqt                # build one
+./warmbox image build --all               # every image the checkout can build
+```
+
+An image lands in `$WARMBOX_HOME/images/<name>/` — either an *overlay* image
+(`vmlinux` + `rootfs.squashfs` + `initramfs-overlay`, sharing one read-only
+rootfs) or an *EFI disk* (`disk.raw` [+ `efi-vars.fd`]) — plus a `meta.json`.
+There is no separate "built-in" slot: the daemon boots the image you name, and
+the daemon's `--image` decides which one an unnamed `create` gets (default
+`xfce`).
 
 ```sh
 ./warmbox images                     # list what the daemon can boot
 ./warmbox create --image omarchy     # a full Omarchy (Hyprland) desktop
-./warmbox create --image default     # the built-in desktop (aliases: xfce, alpine)
-./warmbox create                     # whatever --image the daemon was started with
+./warmbox create --image headless    # no screen: agent API (exec/files/runs) only
+./warmbox create --image default     # whatever this daemon's default image is
+./warmbox create                     # the same thing
 ```
 
 | image | base | size on disk | boot |
 |---|---|---|---|
-| `default` | Alpine + XFCE | ~776 MB (compressed squashfs base) | ~1s, shared rootfs |
+| `xfce` | Alpine + XFCE | ~776 MB (compressed squashfs base) | ~1s from the shared rootfs |
 | `lxqt` | Alpine + LXQt | ~800 MB (compressed squashfs base) | ~7s cold |
+| `headless` | Alpine + XFCE, X never starts | ~776 MB (same base) | ~6s cold, no X to wait for |
+| `headless-lxqt` | Alpine + LXQt, X never starts | ~800 MB | ~7s cold |
 | `omarchy` | Arch + Hyprland/Quickshell | 24 GB sparse, ~8.4 GB real | ~13s cold, instant if pooled |
 
-The built-in and `lxqt` images are *overlay* images (a shared read-only squashfs
-plus a writable upper); `omarchy` is an *EFI disk*. Both kinds are named images
-and are selected the same way. `default` and `lxqt` boot on both hosts; `omarchy`
-needs macOS, since only vfkit brings its own EFI firmware. Build a variant with:
+`meta.json` is the run-time contract: `headless`, plus optional `gpu`, `mem_mib`,
+`cpus`, `input`, and the guest-agent `agent_api` the image was built against. An
+image that overrides nothing inherits whatever the daemon was started with.
 
-```sh
-DESKTOP=lxqt THEME=ambiance VARIANT=lxqt ./deploy/guest/build.sh   # -> images/lxqt
+`"headless": true` marks an image that boots no X server and no desktop session:
+the guest reports readiness as soon as its agent is listening, the daemon arms no
+GPU or input devices, and there is no console to open — the desktop is reached
+through the agent API instead (`POST /api/desktops/{id}/exec`, `/files`,
+`/runs`, `/sessions`). It is a property of the image rather than a flag on
+`create`, so the guest and the daemon cannot disagree about whether a screen
+exists. Everything else is unchanged: volumes, snapshots, egress policy and the
+warm pool all work the same.
+
+### Adding an image
+
+Write a file and build it — nothing else has to know:
+
+```yaml
+# deploy/images/epiphany.yaml
+name: epiphany
+engine: overlay          # overlay | efi
+desktop: xfce
+theme: win11
+browser: epiphany
+headless: false
+publish: false           # publish: true ships it on the images release
 ```
 
-Images travel as a single compressed artifact:
+The `overlay` engine builds a rootfs from `deploy/guest/Dockerfile`. The `efi`
+engine (used by `omarchy`) stages a disk that was already installed on a machine,
+so it needs input from the host; `warmbox image build --all` skips those and
+builds the rest.
+
+Adding a desktop, a theme or a browser is a Dockerfile change; the config is how
+you say *which combination* is an image. `warmbox image build` prints the whole
+registry with what is installed.
+
+### Moving images between machines
 
 ```sh
 ./warmbox image pack omarchy                 # -> ~/.warmbox/images/omarchy.tar.zst (~3.9 GB)
-./warmbox image pull omarchy <file-or-url>   # expand into ~/.warmbox/images/omarchy
+./warmbox image pull omarchy                 # the published image for this platform
+./warmbox image pull omarchy <file-or-url>   # or from a file or URL
 ./warmbox image list                         # local images (offline)
 ```
+
+A `pull` from a URL is verified against the published `.sha256` before anything
+is expanded — an image is code that boots.
 
 See [`deploy/omarchy/README.md`](deploy/omarchy/README.md) for how the Omarchy
 image is built and provisioned (it stands on the community aarch64 port).
@@ -268,8 +325,8 @@ screenshot/input are next. Design: [`docs/agent-api.md`](docs/agent-api.md).
 ./warmbox volume clone dev dev-clean      # template a fresh box
 ```
 
-Volumes attach to image guests too. On the built-in image the volume *is* the
-writable overlay (the whole machine persists); on an image guest like Omarchy it
+Volumes attach to image guests too. On an overlay image the volume *is* the
+writable layer (the whole machine persists); on an image guest like Omarchy it
 is a data disk mounted at `/volume`, flushed every couple of seconds.
 
 Inside the guest:
@@ -328,9 +385,9 @@ bucket up.
 - **EFI disk images are macOS-only.** Omarchy is an EFI disk, and the QEMU
   backend ships no OVMF firmware, so it cannot boot it. (vfkit wraps Apple's
   Virtualization.framework, which is ARM64-only and handles the firmware itself.)
-  Overlay images — the built-in one and `lxqt` — need no firmware and take the
-  same path on both backends: the built-in image is verified on Linux/QEMU, a
-  *named* overlay image there is not.
+  Overlay images — `xfce`, `lxqt`, `headless` — need no firmware and take the
+  same path on both backends; `xfce` and `lxqt` are verified on Linux/QEMU, the
+  newer images are not.
 - **Authorised, but not encrypted.** The API is not open: accounts and workspaces
   gate every stateful route, and everything that reaches a desktop — console
   streams (`/d/`, `/websockify/`, `/vnc/`), the agent API, published guest ports
@@ -352,7 +409,7 @@ bucket up.
   macOS, virtio on QEMU), so a Wayland desktop composites through Mesa
   `llvmpipe`; the Omarchy image is tuned for it (small output, effects off). X11
   is far lighter for remote display.
-- **Images are big.** The built-in image is ~800 MB compressed and `warmbox
+- **Images are big.** The default image is ~800 MB compressed and `warmbox
   setup` downloads it in one piece. Omarchy is the heavy one: ~8.4 GB on disk,
   ~3.9 GB packed, and because btrfs fragments its free space and APFS only
   preserves large holes, an expanded copy may not be as sparse as you'd like.
@@ -372,8 +429,10 @@ internal/catalog    SQLite metadata (volumes, desktops, snapshots, leases)
 internal/egress     default-deny egress policy + forward proxy
 internal/api        REST API, noVNC bridge, guest port proxy, agent proxy
 internal/vnc        WebSocket→TCP VNC bridge
-deploy/guest        built-in image (Dockerfile, init, overlay-init, apps, agent)
-deploy/omarchy      Omarchy image build + guest provisioning
+internal/imagecfg   the guest-image registry (deploy/images/*.yaml)
+deploy/images       what images exist, and what each one is
+deploy/guest        the overlay engine (Dockerfile, init, overlay-init, apps, agent)
+deploy/omarchy      the EFI engine: Omarchy image build + guest provisioning
 docs/               architecture, volumes, snapshots, agent-api, egress, oss-positioning
 ```
 
@@ -389,11 +448,9 @@ docs/               architecture, volumes, snapshots, agent-api, egress, oss-pos
 
 ## Help wanted
 
-- **Named-image distribution** — the built-in image is a release artifact now
-  (`warmbox setup` downloads and verifies it), but *named* images are not:
-  `warmbox image pull` still wants a file or a URL, so Omarchy has to be built
-  locally. Publishing them, and letting `pull omarchy` resolve a bare name, is
-  the remaining half.
+- **One pooled image per image** — the warm pool only pre-boots the daemon's
+  default image, so any other `--image` still cold-boots (~6–13s). Pooling is
+  per-image work: the pool has to know which image each warm VM holds.
 - **EFI on Linux** — OVMF support in the QEMU backend so image guests run there too.
 - **Cloud Hypervisor / Firecracker backend** — leaner boot and real memory
   snapshot/restore (the "~100 ms restore anywhere" story).

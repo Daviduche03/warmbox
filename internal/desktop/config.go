@@ -22,51 +22,16 @@ type Config struct {
 	// Backend selects the hypervisor backend (default "vfkit").
 	Backend string
 
-	// KernelPath is the uncompressed arm64 vmlinux.
-	KernelPath string
-
-	// InitrdPath is the zstd-compressed cpio initramfs containing the whole rootfs.
-	InitrdPath string
-
-	// BootInitrdPath is the small Alpine boot initramfs (with virtio-blk/ext4)
-	// used when booting from DiskPath instead of the all-RAM InitrdPath.
-	BootInitrdPath string
-
-	// DiskPath is the base ext4 rootfs image for low-RAM disk boot. When it
-	// (and BootInitrdPath) exist, each VM boots its own clone of this image and
-	// pages the rootfs in on demand instead of loading it all into RAM. Empty
-	// or missing => fall back to the all-RAM initramfs.
-	DiskPath string
-
-	// SquashPath is a read-only squashfs rootfs base shared by every VM. When
-	// it (and OverlayInitrdPath) exist, VMs boot it with a tmpfs overlay, so no
-	// per-VM disk copy is made and all writes live in RAM. Takes precedence
-	// over DiskPath.
-	SquashPath string
-
-	// OverlayInitrdPath is the boot initramfs that mounts SquashPath read-only
-	// and layers a tmpfs overlay on top (see deploy/guest/overlay-init).
-	OverlayInitrdPath string
-
 	// Image names the default guest image to boot when a caller does not ask
-	// for one explicitly. Names resolve under ImageDir. Empty falls back to
-	// the built-in image (overlay > disk > initramfs), or to EFIDisk when set.
+	// for one. Names resolve under ImageDir; empty means DefaultImage.
 	Image string
 
-	// ImageDir is where named guest images live: <ImageDir>/<name>/ containing
-	// disk.raw (an EFI-bootable disk), an optional efi-vars.fd seed, and an
-	// optional meta.json ({"gpu","mem_mib","cpus","input"}).
+	// ImageDir holds every guest image: <ImageDir>/<name>/ with either a
+	// bootable disk (disk.raw, EFI) or a shared read-only rootfs (vmlinux +
+	// rootfs.squashfs + initramfs-overlay), plus meta.json — the per-image
+	// boot overrides. There is no separate "built-in" slot: every image is a
+	// named image, and one of them is the default.
 	ImageDir string
-
-	// EFIDisk is a full EFI-bootable disk image used when Image is empty (a
-	// legacy anonymous EFI image). Every VM boots its own clone.
-	EFIDisk string
-
-	// EFIVars is an optional seed EFI variable store copied into each VM. An
-	// EFI install often keeps its boot entry only in NVRAM, so a fresh store
-	// may not find anything to boot; seeding from the machine that installed
-	// the disk fixes that.
-	EFIVars string
 
 	// EgressAddr, when non-empty, runs the egress policy proxy on this address
 	// (e.g. ":8099"). Guests are told to route through it.
@@ -168,31 +133,25 @@ func DefaultConfig() *Config {
 		backend = "qemu"
 	}
 	return &Config{
-		WorkDir:           wd,
-		VfkitPath:         "vfkit",
-		Backend:           backend,
-		KernelPath:        filepath.Join(wd, "vmlinux"),
-		InitrdPath:        filepath.Join(wd, "initramfs.zst"),
-		BootInitrdPath:    filepath.Join(wd, "initramfs-virt"),
-		DiskPath:          filepath.Join(wd, "rootfs.img"),
-		SquashPath:        filepath.Join(wd, "rootfs.squashfs"),
-		OverlayInitrdPath: filepath.Join(wd, "initramfs-overlay"),
-		ImageDir:          filepath.Join(wd, "images"),
-		NoVNCDir:          filepath.Join(wd, "novnc"),
-		HostAddr:          "192.168.64.1",
-		APIAddr:           "127.0.0.1:7070",
-		MemMiB:            4096,
-		CPUs:              4,
-		Display:           "1280x800",
-		GuestVNCPort:      5900,
-		AgentPort:         7077,
-		PoolSize:          2,
-		PoolIdleTimeout:   15 * time.Minute,
-		ShareTag:          "workspace",
-		VolumeDir:         filepath.Join(wd, "volumes"),
-		VolumeBase:        filepath.Join(wd, "volume-base.img"),
-		VolumeChunkMiB:    16,
-		VolumePrefix:      "volumes",
+		WorkDir:         wd,
+		VfkitPath:       "vfkit",
+		Backend:         backend,
+		ImageDir:        filepath.Join(wd, "images"),
+		NoVNCDir:        filepath.Join(wd, "novnc"),
+		HostAddr:        "192.168.64.1",
+		APIAddr:         "127.0.0.1:7070",
+		MemMiB:          4096,
+		CPUs:            4,
+		Display:         "1280x800",
+		GuestVNCPort:    5900,
+		AgentPort:       7077,
+		PoolSize:        2,
+		PoolIdleTimeout: 15 * time.Minute,
+		ShareTag:        "workspace",
+		VolumeDir:       filepath.Join(wd, "volumes"),
+		VolumeBase:      filepath.Join(wd, "volume-base.img"),
+		VolumeChunkMiB:  16,
+		VolumePrefix:    "volumes",
 	}
 }
 

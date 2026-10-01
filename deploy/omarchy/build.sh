@@ -18,11 +18,18 @@
 # Env:
 #   OMARCHY_SRC       installed Omarchy EFI disk  (default $HOME/.omarchy-vm/disk.raw)
 #   OMARCHY_EFIVARS   matching EFI variable store (default $HOME/.omarchy-vm/efi-vars.fd)
+#   OMARCHY_NAME      image name / output directory (default omarchy)
 #   WARMBOX_HOME      output directory            (default $HOME/.warmbox)
 #   RESOLUTION        output resolution           (default 800x600)
 #   VNC_FPS           wayvnc max fps              (default 60)
 #   PROVISION         1 = run provisioning over the serial console (default 1)
 #   OMARCHY_PASSWORD  guest login for provisioning (default omarchy)
+#   META_JSON         meta.json to write verbatim; `warmbox image build` passes
+#                     the registry's rendering here. Unset, the values below are
+#                     written instead.
+#
+# Prefer `warmbox image build omarchy` (see deploy/images/omarchy.yaml) — it is
+# the same script with the definition kept somewhere reviewable.
 
 set -eu
 
@@ -30,6 +37,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 WARMBOX_HOME="${WARMBOX_HOME:-$HOME/.warmbox}"
 OMARCHY_SRC="${OMARCHY_SRC:-$HOME/.omarchy-vm/disk.raw}"
 OMARCHY_EFIVARS="${OMARCHY_EFIVARS:-$HOME/.omarchy-vm/efi-vars.fd}"
+OMARCHY_NAME="${OMARCHY_NAME:-omarchy}"
 RESOLUTION="${OMARCHY_VM_RESOLUTION:-800x600}"
 VNC_FPS="${OMARCHY_VM_VNC_FPS:-60}"
 PROVISION="${PROVISION:-1}"
@@ -42,7 +50,7 @@ note() { printf '==> %s\n' "$*"; }
 command -v vfkit >/dev/null 2>&1 || die "vfkit not found (brew install vfkit)"
 [ -f "$OMARCHY_SRC" ] || die "no Omarchy disk at $OMARCHY_SRC (set OMARCHY_SRC)"
 
-img="$WARMBOX_HOME/images/omarchy"
+img="$WARMBOX_HOME/images/$OMARCHY_NAME"
 mkdir -p "$img"
 
 note "building warmbox-agent (linux/arm64)"
@@ -62,7 +70,11 @@ if [ -f "$OMARCHY_EFIVARS" ]; then
   cp "$OMARCHY_EFIVARS" "$img/efi-vars.fd"
 fi
 
-cat > "$img/meta.json" <<EOF
+if [ -n "${META_JSON:-}" ]; then
+  printf '%s\n' "$META_JSON" > "$img/meta.json"
+  note "wrote $img/meta.json (from the image config)"
+else
+  cat > "$img/meta.json" <<EOF
 {
   "gpu": "$RESOLUTION",
   "mem_mib": 3072,
@@ -70,7 +82,8 @@ cat > "$img/meta.json" <<EOF
   "input": true
 }
 EOF
-note "wrote $img/meta.json (gpu=$RESOLUTION)"
+  note "wrote $img/meta.json (gpu=$RESOLUTION)"
+fi
 
 if [ "$PROVISION" = "1" ]; then
   note "provisioning over the serial console (resolution=$RESOLUTION, fps=$VNC_FPS)"

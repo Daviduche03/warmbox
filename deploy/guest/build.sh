@@ -3,6 +3,13 @@
 #
 #   ./deploy/guest/build.sh
 #
+# This is the *engine*, not the usual way to build. Prefer
+# `warmbox image build <name>`, which reads the image's config from
+# deploy/images/ and sets exactly the variables below from it — including
+# META_JSON, the run-time contract. Running this by hand still works and still
+# writes a meta.json, but you have to keep the flags in sync with the registry
+# yourself.
+#
 # Produces, in $WARMBOX_HOME (default ~/.warmbox):
 #   vmlinux             uncompressed arm64 kernel        (vfkit needs a raw Image)
 #   initramfs.zst       zstd cpio initramfs = whole rootfs (all-RAM boot)
@@ -27,6 +34,12 @@
 #                 Point a daemon at a variant with
 #                 --squash/--overlay-initrd/--disk/--boot-initrd/--image flags
 #                 (or a separate --workdir).
+#   HEADLESS      0|1 (default 0). 1 builds an image with no screen: /init
+#                 skips Xvnc and the desktop session and reports ready off the
+#                 agent port, and the image's meta.json says "headless": true
+#                 so the daemon and dashboard know not to offer a screen.
+#                 Requires VARIANT — the built-in image has nowhere to record
+#                 it. Try:  HEADLESS=1 VARIANT=headless ./deploy/guest/build.sh
 #   IMAGE         docker image tag                          (default warmbox-guest:latest)
 #   WARMBOX_HOME  output directory                          (default ~/.warmbox)
 #   PLATFORM      docker build platform                     (default linux/arm64)
@@ -38,6 +51,7 @@ BROWSER="${BROWSER:-chromium}"
 DESKTOP="${DESKTOP:-xfce}"
 THEME="${THEME:-win11}"
 VARIANT="${VARIANT:-}"
+HEADLESS="${HEADLESS:-0}"
 IMAGE="${IMAGE:-warmbox-guest:latest}"
 WARMBOX_HOME="${WARMBOX_HOME:-$HOME/.warmbox}"
 # A variant is written as a named image at images/<variant>/ (boot it with
@@ -50,10 +64,19 @@ PLATFORM="${PLATFORM:-linux/arm64}"
 # volume can be; request larger with `warmbox volume create --size`.
 VOLUME_BASE_SIZE="${VOLUME_BASE_SIZE:-2G}"
 
-echo "==> building $IMAGE (BROWSER=$BROWSER, DESKTOP=$DESKTOP, THEME=$THEME, platform=$PLATFORM, variant=${VARIANT:-default})"
+# A headless image must be a named one: meta.json is what tells the daemon the
+# image has no screen, and only named images carry a meta.json.
+if [ "$HEADLESS" = "1" ] && [ -z "$VARIANT" ]; then
+    echo "==> HEADLESS=1 needs a VARIANT — the built-in image cannot record it." >&2
+    echo "    try: HEADLESS=1 VARIANT=headless ./deploy/guest/build.sh" >&2
+    exit 1
+fi
+
+echo "==> building $IMAGE (BROWSER=$BROWSER, DESKTOP=$DESKTOP, THEME=$THEME, headless=$HEADLESS, platform=$PLATFORM, variant=${VARIANT:-default})"
 docker build --platform "$PLATFORM" -t "$IMAGE" \
     --build-arg "BROWSER=$BROWSER" \
     --build-arg "DESKTOP=$DESKTOP" \
+    --build-arg "HEADLESS=$HEADLESS" \
     --build-arg "THEME=$THEME" "$here"
 
 mkdir -p "$OUTDIR"
@@ -82,7 +105,18 @@ docker run --rm \
     -v "$tmptar:/rootfs.tar:ro" \
     alpine:3.22 sh -c '
         set -e
-        apk add --no-cache squashfs-tools cpio gzip zstd kmod e2fsprogs e2fsprogs-extra >/dev/null 2>&1
+        # Installing the tools is the one step here that needs the network, and
+        # a transient failure used to surface as a bare exit status with no
+        # output at all. Retry, then say why.
+        for attempt in 1 2 3; do
+            apk add --no-cache squashfs-tools cpio gzip zstd kmod e2fsprogs e2fsprogs-extra >/tmp/apk.log 2>&1 && break
+            if [ "$attempt" = 3 ]; then
+                echo "apk add failed after three attempts:" >&2
+                cat /tmp/apk.log >&2
+                exit 1
+            fi
+            sleep 3
+        done
 
         D="/host${SUB:+/$SUB}"
         mkdir -p "$D"
@@ -101,6 +135,12 @@ docker run --rm \
             truncate -s "${VOLUME_BASE_SIZE:-2G}" /host/volume-base.img
             mke2fs -F -t ext4 -q -m 0 /host/volume-base.img
         fi
+        # The base is shared by every image, but it travels inside an image
+        # archive so a fresh install can create volumes without a second
+        # download. Hard-link it (same filesystem) instead of copying it per
+        # image; a filesystem that refuses the link gets a copy.
+        ln -f /host/volume-base.img "$D/volume-base.img" 2>/dev/null || \
+            cp /host/volume-base.img "$D/volume-base.img"
 
         # --- overlay boot initramfs ---
         krel=$(ls /rootfs/lib/modules | head -1)
@@ -144,11 +184,38 @@ docker run --rm \
     '
 rm -f "$tmptar"
 
+# meta.json is the image's run-time contract: the daemon reads it to decide
+# sizing, whether there is a screen, and which agent contract the guest speaks.
+# `warmbox image build` renders it from the registry and hands it over as
+# META_JSON, so there is exactly one writer and one source. Running this script
+# by hand falls back to deriving what it can from the flags above.
+if [ -n "${META_JSON:-}" ]; then
+  printf '%s\n' "$META_JSON" > "$OUTDIR/meta.json"
+  echo "==> wrote $OUTDIR/meta.json (from the image config)"
+elif [ "$HEADLESS" = "1" ]; then
+  cat > "$OUTDIR/meta.json" <<'EOF'
+{
+  "headless": true
+}
+EOF
+  echo "==> wrote $OUTDIR/meta.json (headless)"
+elif [ -f "$OUTDIR/meta.json" ] && grep -q '"headless"[[:space:]]*:[[:space:]]*true' "$OUTDIR/meta.json"; then
+  # Rebuilt without HEADLESS: this rootfs has no marker, so an inherited claim
+  # that it does would be a lie the daemon acts on. Only that claim is dropped —
+  # a hand-written meta.json (gpu/mem/cpus overrides) is left alone.
+  rm -f "$OUTDIR/meta.json"
+  echo "==> removed stale $OUTDIR/meta.json (this build is not headless)"
+fi
+
 ls -lh "$OUTDIR/vmlinux" "$OUTDIR/initramfs.zst" \
     "$OUTDIR/initramfs-virt" "$OUTDIR/rootfs.squashfs" \
     "$OUTDIR/initramfs-overlay" "$WARMBOX_HOME/volume-base.img" 2>/dev/null || true
 if [ -n "$VARIANT" ]; then
-  echo "==> done. variant image '$VARIANT'. boot it with: warmbox create --image $VARIANT"
+  if [ "$HEADLESS" = "1" ]; then
+    echo "==> done. headless variant '$VARIANT'. boot it with: warmbox create --image $VARIANT"
+  else
+    echo "==> done. variant image '$VARIANT'. boot it with: warmbox create --image $VARIANT"
+  fi
 else
   echo "==> done. built-in image. run: warmbox service install --pool 1"
 fi

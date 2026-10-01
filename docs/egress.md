@@ -30,7 +30,7 @@ makes the policy **default-deny**.
 The host daemon starts an HTTP(S) forward proxy and tells each guest to route
 through it:
 
-- overlay images (built-in, `lxqt`): on the kernel cmdline (`warmbox.proxy=…`),
+- overlay images (`xfce`, `lxqt`, `headless`): on the kernel cmdline (`warmbox.proxy=…`),
   which `deploy/guest/init` turns into `http_proxy`/`https_proxy` for the agent
   and any program it runs.
 - EFI images (`omarchy`): the host writes the same address into the config share
@@ -90,7 +90,7 @@ boundary) and the policy engine works; the enforcement half is the next step."
 4. **Denied-by-default DNS** — resolve guest DNS through the proxy so names
    that aren't allowed don't resolve at all.
 5. **Proxy on image guests** — read the config share's `proxy` key in the
-   Omarchy image so EFI guests get the same routing the built-in image does.
+   Omarchy image so EFI guests get the same routing overlay images do.
 
 See also [`deploy/omarchy/README.md`](../deploy/omarchy/README.md) for the image
 side, and `docs/agent-api.md` for the guest channel that agents actually use.

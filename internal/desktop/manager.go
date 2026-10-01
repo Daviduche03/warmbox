@@ -75,22 +75,11 @@ type StartSpec struct {
 
 // Start launches a new microVM from the default image and returns it (state =
 // booting). Callers wait for readiness with WaitReady.
+//
+// Everything else goes through StartDesktop with a StartSpec: a convenience
+// wrapper per option was how a volume-backed create ended up silently ignoring
+// the image the caller asked for.
 func (m *Manager) Start(id string) (*VM, error) { return m.start(StartSpec{ID: id}) }
-
-// StartWithVolume launches a microVM whose writable layer is the given volume
-// image (a raw ext4 disk) attached read-write as /dev/vdb. volumeName names it
-// for later commit/release.
-func (m *Manager) StartWithVolume(id, volumeName, image string) (*VM, error) {
-	return m.start(StartSpec{ID: id, VolumeName: volumeName, VolumeImage: image})
-}
-
-// StartImage launches a microVM from a named image under cfg.ImageDir,
-// optionally attached to a persistent volume.
-func (m *Manager) StartImage(id, volumeName, volumeImage, imageName string) (*VM, error) {
-	return m.start(StartSpec{
-		ID: id, VolumeName: volumeName, VolumeImage: volumeImage, ImageName: imageName,
-	})
-}
 
 // StartDesktop boots exactly what the caller asked for, including explicit
 // vCPU/memory requests (which rule out a warm-pool VM: those are sized when
@@ -98,7 +87,11 @@ func (m *Manager) StartImage(id, volumeName, volumeImage, imageName string) (*VM
 func (m *Manager) StartDesktop(spec StartSpec) (*VM, error) { return m.start(spec) }
 
 func (m *Manager) start(spec StartSpec) (*VM, error) {
-	id, volumeName, volumeImage, imageName := spec.ID, spec.VolumeName, spec.VolumeImage, spec.ImageName
+	id, volumeName, volumeImage := spec.ID, spec.VolumeName, spec.VolumeImage
+	// Every VM boots a named image: a caller that names none gets this daemon's
+	// default. The warm pool boots this way, so getting it wrong would hand out
+	// one image no matter what --image the daemon was started with.
+	imageName := CanonicalImage(spec.ImageName, m.cfg.Image)
 	if id == "" {
 		id = NewID()
 	}
@@ -112,20 +105,12 @@ func (m *Manager) start(spec StartSpec) (*VM, error) {
 	consolePath := filepath.Join(dir, "console.log")
 	pidPath := filepath.Join(dir, "vm.pid")
 
-	// Resolve the boot image. A named image is either an EFI disk or an overlay
-	// (squashfs) image; otherwise fall back to the built-in image
-	// (overlay > disk > initramfs).
-	var img resolved
-	haveImg := false
-	switch {
-	case imageName != "" && !isBuiltinImage(imageName):
-		r, err := m.resolveImage(imageName)
-		if err != nil {
-			return nil, err
-		}
-		img, haveImg = r, true
-	case !isBuiltinImage(imageName) && m.cfg.EFIDisk != "":
-		img, haveImg = resolved{kind: "efi", disk: m.cfg.EFIDisk, vars: m.cfg.EFIVars}, true
+	// Resolve the boot image: an EFI disk or an overlay (squashfs) image. Both
+	// kinds are named images under ImageDir; there is no fallback, because a
+	// daemon with no bootable image has nothing to boot and should say so.
+	img, err := m.resolveImage(imageName)
+	if err != nil {
+		return nil, err
 	}
 	meta := img.meta
 
@@ -145,11 +130,18 @@ func (m *Manager) start(spec StartSpec) (*VM, error) {
 	if spec.MemMiB > 0 {
 		mem = spec.MemMiB
 	}
-	if meta.GPU != "" {
-		display = meta.GPU
-	}
-	if meta.Input {
-		input = true
+	if meta.Headless {
+		// The image declares it has no screen, so don't arm a GPU or input
+		// devices for a compositor that is never coming up — whatever the
+		// daemon's defaults happen to be. The image wins here.
+		display, input = "", false
+	} else {
+		if meta.GPU != "" {
+			display = meta.GPU
+		}
+		if meta.Input {
+			input = true
+		}
 	}
 
 	hostAddr := m.backend.GuestHostAddr()
@@ -180,8 +172,8 @@ func (m *Manager) start(spec StartSpec) (*VM, error) {
 		Input:      input,
 		ControlDir: dir,
 	}
-	switch {
-	case haveImg && img.kind == "efi":
+	switch img.kind {
+	case "efi":
 		if _, err := os.Stat(img.disk); err != nil {
 			return nil, fmt.Errorf("efi disk %s: %w", img.disk, err)
 		}
@@ -193,7 +185,7 @@ func (m *Manager) start(spec StartSpec) (*VM, error) {
 		// variable store is provided; otherwise let vfkit create a fresh one.
 		varPath := filepath.Join(dir, "efi-vars.fd")
 		if img.vars != "" {
-			if err := copyFile(img.vars, varPath); err != nil {
+			if err := CopyFile(img.vars, varPath); err != nil {
 				return nil, fmt.Errorf("seeding efi vars: %w", err)
 			}
 		} else {
@@ -225,31 +217,15 @@ func (m *Manager) start(spec StartSpec) (*VM, error) {
 			return nil, fmt.Errorf("writing config.json: %w", err)
 		}
 		launch.Shares = append(launch.Shares, Share{Dir: cfgDir, Tag: "warmbox-config"})
-	case haveImg && img.kind == "overlay":
-		// Startup is booted directly by warmbox, so the guest gets its identity
-		// on the kernel cmdline (as the built-in image does).
+	case "overlay":
+		// warmbox boots the kernel directly, so the guest gets its identity on
+		// the kernel cmdline and the rootfs is a shared read-only squashfs.
 		launch.Kernel = img.kernel
 		launch.Cmdline = cmdline
 		launch.Initrd = img.initrd
 		launch.Disks = append(launch.Disks, Disk{Path: img.squash, ReadOnly: true})
-	case m.overlayAvailable():
-		launch.Kernel = m.cfg.KernelPath
-		launch.Cmdline = cmdline
-		launch.Initrd = m.cfg.OverlayInitrdPath
-		launch.Disks = append(launch.Disks, Disk{Path: m.cfg.SquashPath, ReadOnly: true})
-	case m.diskAvailable():
-		diskPath := filepath.Join(dir, "rootfs.img")
-		if err := cloneFile(m.cfg.DiskPath, diskPath); err != nil {
-			return nil, fmt.Errorf("cloning rootfs image: %w", err)
-		}
-		launch.Kernel = m.cfg.KernelPath
-		launch.Cmdline = cmdline + " root=/dev/vda rootfstype=ext4 rootwait rw"
-		launch.Initrd = m.cfg.BootInitrdPath
-		launch.Disks = append(launch.Disks, Disk{Path: diskPath})
 	default:
-		launch.Kernel = m.cfg.KernelPath
-		launch.Cmdline = cmdline
-		launch.Initrd = m.cfg.InitrdPath
+		return nil, fmt.Errorf("image %q has an unknown boot kind %q", img.name, img.kind)
 	}
 	if volumeImage != "" {
 		launch.Disks = append(launch.Disks, Disk{Path: volumeImage})
@@ -272,11 +248,13 @@ func (m *Manager) start(spec StartSpec) (*VM, error) {
 		State:    StateBooting,
 		Started:  time.Now(),
 		Volume:   volumeName,
+		Headless: meta.Headless,
 		forwards: inst.Forwards,
 		cmd:      cmd,
 		inst:     inst,
 		dir:      dir,
 		ready:    make(chan struct{}),
+		done:     make(chan struct{}),
 	}
 
 	m.mu.Lock()
@@ -288,6 +266,7 @@ func (m *Manager) start(spec StartSpec) (*VM, error) {
 	go func() {
 		err := cmd.Wait()
 		vm.setState(StateDead)
+		vm.markExited(err)
 		if err != nil {
 			fmt.Fprintf(m.log, "desktop: vm %s exited: %v\n", id, err)
 		} else {
@@ -322,6 +301,19 @@ func (m *Manager) WaitReady(ctx context.Context, id string) (*VM, error) {
 	select {
 	case <-vm.Ready():
 		return vm, nil
+	case <-vm.Done():
+		// The process is gone. Waiting out the rest of the timeout would only
+		// hide why: a vfkit that could not open its kernel should read as "the
+		// vm exited", not as a boot that was merely slow.
+		if vm.wasReady() {
+			// It did come up first; the caller gets the VM and can see its
+			// state. Reporting this as a failed boot would be a lie.
+			return vm, nil
+		}
+		if err := vm.ExitError(); err != nil {
+			return nil, fmt.Errorf("the vm exited before it became ready: %w", err)
+		}
+		return nil, fmt.Errorf("the vm exited before it became ready")
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
@@ -444,46 +436,18 @@ func (m *Manager) Shutdown() {
 	}
 }
 
-// overlayAvailable reports whether overlay boot is configured and both the
-// shared squashfs base and its boot initramfs exist.
-func (m *Manager) overlayAvailable() bool {
-	if m.cfg.SquashPath == "" || m.cfg.OverlayInitrdPath == "" {
-		return false
-	}
-	if _, err := os.Stat(m.cfg.SquashPath); err != nil {
-		return false
-	}
-	if _, err := os.Stat(m.cfg.OverlayInitrdPath); err != nil {
-		return false
-	}
-	return true
-}
-
-// diskAvailable reports whether disk boot is configured and both the base image
-// and the boot initramfs exist.
-func (m *Manager) diskAvailable() bool {
-	if m.cfg.DiskPath == "" || m.cfg.BootInitrdPath == "" {
-		return false
-	}
-	if _, err := os.Stat(m.cfg.DiskPath); err != nil {
-		return false
-	}
-	if _, err := os.Stat(m.cfg.BootInitrdPath); err != nil {
-		return false
-	}
-	return true
-}
-
 // cloneFile makes a copy-on-write clone when the filesystem supports it
 // (APFS "cp -c"), otherwise a full copy.
 func cloneFile(src, dst string) error {
 	if err := exec.Command("cp", "-c", src, dst).Run(); err == nil {
 		return nil
 	}
-	return copyFile(src, dst)
+	return CopyFile(src, dst)
 }
 
-func copyFile(src, dst string) error {
+// CopyFile copies src to dst. Exporting it keeps main.go from growing its own
+// version of the same ten lines.
+func CopyFile(src, dst string) error {
 	in, err := os.Open(src)
 	if err != nil {
 		return err

@@ -34,6 +34,9 @@ type VM struct {
 	// warm-pool capacity: the daemon's own spare, reported in the pool stats
 	// and deliberately kept out of the desktop list.
 	Workspace string
+	// Headless is true when the image this VM booted declares no screen (see
+	// ImageMeta.Headless): there is nothing behind /d/ to stream.
+	Headless bool
 
 	forwards map[int]string
 	cmd      *exec.Cmd
@@ -45,11 +48,47 @@ type VM struct {
 	pausedFrom State
 	ready      chan struct{}
 	readyMu    sync.Once
-	mu         sync.Mutex
+	// done is closed when the VM process exits, so a caller waiting for
+	// readiness stops waiting when there is nothing left to wait for. exitErr
+	// is why it ended (guarded by mu).
+	done    chan struct{}
+	doneMu  sync.Once
+	exitErr error
+	mu      sync.Mutex
 }
 
 // Ready returns a channel closed once the guest reports readiness.
 func (v *VM) Ready() <-chan struct{} { return v.ready }
+
+// Done returns a channel closed once the VM process has exited.
+func (v *VM) Done() <-chan struct{} { return v.done }
+
+// wasReady reports whether the guest ever reported readiness, even if the VM
+// has since exited.
+func (v *VM) wasReady() bool {
+	select {
+	case <-v.ready:
+		return true
+	default:
+		return false
+	}
+}
+
+// markExited records how the VM process ended and wakes anyone waiting on it.
+func (v *VM) markExited(err error) {
+	v.mu.Lock()
+	v.exitErr = err
+	v.mu.Unlock()
+	v.doneMu.Do(func() { close(v.done) })
+}
+
+// ExitError is why the VM process ended, or nil if it ended cleanly or has not
+// ended yet.
+func (v *VM) ExitError() error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.exitErr
+}
 
 // markReady records the guest IP and signals readiness (idempotent).
 func (v *VM) markReady(ip string) {
@@ -132,6 +171,8 @@ type Info struct {
 	Volume  string    `json:"volume,omitempty"`
 	// Workspace tags the leasing workspace; empty means unleased pool capacity.
 	Workspace string `json:"workspace,omitempty"`
+	// Headless reports an image with no screen: there is no /d/ to open.
+	Headless bool `json:"headless,omitempty"`
 	// Allow and Deny are the desktop's egress policy (set by the API).
 	Allow []string `json:"allow,omitempty"`
 	Deny  []string `json:"deny,omitempty"`
@@ -148,5 +189,6 @@ func (v *VM) Info() Info {
 		Started:   v.Started,
 		Volume:    v.Volume,
 		Workspace: v.Workspace,
+		Headless:  v.Headless,
 	}
 }

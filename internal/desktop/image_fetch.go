@@ -40,11 +40,18 @@ func FetchChecksum(url string) (string, error) {
 	return fields[0], nil
 }
 
+// ProgressFunc reports how much of a download has arrived. total is 0 when the
+// server does not say how big the artifact is.
+type ProgressFunc func(done, total int64)
+
 // Download fetches url into dst. An existing dst that already matches wantSHA is
 // left alone; otherwise a partial dst is resumed with a Range request (and a
 // server that ignores the range simply restarts from zero). A finished file that
 // fails the checksum is removed so the next attempt cannot resume from it.
-func Download(url, dst, wantSHA string, progress io.Writer) error {
+//
+// progress, when non-nil, gets human-readable lines (for a terminal); onProgress,
+// when non-nil, gets the numbers (for a progress bar).
+func Download(url, dst, wantSHA string, progress io.Writer, onProgress ProgressFunc) error {
 	if wantSHA != "" {
 		if got, err := SHA256File(dst); err == nil && strings.EqualFold(got, wantSHA) {
 			return nil // already have it
@@ -93,7 +100,7 @@ func Download(url, dst, wantSHA string, progress io.Writer) error {
 	if progress != nil && have > 0 && total > 0 {
 		fmt.Fprintf(progress, "  resuming at %s of %s\n", humanBytes(have), humanBytes(total))
 	}
-	if _, err := copyProgress(f, resp.Body, have, total, progress); err != nil {
+	if _, err := copyProgress(f, resp.Body, have, total, progress, onProgress); err != nil {
 		f.Close()
 		return err
 	}
@@ -132,21 +139,27 @@ func Extract(archive, dir string) error {
 	return extractTo(dir, zr)
 }
 
-// FetchBuiltin downloads the built-in image archive and installs it into
-// workDir. The download and the extraction each land in a temporary path and
-// only finished files are moved into place, so an interrupted run or a bad
+// FetchImage downloads a published image archive and installs it into
+// imageDir/name. The download and the extraction each land in a temporary path
+// and only finished files are moved into place, so an interrupted run or a bad
 // checksum can never leave a half-written kernel for the daemon to boot. The
 // partial download is kept on failure so a retry resumes instead of restarting.
-func FetchBuiltin(workDir, url, wantSHA string, progress io.Writer) error {
-	if err := os.MkdirAll(workDir, 0o755); err != nil {
+func FetchImage(imageDir, name, url, wantSHA string, progress io.Writer) error {
+	return FetchImageProgress(imageDir, name, url, wantSHA, nil, progress)
+}
+
+// FetchImageProgress is FetchImage with a progress callback, for callers that
+// have somewhere to report to besides a terminal.
+func FetchImageProgress(imageDir, name, url, wantSHA string, onProgress ProgressFunc, progress io.Writer) error {
+	if err := os.MkdirAll(imageDir, 0o755); err != nil {
 		return err
 	}
-	tmp := filepath.Join(workDir, ".image-download.tar.zst")
-	if err := Download(url, tmp, wantSHA, progress); err != nil {
+	tmp := filepath.Join(imageDir, "."+name+".download.tar.zst")
+	if err := Download(url, tmp, wantSHA, progress, onProgress); err != nil {
 		return err // keep tmp: the next run resumes
 	}
 
-	staging := filepath.Join(workDir, ".image-staging")
+	staging := filepath.Join(imageDir, "."+name+".staging")
 	if err := os.RemoveAll(staging); err != nil {
 		return err
 	}
@@ -162,8 +175,12 @@ func FetchBuiltin(workDir, url, wantSHA string, progress io.Writer) error {
 		_ = os.RemoveAll(staging)
 		return err
 	}
+	dir := filepath.Join(imageDir, name)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
 	for _, e := range entries {
-		if err := os.Rename(filepath.Join(staging, e.Name()), filepath.Join(workDir, e.Name())); err != nil {
+		if err := os.Rename(filepath.Join(staging, e.Name()), filepath.Join(dir, e.Name())); err != nil {
 			return err
 		}
 	}
@@ -171,7 +188,7 @@ func FetchBuiltin(workDir, url, wantSHA string, progress io.Writer) error {
 	_ = os.Remove(tmp)
 	// Remember which published archive this image came from, so the daemon can
 	// offer an update when a newer one lands (internal/update reads it back).
-	_ = WriteImageSHA(workDir, wantSHA)
+	_ = WriteImageSHA(dir, wantSHA)
 	return nil
 }
 
@@ -216,10 +233,16 @@ func SHA256File(path string) (string, error) {
 
 // copyProgress copies src to dst, reporting to w at most twice a second. done is
 // the offset already present (a resumed download); total may be 0 when the
-// server doesn't say.
-func copyProgress(dst io.Writer, src io.Reader, done, total int64, w io.Writer) (int64, error) {
-	if w == nil {
+// server doesn't say. onProgress, when set, gets the same numbers on the same
+// cadence plus a final call.
+func copyProgress(dst io.Writer, src io.Reader, done, total int64, w io.Writer, onProgress ProgressFunc) (int64, error) {
+	if w == nil && onProgress == nil {
 		return io.Copy(dst, src)
+	}
+	report := func(d int64) {
+		if onProgress != nil {
+			onProgress(d, total)
+		}
 	}
 	buf := make([]byte, 1<<20)
 	last := time.Now()
@@ -232,19 +255,25 @@ func copyProgress(dst io.Writer, src io.Reader, done, total int64, w io.Writer) 
 			done += int64(n)
 			if time.Since(last) > 500*time.Millisecond {
 				last = time.Now()
-				fmt.Fprintf(w, "\r  %s", humanBytes(done))
-				if total > 0 {
-					fmt.Fprintf(w, " / %s (%.0f%%)", humanBytes(total), float64(done)/float64(total)*100)
+				report(done)
+				if w != nil {
+					fmt.Fprintf(w, "\r  %s", humanBytes(done))
+					if total > 0 {
+						fmt.Fprintf(w, " / %s (%.0f%%)", humanBytes(total), float64(done)/float64(total)*100)
+					}
+					fmt.Fprint(w, "   ")
 				}
-				fmt.Fprint(w, "   ")
 			}
 		}
 		if rerr == io.EOF {
-			fmt.Fprintf(w, "\r  %s", humanBytes(done))
-			if total > 0 {
-				fmt.Fprintf(w, " / %s (100%%)", humanBytes(total))
+			report(done)
+			if w != nil {
+				fmt.Fprintf(w, "\r  %s", humanBytes(done))
+				if total > 0 {
+					fmt.Fprintf(w, " / %s (100%%)", humanBytes(total))
+				}
+				fmt.Fprintln(w)
 			}
-			fmt.Fprintln(w)
 			return done, nil
 		}
 		if rerr != nil {

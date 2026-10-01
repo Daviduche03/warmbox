@@ -9,19 +9,33 @@ import (
 	"strings"
 )
 
-// BuiltinImage is the name Images() reports for the built-in image: the Alpine +
-// XFCE desktop built by deploy/guest/build.sh. "default" and "alpine" stay
-// accepted as aliases so an existing --image keeps resolving.
-const BuiltinImage = "xfce"
+// DefaultImage is the image a daemon boots when a caller names none and the
+// daemon was started without --image. It is an ordinary named image built from
+// deploy/images/xfce.yaml — there is no separate built-in slot.
+const DefaultImage = "xfce"
 
 // ImageMeta optionally overrides boot parameters for a named image. It lives
-// at <ImageDir>/<name>/meta.json.
+// at <ImageDir>/<name>/meta.json, and is generated from the image config in
+// deploy/images/ — never hand-edited, or the two drift.
 type ImageMeta struct {
-	GPU    string `json:"gpu"`     // virtio-gpu size, e.g. "800x600"
-	MemMiB uint   `json:"mem_mib"` // memory per VM
-	CPUs   uint   `json:"cpus"`    // vCPUs per VM
-	Input  bool   `json:"input"`   // attach virtio keyboard/pointing
+	GPU    string `json:"gpu,omitempty"`     // virtio-gpu size, e.g. "800x600"
+	MemMiB uint   `json:"mem_mib,omitempty"` // memory per VM
+	CPUs   uint   `json:"cpus,omitempty"`    // vCPUs per VM
+	Input  bool   `json:"input,omitempty"`   // attach virtio keyboard/pointing
+	// Headless marks an image with no screen: the guest skips Xvnc and the
+	// desktop session and reports ready off the agent port instead of the VNC
+	// port. The guest knows it from a file baked into the image; this is how
+	// the daemon and dashboard learn the same thing.
+	Headless bool `json:"headless,omitempty"`
+	// AgentAPI is the guest-agent contract the image was built against. Zero
+	// means the image predates the field, which reads as "no claim".
+	AgentAPI int `json:"agent_api,omitempty"`
 }
+
+// AgentAPI is the guest-agent contract this daemon speaks. An image built
+// against a newer one may use requests this daemon cannot make, so the daemon
+// warns rather than failing obscurely at the first call.
+const AgentAPI = 1
 
 // resolved describes how to boot a named image. An image is either a full EFI
 // disk (disk.raw, booted via firmware) or an overlay image (vmlinux +
@@ -37,33 +51,26 @@ type resolved struct {
 	meta   ImageMeta
 }
 
-// isBuiltinImage reports whether a name refers to the built-in image.
-func isBuiltinImage(name string) bool {
-	switch name {
-	case "", "default", BuiltinImage, "alpine":
-		return true
+// isAlias reports whether a name stands for "whatever this daemon's default
+// image is" rather than naming an image itself. "default" stays accepted so
+// scripts written against the old built-in naming keep working.
+func isAlias(name string) bool { return name == "" || name == "default" }
+
+// CanonicalImage resolves a requested name against the daemon's configured
+// default: an alias means the default, and a daemon with no configured default
+// means DefaultImage. Returns a name that Images() lists.
+func CanonicalImage(name, daemonDefault string) string {
+	if !isAlias(name) {
+		return name
 	}
-	return false
+	if daemonDefault != "" {
+		return daemonDefault
+	}
+	return DefaultImage
 }
 
-// SameImage reports whether two image names refer to the same image, treating
-// the built-in aliases ("", "default", "xfce", "alpine") as equivalent. Used to
-// decide whether a request can be served from the warm pool.
-func SameImage(a, b string) bool {
-	if isBuiltinImage(a) && isBuiltinImage(b) {
-		return true
-	}
-	return a == b
-}
-
-// CanonicalImage maps the built-in aliases onto the name Images() reports, so a
-// configured default always matches an entry in that list.
-func CanonicalImage(name string) string {
-	if isBuiltinImage(name) {
-		return BuiltinImage
-	}
-	return name
-}
+// DefaultFor is the image this daemon boots when a caller names none.
+func DefaultFor(daemonDefault string) string { return CanonicalImage("", daemonDefault) }
 
 func fileExists(p string) bool {
 	if p == "" {
@@ -86,41 +93,51 @@ func imageKind(dir string) (string, bool) {
 	return "", false
 }
 
-// builtinAvailable reports whether the built-in image's artifacts exist.
-func (m *Manager) builtinAvailable() bool {
-	if m.overlayAvailable() || m.diskAvailable() {
-		return true
-	}
-	return fileExists(m.cfg.InitrdPath)
-}
+// Images lists the images the daemon can boot.
+func (m *Manager) Images() []string { return ImagesIn(m.cfg.ImageDir) }
 
-// Images lists the images the daemon can boot: the built-in image (when its
-// artifacts exist) followed by the named images under cfg.ImageDir.
-func (m *Manager) Images() []string {
-	var out []string
-	if m.builtinAvailable() {
-		out = append(out, BuiltinImage)
-	}
-	entries, err := os.ReadDir(m.cfg.ImageDir)
+// ImagesIn lists the bootable images in an image directory: every subdirectory
+// that holds a complete image. It is the same rule the daemon applies at run
+// time, for callers that do not have a Manager yet.
+func ImagesIn(imageDir string) []string {
+	entries, err := os.ReadDir(imageDir)
 	if err != nil {
-		return out
+		return nil
 	}
-	var named []string
+	var out []string
 	for _, e := range entries {
 		if !e.IsDir() {
 			continue
 		}
-		if _, ok := imageKind(filepath.Join(m.cfg.ImageDir, e.Name())); ok {
-			named = append(named, e.Name())
+		if _, ok := imageKind(filepath.Join(imageDir, e.Name())); ok {
+			out = append(out, e.Name())
 		}
 	}
-	sort.Strings(named)
-	return append(out, named...)
+	sort.Strings(out)
+	return out
 }
 
-// validImageName rejects anything that could step outside the images directory
-// (or name a file rather than a directory).
-func validImageName(name string) bool {
+// ImageMetas reports each bootable image's meta.json overrides, keyed by the
+// name Images reports. An image whose meta.json cannot be read is left out
+// rather than reported as headless by accident. This is how the API tells the
+// dashboard which images have no screen.
+func (m *Manager) ImageMetas() map[string]ImageMeta {
+	names := m.Images()
+	out := make(map[string]ImageMeta, len(names))
+	for _, name := range names {
+		r, err := m.resolveImage(name)
+		if err != nil {
+			continue
+		}
+		out[name] = r.meta
+	}
+	return out
+}
+
+// ValidImageName rejects anything that could step outside the images directory
+// (or name a file rather than a directory). Exported because the image registry
+// validates config names with the same rule the daemon applies at run time.
+func ValidImageName(name string) bool {
 	if name == "" || name == "." || name == ".." {
 		return false
 	}
@@ -137,7 +154,7 @@ func validImageName(name string) bool {
 
 // resolveImage returns how to boot a named image, plus any per-image overrides.
 func (m *Manager) resolveImage(name string) (resolved, error) {
-	if !validImageName(name) {
+	if !ValidImageName(name) {
 		return resolved{}, fmt.Errorf("invalid image name %q", name)
 	}
 	dir := filepath.Join(m.cfg.ImageDir, name)

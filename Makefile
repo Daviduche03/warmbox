@@ -1,9 +1,14 @@
 # warmbox — self-hosted GUI desktop orchestrator (vfkit + noVNC)
 
 WARMBOX_HOME ?= $(HOME)/.warmbox
-BROWSER ?= chromium
 BINARY ?= warmbox
-VERSION ?= v0.1.0
+# A local build is not a release, so it says so: the update check then stays
+# quiet instead of comparing a dev tree against published tags. Releases get
+# their version from the tag — goreleaser passes -X main.version={{ .Tag }}.
+VERSION ?= dev
+# Which image the guest-image / image-pack targets act on. The images themselves
+# are defined in deploy/images/ — `./warmbox image build` lists them.
+IMAGE_NAME ?= xfce
 
 .PHONY: build build-all web web-dev guest-image setup daemon run test vet clean install image-pack release-snapshot
 
@@ -31,9 +36,9 @@ install: build
 	install -m755 $(BINARY) $(HOME)/.local/bin/$(BINARY)
 	-codesign --force --sign - $(HOME)/.local/bin/$(BINARY)
 
-## guest-image: build the guest rootfs and extract vmlinux + initramfs.zst
-guest-image:
-	./deploy/guest/build.sh
+## guest-image: build IMAGE_NAME from the registry (see deploy/images/)
+guest-image: build
+	./$(BINARY) image build $(IMAGE_NAME)
 
 ## setup: fetch noVNC and check prerequisites (requires the guest image)
 setup: build
@@ -59,9 +64,9 @@ vet:
 clean:
 	rm -f $(BINARY)
 
-## image-pack: pack the built-in image for the "images" release (also writes .sha256)
+## image-pack: pack IMAGE_NAME for the "images" release (also writes .sha256)
 image-pack: build
-	./$(BINARY) image pack --builtin -o warmbox-image-$(shell go env GOARCH).tar.zst
+	./$(BINARY) image pack $(IMAGE_NAME) -o warmbox-image-$(IMAGE_NAME)-$(shell go env GOARCH).tar.zst
 
 ## release-snapshot: dry-run a release locally (builds every target, publishes nothing)
 release-snapshot:

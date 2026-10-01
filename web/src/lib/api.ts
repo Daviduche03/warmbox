@@ -67,6 +67,48 @@ export interface Desktop {
   volume?: string;
   allow?: string[];
   deny?: string[];
+  /** The image behind this desktop declares no screen — nothing at /d/. */
+  headless?: boolean;
+}
+
+/**
+ * Per-image boot overrides from an image's meta.json. Only `headless` changes
+ * what the dashboard can offer: a headless image has no console to open.
+ */
+export interface ImageMeta {
+  gpu?: string;
+  mem_mib?: number;
+  cpus?: number;
+  input?: boolean;
+  headless?: boolean;
+}
+
+/** GET /api/images — the name list plus each image's meta.json overrides. */
+export interface ImagesResponse {
+  images: string[] | null;
+  /** Absent on older daemons; nothing is headless then. */
+  image_meta?: Record<string, ImageMeta>;
+  /** Every image this build knows about, installed or not. */
+  catalogue?: ImageStatus[];
+}
+
+/**
+ * One row of the Images page: an image the daemon can boot, or one this build
+ * knows about that has not been fetched yet.
+ */
+export interface ImageStatus {
+  name: string;
+  headless?: boolean;
+  /** The daemon can boot it right now. */
+  installed?: boolean;
+  /** There is something to download. False for unpublished or locally built. */
+  pullable?: boolean;
+  state: "installed" | "available" | "pulling" | "failed";
+  /** Why a pull failed. */
+  detail?: string;
+  /** Bytes downloaded and expected, while state is "pulling". */
+  done?: number;
+  total?: number;
 }
 
 export interface Volume {
@@ -308,7 +350,17 @@ export const api = {
       request<{ status: string }>(`/api/snapshots/${id}`, { method: "DELETE" }),
   },
 
-  images: () => request<{ images: string[] | null }>("/api/images"),
+  images: () => request<ImagesResponse>("/api/images"),
+
+  /**
+   * Ask the daemon to download and install a published image. It answers as
+   * soon as the job is registered — the download is hundreds of MB, so progress
+   * comes from polling images(), not from this request.
+   */
+  pullImage: (name: string) =>
+    request<void>(`/api/images/${encodeURIComponent(name)}/pull`, {
+      method: "POST",
+    }),
 
   auth: {
     setupStatus: () => request<{ needs_setup: boolean }>("/api/setup/status"),

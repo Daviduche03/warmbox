@@ -1,16 +1,20 @@
 name: guest image
 
-# Publishes the guest images to a fixed "images" release, one asset per
-# architecture:
+# Publishes the guest images to a fixed "images" release, one asset per image
+# per architecture:
 #
-#   warmbox-image-<goarch>.tar.zst  (+ .sha256)
+#   warmbox-image-<name>-<goarch>.tar.zst  (+ .sha256)
 #
 # The tag is deliberately not the version: the guest changes far less often than
-# the CLI, and `warmbox setup` looks for these exact names, so a new release does
-# not need ~800 MB re-uploaded. Run this only when the guest actually changes.
+# the CLI, and `warmbox setup` looks for these names, so a new release does not
+# need hundreds of MB re-uploaded. Run this only when a guest actually changes.
 #
-# Manual on purpose: the build takes ~15 minutes per architecture and a failure
-# here must never be able to block a binary release.
+# Which images ship is not decided here: `warmbox image build --publishable`
+# asks the registry in deploy/images/. Adding an image is a config file plus a
+# `publish: true`, not an edit to this workflow.
+#
+# Manual on purpose: every image is minutes of build per architecture, and a
+# failure here must never be able to block a binary release.
 
 on:
   workflow_dispatch:
@@ -21,6 +25,10 @@ on:
         default: both
         type: choice
         options: [both, amd64, arm64]
+      images:
+        description: "Image names, space-separated (empty = every publish: true image)"
+        required: false
+        default: ""
 
 permissions:
   contents: write
@@ -29,7 +37,7 @@ jobs:
   amd64:
     if: ${{ inputs.arch == 'amd64' || inputs.arch == 'both' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v7
 
@@ -38,42 +46,45 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      # Builds vmlinux + initramfs.zst + rootfs.squashfs (+ overlay initramfs
-      # and volume-base.img) into ~/.warmbox.
-      - name: Build the guest image
-        env:
-          PLATFORM: linux/amd64
-        run: ./deploy/guest/build.sh
+      - run: go build -o warmbox ./cmd/warmbox
 
-      - name: Pack it (adds the .sha256 beside the archive)
+      - name: Ask the registry which images ship
+        id: which
         run: |
-          go build -o warmbox ./cmd/warmbox
-          ./warmbox image pack --builtin -o warmbox-image-amd64.tar.zst
+          images="${{ inputs.images }}"
+          if [ -z "$images" ]; then
+            images="$(./warmbox image build --publishable | tr '\n' ' ')"
+          fi
+          echo "building: $images"
+          echo "names=$images" >> "$GITHUB_OUTPUT"
 
-      - name: Publish to the images release
+      - name: Build and publish each image
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -eu
           gh release create images --latest=false \
             --title "Guest images" \
-            --notes "Guest images for \`warmbox setup\`, one per host architecture. Not versioned with the CLI: they change only when the guest does." \
+            --notes "Guest images, one asset per image and host architecture. Not versioned with the CLI: they change only when a guest does.
+
+          Install one with \`warmbox setup\` (the default image) or \`warmbox image pull <name>\`." \
             2>/dev/null || true
-          gh release upload images \
-            warmbox-image-amd64.tar.zst \
-            warmbox-image-amd64.tar.zst.sha256 \
-            --clobber
+          for name in ${{ steps.which.outputs.names }}; do
+            echo "=== $name (amd64)"
+            ./warmbox image build "$name" --platform linux/amd64
+            asset="warmbox-image-$name-amd64.tar.zst"
+            ./warmbox image pack "$name" -o "$asset"
+            gh release upload images "$asset" "$asset.sha256" --clobber
+          done
 
   arm64:
     # ubuntu-24.04-arm is GitHub's free arm64 runner, available on public
-    # repositories. If it is ever unavailable, build the arm64 image on an Apple
-    # Silicon Mac instead — which is where the guest image already lives:
-    #
-    #   make image-pack VERSION=unused
-    #   gh release upload images warmbox-image-arm64.tar.zst \
-    #       warmbox-image-arm64.tar.zst.sha256
+    # repositories. If it is ever unavailable, build on an Apple Silicon Mac
+    # instead: ./warmbox image build <name> && ./warmbox image pack <name>, then
+    # upload warmbox-image-<name>-arm64.tar.zst (+ .sha256) by hand.
     if: ${{ inputs.arch == 'arm64' || inputs.arch == 'both' }}
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 90
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v7
 
@@ -82,25 +93,33 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Build the guest image
-        env:
-          PLATFORM: linux/arm64
-        run: ./deploy/guest/build.sh
+      - run: go build -o warmbox ./cmd/warmbox
 
-      - name: Pack it (adds the .sha256 beside the archive)
+      - name: Ask the registry which images ship
+        id: which
         run: |
-          go build -o warmbox ./cmd/warmbox
-          ./warmbox image pack --builtin -o warmbox-image-arm64.tar.zst
+          images="${{ inputs.images }}"
+          if [ -z "$images" ]; then
+            images="$(./warmbox image build --publishable | tr '\n' ' ')"
+          fi
+          echo "building: $images"
+          echo "names=$images" >> "$GITHUB_OUTPUT"
 
-      - name: Publish to the images release
+      - name: Build and publish each image
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -eu
           gh release create images --latest=false \
             --title "Guest images" \
-            --notes "Guest images for \`warmbox setup\`, one per host architecture. Not versioned with the CLI: they change only when the guest does." \
+            --notes "Guest images, one asset per image and host architecture. Not versioned with the CLI: they change only when a guest does.
+
+          Install one with \`warmbox setup\` (the default image) or \`warmbox image pull <name>\`." \
             2>/dev/null || true
-          gh release upload images \
-            warmbox-image-arm64.tar.zst \
-            warmbox-image-arm64.tar.zst.sha256 \
-            --clobber
+          for name in ${{ steps.which.outputs.names }}; do
+            echo "=== $name (arm64)"
+            ./warmbox image build "$name" --platform linux/arm64
+            asset="warmbox-image-$name-arm64.tar.zst"
+            ./warmbox image pack "$name" -o "$asset"
+            gh release upload images "$asset" "$asset.sha256" --clobber
+          done

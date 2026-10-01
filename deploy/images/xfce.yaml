@@ -1,0 +1,14 @@
+# The default image: an Alpine + XFCE desktop with the Win11 theme.
+#
+# Build it with `warmbox image build xfce` (or ./deploy/guest/build.sh by hand).
+# Anything under `runtime` is written into the image's meta.json, which is what
+# the daemon reads at run time; everything else is a build knob.
+name: xfce
+engine: overlay
+desktop: xfce
+theme: win11
+browser: chromium
+headless: false
+# runtime: deliberately empty — this image inherits whatever the daemon was
+# started with (--cpus/--mem), which is what it did before it had a config.
+publish: true

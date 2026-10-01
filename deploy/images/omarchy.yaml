@@ -1,0 +1,16 @@
+# Arch + Hyprland/Quickshell, staged as an EFI disk. A different engine on
+# purpose: this one cannot build from a Dockerfile — it stages an Omarchy disk
+# that was already installed on a machine, then provisions it over the serial
+# console. Everything this config can say is *what the image is*; where the
+# source disk lives (OMARCHY_SRC) stays a host detail, passed by the caller.
+name: omarchy
+engine: efi
+resolution: 800x600
+runtime:
+  gpu: 800x600
+  mem_mib: 3072
+  cpus: 4
+  input: true
+# 8.4 GB of disk, ~4 GB compressed, and it needs a hand-built source disk —
+# too big to publish and not reproducible in CI.
+publish: false

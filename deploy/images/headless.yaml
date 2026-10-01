@@ -1,0 +1,14 @@
+# The same Alpine base with no screen: the guest skips Xvnc and the desktop
+# session and reports ready as soon as its agent is listening, so there is no
+# console to open — it is reached through the agent API (exec/files/runs).
+#
+# `headless` is the one field that is both a build knob and a run-time fact: it
+# bakes a marker into the guest and lands in meta.json, which is how the daemon
+# knows not to offer a screen.
+name: headless
+engine: overlay
+desktop: xfce
+theme: win11
+browser: chromium
+headless: true
+publish: true

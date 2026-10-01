@@ -26,6 +26,12 @@ virtio-gpu device. Warmbox hands the guest its identity over a virtiofs share
 (tag `warmbox-config`) because EFI boot has no kernel cmdline — the image's
 `warmbox-ready` unit reads it and reports readiness back to the daemon.
 
+Headless images (`"headless": true`) are **overlay images only** for now. The
+readiness logic that skips the screen lives in `deploy/guest/init`, which EFI
+images do not run: `warmbox-ready` still waits for the VNC port, so an EFI image
+marked headless would never report ready. Build one with
+`HEADLESS=1 VARIANT=headless ./deploy/guest/build.sh` instead.
+
 ## Shipping an image
 
 Images are large raw disks, so they can be packed as a single compressed
