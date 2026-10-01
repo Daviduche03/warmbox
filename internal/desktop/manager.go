@@ -311,9 +311,9 @@ func (m *Manager) WaitReady(ctx context.Context, id string) (*VM, error) {
 			return vm, nil
 		}
 		if err := vm.ExitError(); err != nil {
-			return nil, fmt.Errorf("the vm exited before it became ready: %w", err)
+			return nil, fmt.Errorf("the vm exited before it became ready: %w%s", err, vm.exitDetail())
 		}
-		return nil, fmt.Errorf("the vm exited before it became ready")
+		return nil, fmt.Errorf("the vm exited before it became ready%s", vm.exitDetail())
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}

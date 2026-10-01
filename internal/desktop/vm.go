@@ -4,6 +4,7 @@ import (
 	"net"
 	"os/exec"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -88,6 +89,35 @@ func (v *VM) ExitError() error {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	return v.exitErr
+}
+
+// exitDetail quotes the hypervisor's own last words, when it had any.
+//
+// "exit status 1" is not a diagnosis — a hypervisor that refuses to start has
+// usually already said why ("Could not access KVM kernel module" is the common
+// one), and that sentence is the difference between a fixable failure and a
+// mystery. The last line is normally the reason; keep the one before it too,
+// since some tools print a preamble.
+func (v *VM) exitDetail() string {
+	if v.inst == nil || v.inst.Stderr == nil {
+		return ""
+	}
+	text := v.inst.Stderr.String()
+	if text == "" {
+		return ""
+	}
+	var tail []string
+	lines := strings.Split(text, "\n")
+	for i := len(lines) - 1; i >= 0 && len(tail) < 2; i-- {
+		if s := strings.TrimSpace(lines[i]); s != "" {
+			tail = append([]string{s}, tail...)
+		}
+	}
+	quoted := strings.Join(tail, ": ")
+	if len(quoted) > 400 {
+		quoted = quoted[:400] + "…"
+	}
+	return ": " + quoted
 }
 
 // markReady records the guest IP and signals readiness (idempotent).

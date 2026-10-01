@@ -1136,16 +1136,31 @@ func ensureHypervisor(cfg *desktop.Config, allowInstall bool) bool {
 		fmt.Fprintf(os.Stderr, "✓ %s found\n", bin)
 	}
 
-	if _, err := os.Stat("/dev/kvm"); err != nil {
+	if err := kvmUsable(); err != nil {
 		// Virtualisation is sometimes just not loaded yet; try the module once.
 		_ = runCmd("", os.Environ(), "modprobe", "kvm")
-		if _, err := os.Stat("/dev/kvm"); err != nil {
-			fmt.Fprintln(os.Stderr, "✗ /dev/kvm missing — enable virtualisation (BIOS/VM settings, or the kvm group)")
+		if err := kvmUsable(); err != nil {
+			fmt.Fprintf(os.Stderr, "✗ /dev/kvm is not usable: %v\n", err)
+			fmt.Fprintln(os.Stderr, "  enable virtualisation (BIOS/VM settings), or let this user open /dev/kvm (the kvm group)")
 			return false
 		}
 	}
 	fmt.Fprintln(os.Stderr, "✓ /dev/kvm")
 	return true
+}
+
+// kvmUsable reports whether QEMU could actually use /dev/kvm.
+//
+// Existing is not the same as usable: QEMU opens this read-write, and a daemon
+// running as a user outside the kvm group finds a file it can stat but not open.
+// A stat-only check prints "✓ /dev/kvm" and leaves the VM to die at boot with
+// "Could not access KVM kernel module: Permission denied".
+func kvmUsable() error {
+	f, err := os.OpenFile("/dev/kvm", os.O_RDWR, 0)
+	if err != nil {
+		return err
+	}
+	return f.Close()
 }
 
 // buildGuestImage builds one guest image on this machine — there is no artifact

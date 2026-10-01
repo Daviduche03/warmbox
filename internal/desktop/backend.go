@@ -80,6 +80,10 @@ type Instance struct {
 	// Control is the backend's live control endpoint: a unix socket path
 	// (vfkit's REST API, QEMU's QMP monitor). Empty when unavailable.
 	Control string
+	// Stderr is the tail of the hypervisor's own output — not the guest's serial
+	// console. When a VM dies before it is ready this is usually the only thing
+	// that says why, so it is kept for the error the caller sees.
+	Stderr *Excerpt
 }
 
 // Backend boots microVMs on a specific hypervisor. The manager owns the process
@@ -187,13 +191,19 @@ func (b *vfkitBackend) Launch(spec LaunchSpec) (*Instance, error) {
 	}
 	cmd := exec.Command(bin, args...)
 	// Keep vfkit's own diagnostics with the VM (next to the guest serial log)
-	// rather than dropping them or spamming the daemon.
+	// rather than dropping them or spamming the daemon, and keep the tail in
+	// memory so a boot that dies can quote the reason.
+	stderr := NewExcerpt(0)
 	if spec.Console != "" {
 		if f, err := os.OpenFile(filepath.Join(filepath.Dir(spec.Console), "vfkit.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644); err == nil {
-			cmd.Stderr = f
+			cmd.Stderr = io.MultiWriter(f, stderr)
+		} else {
+			cmd.Stderr = stderr
 		}
+	} else {
+		cmd.Stderr = stderr
 	}
-	return &Instance{Cmd: cmd, Control: control}, nil
+	return &Instance{Cmd: cmd, Control: control, Stderr: stderr}, nil
 }
 
 // Pause freezes the guest's vCPUs; Resume thaws them. The guest's memory stays
@@ -330,13 +340,20 @@ func (b *qemuBackend) Launch(spec LaunchSpec) (*Instance, error) {
 	if spec.PidFile != "" {
 		args = append(args, "-pidfile", spec.PidFile)
 	}
+	// QEMU's own diagnostics used to go to the daemon's stderr and nowhere
+	// else, so "exit status 1" was all a failed boot could tell you. Keep the
+	// tail for the error, and still pass it through to the daemon's log.
+	stderr := NewExcerpt(0)
+	cmd := exec.Command(bin, args...)
+	cmd.Stderr = io.MultiWriter(stderr, os.Stderr)
 	return &Instance{
-		Cmd: exec.Command(bin, args...),
+		Cmd: cmd,
 		Forwards: map[int]string{
 			5900: fmt.Sprintf("127.0.0.1:%d", vncPort),
 			7077: fmt.Sprintf("127.0.0.1:%d", agentPort),
 		},
 		Control: control,
+		Stderr:  stderr,
 	}, nil
 }
 

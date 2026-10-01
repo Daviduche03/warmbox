@@ -17,6 +17,8 @@ import (
 // starts and no test leaves a guest behind.
 type captureBackend struct {
 	spec LaunchSpec
+	// stderr stands in for whatever the hypervisor would have complained about.
+	stderr string
 }
 
 func (b *captureBackend) Name() string           { return "test" }
@@ -26,7 +28,11 @@ func (b *captureBackend) Resume(*Instance) error { return nil }
 func (b *captureBackend) GuestHostAddr() string  { return "192.168.64.1" }
 func (b *captureBackend) Launch(spec LaunchSpec) (*Instance, error) {
 	b.spec = spec
-	return &Instance{Cmd: exec.Command("true")}, nil
+	stderr := NewExcerpt(0)
+	if b.stderr != "" {
+		_, _ = stderr.Write([]byte(b.stderr + "\n"))
+	}
+	return &Instance{Cmd: exec.Command("true"), Stderr: stderr}, nil
 }
 
 // testManager builds a Manager over an empty temp workdir: no images are
@@ -256,5 +262,63 @@ func TestImageWithAScreenKeepsItsDevices(t *testing.T) {
 	}
 	if vm.Headless {
 		t.Error("vm from an image with a screen marked headless")
+	}
+}
+
+// A VM that dies on a host whose hypervisor refused to start must say *why*.
+// "exit status 1" alone sent someone looking through a VPS by hand; the
+// hypervisor had already printed the answer and nobody was keeping it.
+func TestWaitReadyQuotesWhyTheHypervisorRefused(t *testing.T) {
+	m := testManager(t)
+	namedImage(t, m, "img", "")
+	m.backend = &captureBackend{
+		stderr: "qemu-system-x86_64: -machine q35,accel=kvm: Could not access KVM kernel module: No such file or directory\nqemu-system-x86_64: failed to initialize kvm: No such file or directory",
+	}
+
+	vm, err := m.start(StartSpec{ImageName: "img"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	_, err = m.WaitReady(ctx, vm.ID)
+	if err == nil {
+		t.Fatal("WaitReady succeeded for a VM whose process had exited")
+	}
+	if !strings.Contains(err.Error(), "Could not access KVM kernel module") {
+		t.Errorf("error = %v\nwant it to quote what the hypervisor said", err)
+	}
+	if !strings.Contains(err.Error(), "exited before it became ready") {
+		t.Errorf("error = %v\nwant it to still say the vm exited", err)
+	}
+}
+
+// The excerpt is a tail, not a transcript: a chatty hypervisor must not grow the
+// daemon without bound, and the process we are only watching must never see a
+// short write.
+func TestExcerptKeepsOnlyTheTail(t *testing.T) {
+	e := NewExcerpt(8)
+	if n, err := e.Write([]byte("0123456789")); n != 10 || err != nil {
+		t.Fatalf("Write = (%d, %v), want (10, nil)", n, err)
+	}
+	if got := e.String(); got != "23456789" {
+		t.Errorf("String() = %q, want the last 8 bytes", got)
+	}
+	_, _ = e.Write([]byte("XY"))
+	if got := e.String(); got != "456789XY" {
+		t.Errorf("String() = %q, want the newest bytes", got)
+	}
+	// A backend that just prints a newline has nothing to say.
+	e2 := NewExcerpt(8)
+	_, _ = e2.Write([]byte("  \n\n"))
+	if got := e2.String(); got != "" {
+		t.Errorf("String() = %q, want empty for whitespace", got)
+	}
+	// The zero value is usable, with a sane default bound.
+	var e3 Excerpt
+	_, _ = e3.Write([]byte("hello"))
+	if got := e3.String(); got != "hello" {
+		t.Errorf("zero-value String() = %q", got)
 	}
 }
