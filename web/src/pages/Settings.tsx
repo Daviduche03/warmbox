@@ -359,7 +359,7 @@ function TokensSection() {
 							className="space-y-4"
 							onSubmit={(e) => void create(e)}
 						>
-							<div className="space-y-2">
+							<div className="space-y-3">
 								<label className="text-sm" htmlFor="new-token-name">
 									Name
 								</label>
@@ -664,7 +664,7 @@ function TeamSection() {
 						</DialogDescription>
 					</DialogHeader>
 					<form className="space-y-4" onSubmit={(e) => void invite(e)}>
-						<div className="space-y-2">
+						<div className="space-y-3">
 							<label className="text-sm" htmlFor="invite-name">
 								Name
 							</label>
@@ -677,7 +677,7 @@ function TeamSection() {
 								value={name}
 							/>
 						</div>
-						<div className="space-y-2">
+						<div className="space-y-3">
 							<label className="text-sm" htmlFor="invite-email">
 								Email
 							</label>
@@ -691,7 +691,7 @@ function TeamSection() {
 								value={email}
 							/>
 						</div>
-						<div className="space-y-2">
+						<div className="space-y-3">
 							<label className="text-sm" htmlFor="invite-password">
 								Temporary password
 							</label>
@@ -705,7 +705,7 @@ function TeamSection() {
 								value={password}
 							/>
 						</div>
-						<div className="space-y-2">
+						<div className="space-y-3">
 							<label className="text-sm" htmlFor="invite-role">
 								Role
 							</label>
@@ -901,7 +901,7 @@ function StorageSection() {
 				<CardContent className="px-6 py-4">
 					<form className="space-y-4" onSubmit={(e) => void save(e)}>
 						<div className="grid gap-4 sm:grid-cols-2">
-							<div className="space-y-2">
+							<div className="space-y-3">
 								<label className="text-sm" htmlFor="cloud-provider">
 									Provider
 								</label>
@@ -912,7 +912,7 @@ function StorageSection() {
 									value={provider}
 								/>
 							</div>
-							<div className="space-y-2">
+							<div className="space-y-3">
 								<label className="text-sm" htmlFor="cloud-bucket">
 									Bucket
 								</label>
@@ -936,7 +936,7 @@ function StorageSection() {
 									value={endpoint}
 								/>
 							</div>
-							<div className="space-y-2">
+							<div className="space-y-3">
 								<label className="text-sm" htmlFor="cloud-access">
 									Access key
 								</label>
@@ -948,7 +948,7 @@ function StorageSection() {
 									value={accessKey}
 								/>
 							</div>
-							<div className="space-y-2">
+							<div className="space-y-3">
 								<label className="text-sm" htmlFor="cloud-secret">
 									Secret key
 								</label>
@@ -961,7 +961,7 @@ function StorageSection() {
 									value={secretKey}
 								/>
 							</div>
-							<div className="space-y-2">
+							<div className="space-y-3">
 								<label className="text-sm" htmlFor="cloud-region">
 									Region
 								</label>
@@ -1070,7 +1070,7 @@ function DesktopLimitSection() {
 			<Card className="shadow-none dark:ring-0">
 				<CardContent className="px-6 py-2">
 					<form className="space-y-4" onSubmit={(e) => void save(e)}>
-						<div className="space-y-2">
+						<div className="space-y-3">
 							<label className="text-sm" htmlFor="max-desktops">
 								Desktops per workspace
 							</label>

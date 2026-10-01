@@ -199,7 +199,7 @@ export function VolumesPage() {
 							void create();
 						}}
 					>
-						<div className="space-y-2">
+						<div className="space-y-3">
 							<label className="text-sm" htmlFor="new-volume-name">
 								Name
 							</label>
@@ -212,7 +212,7 @@ export function VolumesPage() {
 								value={name}
 							/>
 						</div>
-						<div className="space-y-2">
+						<div className="space-y-3">
 							<label className="text-sm" htmlFor="new-volume-size">
 								Size
 							</label>

@@ -441,23 +441,23 @@ export function DesktopsPage() {
 							default-deny. Deny always wins. Comma-separated.
 						</DialogDescription>
 					</DialogHeader>
-					<div className="grid gap-3 py-2">
-						<label className="grid gap-1 text-sm">
-							<span className="text-muted-foreground">Allow</span>
+					<div className="grid gap-4 py-2">
+						<Field id="policy-allow" label="Allow">
 							<Input
+								id="policy-allow"
 								onChange={(e) => setPolicyAllow(e.target.value)}
 								placeholder="api.openai.com, pypi.org"
 								value={policyAllow}
 							/>
-						</label>
-						<label className="grid gap-1 text-sm">
-							<span className="text-muted-foreground">Deny</span>
+						</Field>
+						<Field id="policy-deny" label="Deny">
 							<Input
+								id="policy-deny"
 								onChange={(e) => setPolicyDeny(e.target.value)}
 								placeholder="ads.example.com"
 								value={policyDeny}
 							/>
-						</label>
+						</Field>
 					</div>
 					<DialogFooter>
 						<Button
