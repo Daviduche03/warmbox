@@ -2,7 +2,7 @@ name: ci
 
 on:
   push:
-    branches: [master, win11-theme-wip]
+    branches: [master]
   pull_request:
 
 jobs:
