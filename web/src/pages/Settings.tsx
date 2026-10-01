@@ -1,4 +1,4 @@
-import { useEffect, useState, type FormEvent } from "react";
+import { useEffect, useState, type FormEvent, type ReactNode } from "react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -41,7 +41,14 @@ import { SectionHead } from "@/components/section-head";
 import { Spinner } from "@/components/spinner";
 import { StatusIndicator } from "@/components/indicator";
 import { useStore } from "@/lib/store";
-import { api, roleRank, ApiError, type CloudStorage, type Member } from "@/lib/api";
+import {
+	api,
+	roleRank,
+	ApiError,
+	type CloudStorage,
+	type Member,
+	type UpdateCheck,
+} from "@/lib/api";
 import { usePending } from "@/lib/use-pending";
 import {
 	ArrowsClockwise,
@@ -62,13 +69,75 @@ function Notice({ message, tone }: { message?: string; tone?: "error" | "success
 	);
 }
 
-function Row({ label, value }: { label: string; value: string }) {
+function Row({
+	label,
+	value,
+	extra,
+	title,
+}: {
+	label: string;
+	value: string;
+	/** Rendered after the value — an "update available" badge, say. */
+	extra?: ReactNode;
+	/** Hover text for the value, used when it is a shortened status. */
+	title?: string;
+}) {
 	return (
 		<div className="flex items-center justify-between gap-4 border-b px-6 py-3 last:border-b-0">
 			<span className="text-muted-foreground text-sm">{label}</span>
-			<span className="truncate font-medium text-sm tabular-nums">{value}</span>
+			<span
+				className="flex min-w-0 items-center gap-2 truncate font-medium text-sm tabular-nums"
+				title={title}
+			>
+				<span className="truncate">{value}</span>
+				{extra}
+			</span>
 		</div>
 	);
+}
+
+/** An amber flag linking at the thing that is newer than what we have. */
+function UpdateFlag({ href, children }: { href: string; children: ReactNode }) {
+	return (
+		<a
+			className="shrink-0"
+			href={href}
+			rel="noreferrer"
+			target="_blank"
+		>
+			<Badge
+				className="border-amber-500/50 bg-amber-500/10 text-amber-600 hover:bg-amber-500/20 dark:text-amber-400"
+				variant="outline"
+			>
+				{children}
+			</Badge>
+		</a>
+	);
+}
+
+/** The guest-image row: what is installed, and whether a newer one is out. */
+function imageLabel(img?: UpdateCheck["image"]): string {
+	if (!img) return "—";
+	if (img.available) return `${img.current?.slice(0, 7) ?? "?"} installed`;
+	if (!img.latest) return "couldn't check";
+	if (!img.known) return img.current === "local" ? "built locally" : "not recorded";
+	return `${img.current?.slice(0, 7)} · up to date`;
+}
+
+/** Freshness of the check itself, so a quiet flag is never mistaken for a stale one. */
+function checkLabel(upd?: UpdateCheck): { value: string; title?: string } {
+	if (!upd) return { value: "—" };
+	if (upd.error) return { value: "couldn't check", title: upd.error };
+	if (!upd.checked_at) return { value: "checking…" };
+	return { value: `checked ${ago(upd.checked_at)}` };
+}
+
+function ago(iso: string): string {
+	const secs = Math.max(0, (Date.now() - Date.parse(iso)) / 1000);
+	if (secs < 90) return "just now";
+	if (secs < 3600) return `${Math.round(secs / 60)}m ago`;
+	if (secs < 86400) return `${Math.round(secs / 3600)}h ago`;
+	return `${Math.round(secs / 86400)}d ago`;
 }
 
 function useCopy(): [boolean, (text: string) => Promise<void>] {
@@ -1114,6 +1183,12 @@ function DesktopLimitSection() {
 function DaemonSection() {
 	const { me, status, loading, error, refresh } = useStore();
 	const [refreshing, setRefreshing] = useState(false);
+	// The daemon works this out in the background, so the flag may be missing,
+	// still checking, or carrying a failure. All three read better than silence.
+	const upd = status?.updates;
+	const binUpdate = upd?.binary?.available ? upd.binary : null;
+	const imgUpdate = upd?.image?.available ? upd.image : null;
+	const check = checkLabel(upd);
 
 	async function runRefresh() {
 		setRefreshing(true);
@@ -1156,7 +1231,15 @@ function DaemonSection() {
 			/>
 			<Card className="shadow-none dark:ring-0">
 				<CardContent className="p-0">
-					<Row label="Version" value={status?.version ?? "—"} />
+					<Row
+						label="Version"
+						value={status?.version ?? "—"}
+						extra={
+							binUpdate ? (
+								<UpdateFlag href={binUpdate.url}>{binUpdate.latest} available</UpdateFlag>
+							) : null
+						}
+					/>
 					<Row label="Backend" value={status?.backend ?? "—"} />
 					<Row label="Listen address" value={status?.addr ?? "—"} />
 					<Row label="Uptime" value={status?.up ?? "—"} />
@@ -1177,6 +1260,16 @@ function DaemonSection() {
 						}
 					/>
 					<Row label="Default image" value={status?.default_image ?? "—"} />
+					<Row
+						label="Guest image"
+						value={imageLabel(upd?.image)}
+						extra={
+							imgUpdate ? (
+								<UpdateFlag href={imgUpdate.url}>new build available</UpdateFlag>
+							) : null
+						}
+					/>
+					<Row label="Update check" title={check.title} value={check.value} />
 					<Row
 						label="Signed in"
 						value={me ? `${me.user.email} · ${me.role}` : "—"}

@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"warmbox/internal/catalog"
+	"warmbox/internal/update"
 )
 
 // StatusInfo is the daemon-level detail the API reports to the dashboard. It is
@@ -20,6 +21,10 @@ type StatusInfo struct {
 
 // SetStatusInfo records the daemon description surfaced by GET /api/status.
 func (s *Server) SetStatusInfo(i StatusInfo) { s.info = i }
+
+// SetUpdater supplies the release check the Daemon tab reads. It is optional:
+// without it, GET /api/status simply omits "updates".
+func (s *Server) SetUpdater(u *update.Manager) { s.updater = u }
 
 // StatusResponse is the shape the dashboard consumes.
 type StatusResponse struct {
@@ -37,6 +42,10 @@ type StatusResponse struct {
 	// Defaults are the per-VM sizes a desktop gets when a request does not
 	// name its own; the create form pre-fills them.
 	Defaults defaultsInfo `json:"defaults"`
+	// Updates is the daemon's cached answer to "is there something newer?" —
+	// gathered by a background check, never fetched while rendering this. It is
+	// nil when the daemon did not wire a checker.
+	Updates *update.State `json:"updates,omitempty"`
 }
 
 type defaultsInfo struct {
@@ -104,6 +113,10 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 		if sn, err := s.volumes.ListSnapshots(r.Context()); err == nil {
 			out.Snapshots = len(sn)
 		}
+	}
+	if s.updater != nil {
+		st := s.updater.State()
+		out.Updates = &st
 	}
 	writeJSON(w, http.StatusOK, out)
 }

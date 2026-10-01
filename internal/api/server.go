@@ -19,6 +19,7 @@ import (
 	"warmbox/internal/catalog"
 	"warmbox/internal/desktop"
 	"warmbox/internal/egress"
+	"warmbox/internal/update"
 	"warmbox/internal/vnc"
 	"warmbox/internal/volume"
 	"warmbox/web"
@@ -36,6 +37,10 @@ type Server struct {
 	started time.Time
 	info    StatusInfo
 	web     http.Handler
+
+	// updater is the background "is there a newer release?" check surfaced by
+	// GET /api/status; nil when the daemon did not wire one (tests).
+	updater *update.Manager
 
 	polMu    sync.Mutex
 	policies map[string]egress.Policy // per-desktop egress policy

@@ -34,6 +34,7 @@ import (
 	"warmbox/internal/config"
 	"warmbox/internal/desktop"
 	"warmbox/internal/egress"
+	"warmbox/internal/update"
 	"warmbox/internal/volume"
 )
 
@@ -859,6 +860,21 @@ func cmdDaemon(args []string) {
 		VolumesBacked: backedBy,
 		DefaultImage:  desktop.CanonicalImage(cfg.Image),
 	})
+	// "Is there something newer?" for the Daemon tab. It runs in the
+	// background and caches its answer: /api/status is polled, GitHub's API is
+	// rate-limited, and a settings page should never wait on the network. The
+	// installed image's checksum lives beside the image, so a daemon started
+	// after `warmbox setup` picks the new one up on its own.
+	updater := update.New(update.Config{
+		Repo:         releaseRepo,
+		Current:      version,
+		Arch:         runtime.GOARCH,
+		ImageURL:     defaultImageURL(runtime.GOARCH),
+		ImageRelease: imageRelease,
+		ImageSHA:     func() string { return desktop.ReadImageSHA(filepath.Dir(cfg.KernelPath)) },
+	})
+	apiSrv.SetUpdater(updater)
+	updater.Start(ctx)
 	srv := &http.Server{Addr: cfg.APIAddr, Handler: apiSrv.Handler()}
 	go func() {
 		fmt.Fprintf(os.Stderr, "warmbox: listening on %s (pool=%d)\n", cfg.APIAddr, cfg.PoolSize)
@@ -1311,6 +1327,9 @@ func installGuestImage(cfg *desktop.Config, url, sha string, force, allowInstall
 				return fmt.Errorf("the build finished but %s is still empty", dir)
 			}
 			fmt.Fprintf(os.Stderr, "✓ guest image built in %s\n", dir)
+			// Not a published archive, so there is nothing to compare it to;
+			// the dashboard says "built locally" instead of offering an update.
+			_ = desktop.WriteImageSHA(dir, "local")
 			return nil
 		}
 		sha = s

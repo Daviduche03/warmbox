@@ -169,7 +169,36 @@ func FetchBuiltin(workDir, url, wantSHA string, progress io.Writer) error {
 	}
 	_ = os.RemoveAll(staging)
 	_ = os.Remove(tmp)
+	// Remember which published archive this image came from, so the daemon can
+	// offer an update when a newer one lands (internal/update reads it back).
+	_ = WriteImageSHA(workDir, wantSHA)
 	return nil
+}
+
+// imageSHAFile sits next to the image it describes: the sha256 of the archive
+// the image was installed from, or the word "local" when it was built on this
+// machine. Images installed before it existed simply have no file, which reads
+// back as "" — unknown, not "up to date".
+const imageSHAFile = ".image-sha256"
+
+// WriteImageSHA records where the image in dir came from. An empty sha records
+// nothing rather than writing an empty file.
+func WriteImageSHA(dir, sha string) error {
+	sha = strings.TrimSpace(sha)
+	if sha == "" {
+		return nil
+	}
+	return os.WriteFile(filepath.Join(dir, imageSHAFile), []byte(sha+"\n"), 0o644)
+}
+
+// ReadImageSHA returns what WriteImageSHA recorded for dir: a hex digest,
+// "local", or "" when nothing was recorded.
+func ReadImageSHA(dir string) string {
+	b, err := os.ReadFile(filepath.Join(dir, imageSHAFile))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
 }
 
 func SHA256File(path string) (string, error) {
