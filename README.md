@@ -1,269 +1,200 @@
 # warmbox
 
-Self-hosted GUI desktop microVMs with portable cloud-backed disks. Boot a Linux
-desktop in a second, hand a browser a link, and keep the whole machine — files,
-installed apps, settings — on a disk that lives in object storage (S3/R2) and can
-be cloned or restored on another host.
+**A Linux desktop you open in a browser tab — on a machine whose disk you can
+move to another computer.**
 
-Two host platforms, both first-class: **macOS on Apple Silicon** (via `vfkit`)
-and **Linux with KVM** (via QEMU). What still differs between them is a
-capability gap, not a preference — see [Requirements](#requirements).
+warmbox runs small virtual machines on a host you control. Each one is an
+ordinary Linux desktop: a window manager, a browser, a terminal, whatever you
+install. It is streamed to your browser over VNC, so there is nothing to install
+on the machine you are sitting at.
 
-Guest images: a tiny **Alpine + XFCE** desktop (~776 MB, boots in ~1s from a
-shared read-only rootfs), the same base with **LXQt** or with **no screen at
-all**, and a full **Omarchy** (Arch + Hyprland, ~8.4 GB). You pick one at create
-time. Every image is defined once, in [`deploy/images/`](deploy/images), and
-built with `warmbox image build <name>`; the ones marked `publish` are also
-downloadable release artifacts.
+The unusual part is where the desktop lives. The operating system is a read-only
+image that every VM boots from, and everything you change — files, settings,
+installed apps — goes to that machine's **volume**, stored as chunks in an
+S3-compatible bucket. The volume *is* the computer. Start it on your laptop
+today, on a server next week, and it is the same machine.
 
-> **Status: experimental alpha.** Not hardened: plaintext HTTP with no TLS, the
-> guest's VNC server accepts anyone who can reach it, and the guest runs as
-> **root**. The API itself *is* gated by accounts and workspaces — see
-> [Limitations](#limitations) — but the transport is unencrypted, so don't expose
-> it to an untrusted network.
-
-## What it does
-
-- **Disposable computers, portable disks.** The OS is a read-only image shared by
-  every VM; the writable layer is a per-VM *volume* stored as content-addressed
-  chunks in an S3-compatible bucket (via [rclone](https://rclone.org)). Start a VM
-  on any host, attach the volume, and it is the same machine.
-- **Fast boot.** Create clones the golden image cheaply (an APFS copy-on-write
-  copy on macOS: instant, shared blocks) and boots it; a warm pool of pre-booted
-  VMs makes a desktop ready in ~1s.
-- **Choose your OS at create time.** `warmbox create --image omarchy` boots a
-  clone of the Omarchy disk; `--image headless` boots a VM with no screen at all
-  (agent API only); no image argument uses the daemon's default image.
-- **Browser access.** Each desktop is streamed over noVNC — no client to install.
-- **Agent API.** `exec` + file read/write/list inside any guest over HTTP, no SSH
-  keys (`docs/agent-api.md`).
-- **Snapshots & clones.** A snapshot is a frozen disk manifest, so it is O(1) and
-  shares every chunk; clone it into a fresh box.
-- **Apps.** `warmbox-app` turns a directory (e.g. an agent-built HTML dashboard)
-  into a menu app, persisted on the volume.
-- **Publish.** `GET /p/<vm>/<port>/` reverse-proxies to a port inside a guest, so
-  anything served there (a dashboard, an app) gets a shareable URL.
-
-## Requirements
-
-**Host** — either:
-- **macOS on Apple Silicon** — `brew install vfkit`; or
-- **Linux with KVM** — `qemu-system-x86_64` (or `-aarch64`) plus `/dev/kvm`. The
-  daemon needs `--backend qemu`; `warmbox service install` passes it for you.
-
-Both boot every overlay image (`xfce`, `lxqt`, `headless`). The one real gap: EFI
-*disk* images (Omarchy) need macOS today, because the QEMU backend has no OVMF
-firmware yet — overlay images need no firmware and take the same path on both.
-
-`warmbox setup` installs the hypervisor for whichever host it finds, so this table
-is about what *can* run, not about what you have to install by hand:
-
-| host | backend | overlay images (`xfce`, `lxqt`, `headless`) | EFI disk images (`omarchy`) |
-|---|---|---|---|
-| macOS 13+, Apple Silicon | vfkit | ✅ | ✅ |
-| Linux + KVM, x86_64 | QEMU | ✅ verified | ❌ no OVMF |
-| Linux + KVM, arm64 | QEMU | ✅ expected (untested) | ❌ no OVMF |
-| Intel Mac | — | unsupported — no nested virtualisation for QEMU, and vfkit is ARM64-only | ❌ |
-| Windows — WSL2 or native | QEMU/WHPX | not yet | ❌ |
-
-To **build from source** you also need **Docker** (for the guest image) and
-**Go 1.25+** — but an install from a release needs neither.
-
-## Install
-
-Prebuilt binaries ship with a prebuilt guest image, so there is no Docker step:
-
-```sh
-brew install --cask Daviduche03/warmbox/warmbox   # macOS, or Linuxbrew
-warmbox setup                                     # fetch noVNC + the guest image
-warmbox service install --pool 1                  # run the daemon in the background
+```
+  your browser ─────────────┐
+                            │  noVNC over a websocket
+                            ▼
+                 ┌────────────────────────┐
+                 │  warmbox daemon        │  REST API · warm pool · VNC bridge
+                 │  (one host)            │
+                 └───────────┬────────────┘
+                             │  boots microVMs (vfkit on macOS, QEMU on Linux)
+                 ┌───────────▼────────────┐
+                 │  guest VM              │
+                 │    ┌───────────────┐   │
+     read-only   │    │  OS image     │   │  shared by every VM
+     ────────────┼───►│  Alpine, Arch │   │
+                 │    └───────────────┘   │
+                 │    ┌───────────────┐   │
+     your disk   │    │  volume       │   │  files and apps, in a bucket
+     ────────────┼───►│               │   │  or a local directory
+                 │    └───────────────┘   │
+                 └────────────────────────┘
 ```
 
-Then open <http://localhost:7070> (or `warmbox create` for a desktop and its
-URL). `warmbox setup` prints what it found and what to do next.
+> **Status: experimental alpha.** Do not put this on the open internet. The
+> dashboard is plaintext HTTP with no TLS, the guest's VNC server accepts anyone
+> who can reach it, and the guest runs as **root**. The API itself *is* behind
+> accounts and workspaces — see [Limitations](#limitations) — but everything
+> assumes a host you trust.
 
-`setup` **installs what is missing** rather than handing you a list of chores. It
-installs the hypervisor for your host (`brew install vfkit`, or QEMU from your
-distro's package manager) when it isn't there, then gets the guest image: it
-downloads the published one for your architecture — verified against its sha256,
-resumable, safe to re-run — or, if none is published for the platform, fetches the
-source and builds it locally (installing Docker first if necessary). `--no-install`
-turns the installing off and just reports; `--image-url`/`--image-sha256` point at
-an archive of your own.
+## Get started
+
+You need a host: **macOS on Apple Silicon**, or **Linux with KVM**. Then:
+
+```sh
+# 1. install the binary
+brew install --cask Daviduche03/warmbox/warmbox    # macOS (or Linuxbrew)
+
+# 2. let it install the rest: hypervisor, noVNC, and the guest image
+warmbox setup
+
+# 3. run the daemon in the background, one warm VM ready to hand out
+warmbox service install --pool 1
+```
+
+Open <http://localhost:7070>. The first time, it asks you to create an account —
+that account **owns** the instance. From the dashboard press **New desktop** and
+you have a Linux desktop in a browser tab, usually in about a second.
+
+Prefer the command line? Sign in once, then create:
+
+```sh
+warmbox login
+warmbox create            # prints the desktop's URL
+```
+
+`warmbox setup` installs what is missing rather than handing you a list of
+chores, and it is safe to re-run. It installs the hypervisor for your host
+(`brew install vfkit`, or QEMU from your package manager), then gets the guest
+image: it downloads the published one for your architecture, verified against its
+sha256 and resumable — or, when nothing is published for your platform, fetches
+the source and builds it locally, installing Docker first if it has to.
+`--no-install` makes it report instead of installing; `--image-url` and
+`--image-sha256` point it at an archive of your own.
 
 <details>
-<summary>Without Homebrew (Linux servers, or by hand)</summary>
+<summary>Other ways to install the binary</summary>
 
-One line — it verifies the release's checksum before installing anything:
+One line on a server, which verifies the release's checksum before installing
+anything:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Daviduche03/warmbox/v0.2.1/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/Daviduche03/warmbox/master/install.sh | sh
 ```
 
-It installs to `/usr/local/bin` when run as root, otherwise `~/.local/bin`.
-
-On Debian/Ubuntu or Fedora/RHEL the packages in the same release are tidier for a
-server (they do not fetch the guest image — that stays `warmbox setup`):
+It installs to `/usr/local/bin` as root, otherwise `~/.local/bin`. That URL picks
+which copy of the script runs, not which version you get — with `WARMBOX_VERSION`
+unset it installs the newest release. To pin both, take the script from a tag and
+say so:
 
 ```sh
-sudo apt install ./warmbox_0.2.0_linux_amd64.deb
-sudo rpm -i ./warmbox_0.2.0_linux_amd64.rpm
+curl -fsSL https://raw.githubusercontent.com/Daviduche03/warmbox/v0.3.0/install.sh \
+  | WARMBOX_VERSION=v0.3.0 sh
+```
+
+Debian/Ubuntu and Fedora/RHEL packages are tidier on a server (they deliberately
+do not fetch the guest image — that stays `warmbox setup`):
+
+```sh
+sudo apt install ./warmbox_0.3.0_linux_amd64.deb
+sudo rpm -i warmbox_0.3.0_linux_amd64.rpm
 ```
 
 Or unpack the tarball for your platform from the
 [releases page](https://github.com/Daviduche03/warmbox/releases) and run the same
-three commands (`./warmbox setup`, `./warmbox service install`).
+commands: `./warmbox setup`, then `./warmbox service install --pool 1`.
 
 </details>
 
-## Quickstart (from source)
+## What you can do with it
 
-```sh
-# 1. Build the default guest image from the registry (deploy/images/xfce.yaml).
-#    First run is slow (Docker + squashfs); artifacts land in ~/.warmbox/images.
-./warmbox image build xfce
+**Get a desktop in about a second.** The daemon keeps a *warm pool* of VMs that
+are already booted. `warmbox create` (or New desktop) hands you one instead of
+waiting for a boot. Anything else — a different image, a custom size, a volume —
+cold-boots in a few seconds.
 
-# 2. Fetch noVNC.
-./warmbox setup --no-image      # the image is already built above
+**Choose the operating system at create time.** `warmbox create --image lxqt`.
+See [Choosing an operating system](#choosing-an-operating-system).
 
-# 3. Run the daemon (warm pool + REST API + noVNC bridge).
-./warmbox daemon
+**Keep your machine on a portable disk.** Attach a volume and the whole system
+persists to it; detach and carry the volume elsewhere. See [Your disk, and where
+it lives](#your-disk-and-where-it-lives).
 
-# 4. Provision a desktop; prints a URL to open in your browser.
-./warmbox create
-```
+**Drive it from code.** Every guest runs a small agent, so you can run commands
+and move files over HTTP without SSH keys or a screen at all:
+`curl -X POST localhost:7070/api/desktops/$ID/exec -d '{"cmd":"uname -a"}'`. See
+[Driving it from code](#driving-it-from-code).
 
-Maintainers publish each image with
+**Reach a service inside a guest.** `GET /p/<vm>/<port>/` reverse-proxies to a
+port in the guest, so a dashboard or dev server running there has a URL you can
+open or share.
 
-```sh
-./warmbox image pack xfce -o warmbox-image-xfce-$(go env GOARCH).tar.zst
-```
+**Freeze a desktop instead of losing it.** Pause stops the guest's CPUs and keeps
+its memory; Resume picks the session up; Destroy is what actually hands the RAM
+back. A volume survives all three.
 
-which also writes the `.sha256` that `setup` verifies; the release workflow does
-this for every image marked `publish: true`.
+**Snapshot and clone a disk.** A snapshot is a frozen manifest, so it is
+effectively instant and shares every chunk with the volume it came from; cloning
+it gives you a fresh machine from that point.
 
-### Releasing
+## Choosing an operating system
 
-Push a tag (`git tag v0.2.0 && git push origin v0.2.0`). The release workflow
-builds the binaries for darwin/arm64 and linux/{amd64,arm64}, publishes them with
-`checksums.txt`, and updates the Homebrew cask.
-
-The guest images live in their own release, tagged **`images`**, as
-`warmbox-image-<name>-<arch>.tar.zst` plus its `.sha256` — deliberately **not**
-tied to the CLI's version, because the guest changes far less often and a new
-release should not need 800 MB re-uploaded. The **guest image** workflow asks the
-registry what to build (`warmbox image build --publishable`) and publishes each
-one; it is manual because every image is minutes of build per architecture and
-must never be able to block a binary release.
-
-Two things must exist before the first release:
-
-- a `homebrew-warmbox` tap repository, and
-- a `HOMEBREW_TAP_GITHUB_TOKEN` secret — a PAT with write access to that repo,
-  because the default `GITHUB_TOKEN` cannot push to a different repository.
-
-The release workflow warns and publishes without the cask if that secret is
-missing, so a release can never fail on it.
-
-Two things worth knowing:
-
-- The image workflow builds both architectures: amd64 on a standard runner, arm64
-  on GitHub's free `ubuntu-24.04-arm` runner. If that runner is ever unavailable,
-  build the arm64 images on an Apple Silicon Mac, where they already live:
-
-  ```sh
-  make image-pack IMAGE_NAME=xfce
-  gh release upload images warmbox-image-xfce-arm64.tar.zst \
-      warmbox-image-xfce-arm64.tar.zst.sha256
-  ```
-
-- Neither is required for `warmbox setup` to work: when no image is published for
-  the platform it fetches the source and builds one locally, installing Docker
-  first if it has to. The published images are a shortcut, not a dependency.
-
-Each desktop gets a short URL (`http://localhost:7070/d/<id>`); open it and
-noVNC fills the page. The token is dropped from the address bar after the first
-load. To run the daemon in the background instead of the foreground:
-
-```sh
-./warmbox service install --pool 1   # launchd on macOS, systemd on Linux
-./warmbox service status             # start | stop | restart | status
-```
-
-On Linux it installs a **systemd** unit instead: a system unit at
-`/etc/systemd/system/warmbox.service` when you run it as root, or a per-user
-unit (`~/.config/systemd/user/`, with lingering enabled so it starts at boot)
-otherwise. Logs live in the journal — `journalctl -u warmbox.service -f`.
-
-The dashboard binds `127.0.0.1` by default (`--addr`), and guests get their own
-listener on the vmnet gateway (`--guest-addr`, derived from `--host`) that serves
-nothing but the readiness callback — so the API is never reachable from the
-network, and guests can still report ready.
-
-Warm VMs hold RAM even when nobody is creating anything, so the pool drains
-itself after 15 minutes without a lease (`--pool-idle-timeout 30m`, `0` keeps it
-warm forever); the next create pays a cold boot instead. Desktops can also be
-frozen from the dashboard's row menu: **Pause** stops the guest's CPUs and keeps
-its memory, **Resume** picks the session back up, and **Destroy** is what hands
-the RAM back. Pause works on both backends (vfkit's REST API, QEMU's monitor).
-
-On **Linux**, add `--backend qemu` to the daemon (KVM + `qemu-system-*`).
-`warmbox service install` passes that flag for you and manages the daemon as a
-systemd unit, so the same command works on both hosts. QEMU's user-mode
-networking isn't reachable host→guest, so the backend forwards a host port to
-each guest's VNC; everything else is identical. Build the guest image for the
-host arch with `./warmbox image build xfce --platform linux/amd64`.
-
-## Images
-
-Every guest image warmbox can build is defined by one file in
-[`deploy/images/`](deploy/images). That config is the source of truth: it picks
+Desktops boot from **guest images**. Every image warmbox can build is one file in
+[`deploy/images/`](deploy/images) — that file is the source of truth. It picks
 the engine that builds the image, and it generates the image's `meta.json`, which
-is all the daemon reads at run time.
+is all the daemon reads at runtime.
+
+| image | based on | screen | download | cold boot |
+|---|---|---|---|---|
+| `xfce` | Alpine + XFCE | yes — the default | ~0.9 GB | ~1s pooled, ~7s cold |
+| `lxqt` | Alpine + LXQt | yes | ~0.9 GB | ~7s |
+| `headless` | Alpine + XFCE | **none** | ~0.9 GB | ~6s |
+| `headless-lxqt` | Alpine + LXQt | **none** | ~0.9 GB | ~7s |
+| `omarchy` | Arch + Hyprland | yes — macOS hosts only | ~3.9 GB packed | ~13s |
+
+Sizes and boot times are approximate, and the times come from an Apple Silicon
+host — they will differ on QEMU, and they move with the guest.
 
 ```sh
-./warmbox image build                     # what can be built, and what is installed
-./warmbox image build lxqt                # build one
-./warmbox image build --all               # every image the checkout can build
+warmbox images                        # what this daemon can boot right now
+warmbox create --image lxqt           # pick one
+warmbox create --image headless       # no screen: the agent API is the only way in
+warmbox create                        # whatever --image the daemon was started with
 ```
 
-An image lands in `$WARMBOX_HOME/images/<name>/` — either an *overlay* image
-(`vmlinux` + `rootfs.squashfs` + `initramfs-overlay`, sharing one read-only
-rootfs) or an *EFI disk* (`disk.raw` [+ `efi-vars.fd`]) — plus a `meta.json`.
-There is no separate "built-in" slot: the daemon boots the image you name, and
-the daemon's `--image` decides which one an unnamed `create` gets (default
-`xfce`).
+**Headless images** boot no X server and no desktop session at all. The guest
+still runs the agent, so `exec`, files, runs and sessions all work — there is
+just nothing to look at, and no VNC port to connect to. It is a property of the
+image rather than a flag on `create`, so the guest and the daemon cannot disagree
+about whether a screen exists.
+
+### Building, downloading, and moving images
+
+The dashboard's **Images** page lists what is installed next to what this build
+knows about but has not fetched, and an admin can download one from there. The
+same thing from a shell:
 
 ```sh
-./warmbox images                     # list what the daemon can boot
-./warmbox create --image omarchy     # a full Omarchy (Hyprland) desktop
-./warmbox create --image headless    # no screen: agent API (exec/files/runs) only
-./warmbox create --image default     # whatever this daemon's default image is
-./warmbox create                     # the same thing
+warmbox image build                   # what can be built, and what is installed
+warmbox image build lxqt              # build one from a checkout
+warmbox image build --all             # every image the checkout can build
+warmbox image pull headless           # download the published one for this platform
+warmbox image pack lxqt -o lxqt.tar.zst   # pack one to move it, + .sha256
+warmbox image list                    # local images, offline
 ```
 
-| image | base | size on disk | boot |
-|---|---|---|---|
-| `xfce` | Alpine + XFCE | ~776 MB (compressed squashfs base) | ~1s from the shared rootfs |
-| `lxqt` | Alpine + LXQt | ~800 MB (compressed squashfs base) | ~7s cold |
-| `headless` | Alpine + XFCE, X never starts | ~776 MB (same base) | ~6s cold, no X to wait for |
-| `headless-lxqt` | Alpine + LXQt, X never starts | ~800 MB | ~7s cold |
-| `omarchy` | Arch + Hyprland/Quickshell | 24 GB sparse, ~8.4 GB real | ~13s cold, instant if pooled |
+An image lands in `~/.warmbox/images/<name>/` — either an *overlay* image
+(`vmlinux` + `rootfs.squashfs` + `initramfs-overlay`, one read-only rootfs shared
+by every VM) or an *EFI disk* (`disk.raw`), plus `meta.json`. There is no
+"built-in" image: the daemon boots the image you name, and the daemon's `--image`
+decides what an unnamed create gets.
 
-`meta.json` is the run-time contract: `headless`, plus optional `gpu`, `mem_mib`,
-`cpus`, `input`, and the guest-agent `agent_api` the image was built against. An
-image that overrides nothing inherits whatever the daemon was started with.
-
-`"headless": true` marks an image that boots no X server and no desktop session:
-the guest reports readiness as soon as its agent is listening, the daemon arms no
-GPU or input devices, and there is no console to open — the desktop is reached
-through the agent API instead (`POST /api/desktops/{id}/exec`, `/files`,
-`/runs`, `/sessions`). It is a property of the image rather than a flag on
-`create`, so the guest and the daemon cannot disagree about whether a screen
-exists. Everything else is unchanged: volumes, snapshots, egress policy and the
-warm pool all work the same.
-
-### Adding an image
+### Adding your own image
 
 Write a file and build it — nothing else has to know:
 
@@ -275,37 +206,58 @@ desktop: xfce
 theme: win11
 browser: epiphany
 headless: false
-publish: false           # publish: true ships it on the images release
+publish: false           # true ships it on the images release
 ```
 
-The `overlay` engine builds a rootfs from `deploy/guest/Dockerfile`. The `efi`
-engine (used by `omarchy`) stages a disk that was already installed on a machine,
-so it needs input from the host; `warmbox image build --all` skips those and
-builds the rest.
+The `overlay` engine builds a rootfs from `deploy/guest/Dockerfile`; adding a
+desktop, a theme or a browser is a Dockerfile change, and the config is how you
+say *which combination* is an image. The `efi` engine (used by `omarchy`) stages
+a disk that was already installed on a machine, so it needs input from the host —
+`warmbox image build --all` skips those and builds the rest.
 
-Adding a desktop, a theme or a browser is a Dockerfile change; the config is how
-you say *which combination* is an image. `warmbox image build` prints the whole
-registry with what is installed.
-
-### Moving images between machines
+## Your disk, and where it lives
 
 ```sh
-./warmbox image pack omarchy                 # -> ~/.warmbox/images/omarchy.tar.zst (~3.9 GB)
-./warmbox image pull omarchy                 # the published image for this platform
-./warmbox image pull omarchy <file-or-url>   # or from a file or URL
-./warmbox image list                         # local images (offline)
+warmbox volume create dev --size 8G     # grow-only; the floor is VOLUME_BASE_SIZE
+warmbox create --volume dev             # boot a machine whose disk is that volume
+warmbox snapshot create dev             # freeze it
+warmbox volume clone dev dev-clean      # a fresh machine from that point
 ```
 
-A `pull` from a URL is verified against the published `.sha256` before anything
-is expanded — an image is code that boots.
+On an overlay image the volume **is** the writable layer: the whole machine
+persists, and destroying the desktop keeps every file. On an EFI image like
+Omarchy it is a data disk mounted at `/volume`, flushed every couple of seconds.
 
-See [`deploy/omarchy/README.md`](deploy/omarchy/README.md) for how the Omarchy
-image is built and provisioned (it stands on the community aarch64 port).
+Storage is local by default, under the workdir. To keep volumes in a bucket so
+the same disk can attach on another host, point warmbox at it (also under
+**Settings** in the dashboard):
 
-## Agent API
+```sh
+warmbox cloud set --endpoint https://<account>.r2.cloudflarestorage.com \
+  --access-key <KEY> --secret-key <SECRET> --bucket <BUCKET>
+warmbox cloud show          # where volume bytes live
+```
 
-Run commands and move files inside any guest over HTTP — the daemon proxies to
-`warmbox-agent` in the VM, reachable on the same dial path as VNC:
+Restart the daemon afterwards (`warmbox service restart`) and it picks the bucket
+up. This is how "the same machine, elsewhere" actually works: it is not a clone
+or an export, it is the same chunks in the same bucket.
+
+### Apps
+
+`warmbox-app` turns a directory into a menu entry, so a thing you built — an
+agent-generated dashboard, a tool you compiled — behaves like an installed app
+and lives on the volume with the rest of your machine:
+
+```sh
+warmbox-app new mydash          # scaffold a web app
+warmbox-app install mydash      # appears in the menu, opens as an app window
+warmbox-app serve mydash 8080   # prints a /p/<vm>/8080/ link you can open
+```
+
+## Driving it from code
+
+Every guest runs `warmbox-agent`, and the daemon proxies to it on the same dial
+path it uses for VNC. No SSH, no keys, no screen:
 
 ```sh
 curl -X POST localhost:7070/api/desktops/$ID/exec -d '{"cmd":"uname -a"}'
@@ -313,154 +265,209 @@ curl "localhost:7070/api/desktops/$ID/files?path=/home"
 curl "localhost:7070/api/desktops/$ID/file?path=/etc/hostname"
 ```
 
-Phase 1 is `exec` + files; streaming/background exec, `tty`, and
-screenshot/input are next. Design: [`docs/agent-api.md`](docs/agent-api.md).
+There are also background/streaming runs (`/runs`) and interactive sessions
+(`/sessions`). This is the only way in to a **headless** image, and it is how you
+would put an agent inside a machine. Design and roadmap:
+[`docs/agent-api.md`](docs/agent-api.md).
 
-## Persistent volumes
+## Running it day to day
 
-```sh
-./warmbox volume create dev --size 8G     # grow-only; floor is VOLUME_BASE_SIZE
-./warmbox create --volume dev             # boot a VM on that disk
-./warmbox snapshot create dev             # freeze it
-./warmbox volume clone dev dev-clean      # template a fresh box
-```
-
-Volumes attach to image guests too. On an overlay image the volume *is* the
-writable layer (the whole machine persists); on an image guest like Omarchy it
-is a data disk mounted at `/volume`, flushed every couple of seconds.
-
-Inside the guest:
+**The daemon** serves the dashboard and the API on `127.0.0.1:7070` by default.
+Guests get a second listener on the vmnet gateway that answers nothing but the
+readiness callback, so the API is never reachable from the network while guests
+can still report that they booted.
 
 ```sh
-warmbox-app new mydash          # scaffold a web app
-warmbox-app install mydash      # appears in the XFCE menu (opens as an app window)
-warmbox-app serve mydash 8080   # prints a /p/<vm>/8080/ link you can open
+warmbox service install --pool 1   # launchd on macOS, systemd on Linux
+warmbox service status             # start | stop | restart | status
 ```
 
-Storage is local by default (a directory under the workdir). To keep volumes in
-a bucket so the same disk can attach on another machine, point warmbox at it
-(also available in the dashboard under Settings):
+On Linux it installs a systemd unit — `/etc/systemd/system/warmbox.service` as
+root, or a per-user unit under `~/.config/systemd/user/` with lingering enabled
+so it starts at boot. Logs are in the journal:
+`journalctl -u warmbox.service -f`.
+
+The daemon needs `--backend qemu` on Linux; `warmbox service install` passes it
+for you. QEMU's user-mode networking is not reachable host→guest, so the backend
+forwards a host port to each guest's VNC — everything else behaves the same.
+
+**Warm VMs hold RAM** even when nobody is creating anything, so the pool drains
+itself after 15 minutes without a lease (`--pool-idle-timeout 30m`; `0` keeps it
+warm forever) and the next create pays a cold boot instead.
+
+**Where things live** (under `~/.warmbox/` unless you pass `--workdir`):
+
+```
+images/<name>/      installed guest images, each with its meta.json
+volumes/            local volume disks, when not backed by a bucket
+vms/<id>/            per-VM state: console log, pid, control socket
+novnc/              the dashboard's VNC client assets
+daemon.log          the service's output
+```
+
+**Updating.** The binary and the guest images move independently — the guest
+changes far less often, and upgrading the CLI does not touch an image.
 
 ```sh
-warmbox cloud set --endpoint https://<acct>.r2.cloudflarestorage.com \
-  --access-key <KEY> --secret-key <SECRET> --bucket <BUCKET>
-warmbox cloud show          # where volume bytes live
+# the binary
+curl -fsSL https://raw.githubusercontent.com/Daviduche03/warmbox/master/install.sh | sh
+
+# the guest image for this platform (or the Images page in the dashboard)
+warmbox setup                      # installs the default image
+warmbox image pull <name>          # or a specific one
+
+warmbox service restart            # picks up the new binary
 ```
 
-Restart the daemon afterwards (`warmbox service restart`) and it picks the
-bucket up.
+The **Settings → Daemon** tab tells you when either half is behind: it compares
+the running version against this repository's releases, and the installed image
+against the published one.
 
-## Status
+## What you need, and what runs where
 
-| Area | State |
-|---|---|
-| Guest desktop (XFCE over noVNC), warm pool | ✅ works |
-| Accounts, workspaces, per-workspace scoping | ✅ works (bcrypt + session/API-token auth) |
-| Pause / resume a desktop | ✅ works (CPU only — the guest keeps its memory) |
-| vCPU/RAM + volume chosen at create | ✅ works (a custom size or a volume boots on demand) |
-| Per-workspace desktop limit | ✅ works (Settings → Storage; 429 past the cap) |
-| Warm-pool idle drain | ✅ works (`--pool-idle-timeout`, default 15m) |
-| Named images + create-time selection | ✅ works |
-| Omarchy guest (EFI disk image) | ✅ works (macOS) |
-| Persistent, cloud-backed volumes (chunked) | ✅ works |
-| Volumes on image guests (`/volume`) | ✅ works |
-| Grow a volume (`--size`) | ✅ works (grow-only) |
-| Disk snapshots + clone | ✅ works |
-| Image pack / pull (compressed artifacts) | ✅ works |
-| Install without Docker (`warmbox setup` fetches the image) | ✅ works (no release published yet) |
-| Agent API: exec + files | ✅ works |
-| Agent API: background/streaming runs + sessions | ✅ works |
-| Linux host (QEMU/KVM) | ✅ works (x86_64 verified; no EFI images) |
-| `warmbox-app` (menu apps) | 🟡 experimental |
-| Publish a guest port at a URL (`/p/<vm>/<port>/`) | 🟡 experimental |
-| Agent API: tty, screenshot/input (computer-use) | ❌ not yet |
-| Linux host (Cloud Hypervisor / Firecracker) | ❌ not yet |
-| Windows host (WSL2 / native WHPX) | ❌ not yet |
-| Memory snapshot / ~100 ms restore | ❌ not yet (needs a different backend) |
-| TLS / per-guest VNC auth | ❌ not yet |
-| GPU / audio | ❌ not supported |
+**macOS 13+ on Apple Silicon** — `brew install vfkit`; or **Linux with KVM** —
+`qemu-system-x86_64` (or `-aarch64`) plus `/dev/kvm`. `warmbox setup` installs
+the hypervisor for whichever host it finds, so the table below is about what can
+run, not what you must install by hand.
 
-## Limitations
+| host | overlay images (`xfce`, `lxqt`, `headless`, `headless-lxqt`) | EFI disk images (`omarchy`) |
+|---|---|---|
+| macOS 13+, Apple Silicon (vfkit) | ✅ | ✅ |
+| Linux + KVM, x86_64 (QEMU) | ✅ verified | ❌ no OVMF |
+| Linux + KVM, arm64 (QEMU) | ✅ expected, untested | ❌ no OVMF |
+| Intel Mac | ❌ no nested virtualisation, and vfkit is ARM64-only | ❌ |
+| Windows (WSL2 or native) | ❌ not yet | ❌ |
 
-- **EFI disk images are macOS-only.** Omarchy is an EFI disk, and the QEMU
-  backend ships no OVMF firmware, so it cannot boot it. (vfkit wraps Apple's
-  Virtualization.framework, which is ARM64-only and handles the firmware itself.)
-  Overlay images — `xfce`, `lxqt`, `headless` — need no firmware and take the
-  same path on both backends; `xfce` and `lxqt` are verified on Linux/QEMU, the
-  newer images are not.
-- **Authorised, but not encrypted.** The API is not open: accounts and workspaces
-  gate every stateful route, and everything that reaches a desktop — console
-  streams (`/d/`, `/websockify/`, `/vnc/`), the agent API, published guest ports
-  (`/p/`) — is scoped to the caller's workspace; warm-pool VMs are daemon
-  capacity and are never listed or controllable as desktops. What is missing is
-  confidentiality and guest hardening: there is still no TLS, the guest's VNC
-  server runs with `-SecurityTypes None`, and the guest is **root**. The guest
-  only sits behind the hypervisor's NAT, so its VNC port is reachable from the
-  host — and therefore through the authenticated daemon — rather than from the
-  LAN. All of it assumes a machine you trust; don't expose it to an untrusted
-  network.
-- **No memory snapshots.** Neither hypervisor we drive today can checkpoint a
-  running VM's memory (Apple's framework exposes no VM state save/restore), so
-  fast "restore anywhere" needs a different backend (see `docs/snapshots.md`).
-  Pause is not a substitute: it freezes the guest's CPUs in place but its memory
-  stays allocated. To actually reclaim RAM, destroy the desktop (its volume keeps
-  your files) or let the warm pool drain.
-- **Guests have no GPU.** The hypervisor exposes virtio-gpu without 3D (AVF on
-  macOS, virtio on QEMU), so a Wayland desktop composites through Mesa
-  `llvmpipe`; the Omarchy image is tuned for it (small output, effects off). X11
-  is far lighter for remote display.
-- **Images are big.** The default image is ~800 MB compressed and `warmbox
-  setup` downloads it in one piece. Omarchy is the heavy one: ~8.4 GB on disk,
-  ~3.9 GB packed, and because btrfs fragments its free space and APFS only
-  preserves large holes, an expanded copy may not be as sparse as you'd like.
-- **Single writer.** A volume attaches to one VM at a time; the lock is
-  in-process (fine for one host, not a fleet).
-- **Commit cost.** Committing hashes the changed extents; a commit is fast for
-  sparse disks but is still O(used) today.
+To **build from source** you also need **Go 1.25+** and **Docker** (for the guest
+image). An install from a release needs neither.
 
-## Repository layout
+## How it works
+
+Two layers, and almost everything follows from them:
+
+- **The image is the operating system, read-only, shared by every VM.** Boots are
+  cheap because nothing is copied: on macOS `create` clones the golden image with
+  an APFS copy-on-write copy (instant, shared blocks) and the guest boots from
+  that. Writes go to a tmpfs or an attached volume, never to the image.
+- **The volume is the machine.** It is chunked and content-addressed, so
+  identical chunks are stored once, snapshots are manifests rather than copies,
+  and a commit only pushes the chunks that changed.
+
+The daemon owns the host side: a REST API, the warm pool, the noVNC bridge, a
+per-guest-port proxy, and a default-deny egress policy for guests that want to
+reach the network through the host.
 
 ```
 cmd/warmbox         the CLI (daemon, create, image, volume, snapshot, cloud)
-internal/desktop    boot/attach microVMs (vfkit, qemu); images, boot modes, pack
-internal/volume     persistent volumes (chunked, content-addressed)
-internal/cloudstore shared chunk+manifest engine
-internal/catalog    SQLite metadata (volumes, desktops, snapshots, leases)
-internal/egress     default-deny egress policy + forward proxy
 internal/api        REST API, noVNC bridge, guest port proxy, agent proxy
-internal/vnc        WebSocket→TCP VNC bridge
+internal/desktop    boots and supervises microVMs (vfkit, QEMU); images, pack
+internal/volume     persistent volumes (chunked, content-addressed)
+internal/cloudstore the chunk + manifest engine shared by volumes
+internal/catalog    SQLite metadata: volumes, desktops, snapshots, leases
+internal/egress     default-deny egress policy and forward proxy
+internal/vnc        websocket → TCP VNC bridge
 internal/imagecfg   the guest-image registry (deploy/images/*.yaml)
+internal/release    where releases and guest images are published
 deploy/images       what images exist, and what each one is
-deploy/guest        the overlay engine (Dockerfile, init, overlay-init, apps, agent)
-deploy/omarchy      the EFI engine: Omarchy image build + guest provisioning
-docs/               architecture, volumes, snapshots, agent-api, egress, oss-positioning
+deploy/guest        the overlay engine: Dockerfile, init, apps, guest agent
+deploy/omarchy      the EFI engine: Omarchy image build + provisioning
 ```
+
+## How finished is it
+
+Solid and used daily: the XFCE/LXQt desktops over noVNC, the warm pool,
+accounts and workspaces, volumes with snapshots and clones, image build/pack/
+pull, and the agent's `exec` and file APIs. Experimental: `warmbox-app` and the
+`/p/` port proxy. Not built yet: TTY and screenshot/input on the agent API, EFI
+images anywhere but macOS, memory snapshots, TLS, and GPU or audio.
+
+## Limitations
+
+- **No TLS, and the guest trusts anyone who reaches it.** The API is not open —
+  accounts and workspaces gate every stateful route, and everything that reaches
+  a desktop (console streams, the agent API, published guest ports) is scoped to
+  the caller's workspace, with warm-pool VMs kept out of every listing. What is
+  missing is confidentiality and guest hardening: plaintext HTTP, the guest's VNC
+  server running `-SecurityTypes None`, and the guest as **root**. The guest only
+  sits behind the hypervisor's NAT, so its VNC port is reachable from the host —
+  and therefore through the authenticated daemon — rather than from the LAN.
+- **EFI disk images are macOS-only.** Omarchy is an EFI disk and the QEMU backend
+  ships no OVMF firmware, so it cannot boot there. Overlay images need no firmware
+  and take the same path on both backends. Omarchy is also arm64, so it would not
+  run on an x86_64 server even with firmware.
+- **No memory snapshots.** Neither hypervisor exposes VM state save/restore, so
+  "restore anywhere in ~100 ms" needs a different backend
+  ([`docs/snapshots.md`](docs/snapshots.md)). Pause is not a substitute: it
+  freezes the CPUs in place and the memory stays allocated.
+- **Guests have no GPU.** virtio-gpu without 3D, so a Wayland desktop composites
+  through Mesa `llvmpipe`; the Omarchy image is tuned for it (small output,
+  effects off). X11 is much lighter for remote display.
+- **Images are big.** A few hundred MB compressed, downloaded in one piece.
+  Omarchy is the heavy one: ~8.4 GB on disk, ~3.9 GB packed, and because btrfs
+  fragments free space and APFS only preserves large holes, an expanded copy may
+  not be as sparse as you would like.
+- **Single writer.** A volume attaches to one VM at a time, and the lock is
+  in-process — fine for one host, not for a fleet.
+- **Commit cost.** Committing hashes the changed extents: fast for a sparse disk,
+  but still O(used).
+
+## Building from source
+
+```sh
+git clone https://github.com/Daviduche03/warmbox && cd warmbox
+go build -o warmbox ./cmd/warmbox
+
+./warmbox image build xfce      # the default image, from deploy/images/xfce.yaml
+./warmbox setup --no-image      # hypervisor + noVNC; the image is already built
+./warmbox daemon                # foreground, so you can watch it
+```
+
+`make build-all` rebuilds the dashboard (`web/`) and the binary that embeds it.
+`make test`, `make vet`.
+
+### Making a release
+
+Push a tag: `git tag v0.3.0 && git push origin v0.3.0`. That builds the binaries
+for darwin/arm64 and linux/{amd64,arm64}, publishes the tarballs, `.deb`/`.rpm`
+and `checksums.txt`, and updates the Homebrew cask. Releases need a
+`homebrew-warmbox` tap repository and a `HOMEBREW_TAP_GITHUB_TOKEN` secret (a PAT
+with write access to it, because the default token cannot push to another
+repository). Without that secret the workflow warns and publishes without the
+cask, so a release can never fail on it.
+
+**Guest images are separate**, on a release tagged `images`, published as
+`warmbox-image-<name>-<arch>.tar.zst` plus its `.sha256`. They are deliberately
+not tied to a version: the guest changes far less often, and a CLI release should
+not need hundreds of MB re-uploaded. Adding an image to the registry does not
+publish it — the **guest image** workflow asks the registry what to build
+(`warmbox image build --publishable`) and is run by hand, because it is minutes
+per image per architecture and must never be able to block a binary release.
 
 ## Docs
 
 - [`docs/architecture.md`](docs/architecture.md) — the cloud-native design.
 - [`docs/volumes.md`](docs/volumes.md) — volumes, sizing, API.
-- [`docs/snapshots.md`](docs/snapshots.md) — snapshots & fast-resume plan.
+- [`docs/snapshots.md`](docs/snapshots.md) — snapshots and the fast-resume plan.
 - [`docs/agent-api.md`](docs/agent-api.md) — the guest agent API and roadmap.
-- [`docs/egress.md`](docs/egress.md) — the egress policy and what it does not do yet.
-- [`deploy/omarchy/README.md`](deploy/omarchy/README.md) — the Omarchy image.
+- [`docs/egress.md`](docs/egress.md) — the egress policy, and what it does not do.
 - [`docs/oss-positioning.md`](docs/oss-positioning.md) — what could be a shared primitive.
+- [`deploy/omarchy/README.md`](deploy/omarchy/README.md) — the Omarchy image.
 
 ## Help wanted
 
+- **EFI on Linux** — OVMF support in the QEMU backend, so Omarchy-style disk
+  images run on a server too.
 - **One pooled image per image** — the warm pool only pre-boots the daemon's
-  default image, so any other `--image` still cold-boots (~6–13s). Pooling is
-  per-image work: the pool has to know which image each warm VM holds.
-- **EFI on Linux** — OVMF support in the QEMU backend so image guests run there too.
+  default image, so any other `--image` cold-boots. The pool needs to know which
+  image each warm VM holds.
 - **Cloud Hypervisor / Firecracker backend** — leaner boot and real memory
-  snapshot/restore (the "~100 ms restore anywhere" story).
-- **Windows** — a **WSL2 setup guide** (WSL2 is Linux + KVM) or a native **WHPX**
-  QEMU backend. Unverified; the seam is `internal/desktop/backend.go`.
-- **Agent API** — streaming/background exec, `tty`, and computer-use
-  (`docs/agent-api.md`).
+  snapshot/restore.
+- **The agent API** — TTY, screenshot and input, so an agent can drive the screen
+  as well as the shell ([`docs/agent-api.md`](docs/agent-api.md)).
 - **WebRTC streaming** — replace noVNC/RFB for latency and bandwidth.
-- **macOS VNC bridge** — replace the `/usr/bin/nc` fallback with a signed helper.
-- **Tests** — API and VM lifecycle integration tests.
+- **Windows** — a WSL2 guide, or a native WHPX QEMU backend. Unverified; the seam
+  is `internal/desktop/backend.go`.
+- **Tests** — API and VM-lifecycle integration tests.
 
 See [`CONTRIBUTING.md`](CONTRIBUTING.md).
 

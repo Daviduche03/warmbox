@@ -1,7 +1,15 @@
 #!/bin/sh
 # Install warmbox from a GitHub release.
 #
-#   curl -fsSL https://raw.githubusercontent.com/Daviduche03/warmbox/v0.2.0/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/Daviduche03/warmbox/master/install.sh | sh
+#
+# That URL picks which copy of this script runs; it does NOT pick which version
+# gets installed. With WARMBOX_VERSION unset the script asks GitHub for the
+# newest release. To pin both, take the script from a tag and ask for the same
+# tag explicitly:
+#
+#   curl -fsSL https://raw.githubusercontent.com/Daviduche03/warmbox/v0.3.0/install.sh \
+#     | WARMBOX_VERSION=v0.3.0 sh
 #
 # The archive is verified against the release's checksums.txt *before* anything
 # is written, so a corrupt or tampered download installs nothing.
