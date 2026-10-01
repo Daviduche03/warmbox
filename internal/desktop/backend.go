@@ -311,6 +311,14 @@ func (b *qemuBackend) Launch(spec LaunchSpec) (*Instance, error) {
 		"-smp", fmt.Sprint(spec.CPUs),
 		"-m", fmt.Sprint(spec.MemMiB),
 		"-nodefaults", "-no-reboot",
+		// No screen, on purpose, and not merely as a default: the guest draws
+		// into Xvnc's own framebuffer and the daemon streams that, so the host
+		// never needs to render anything. Without this QEMU falls back to its
+		// default display backend — GTK — which on a headless server cannot
+		// open a display, prints "gtk initialization failed" and exits 1 before
+		// the kernel is even loaded. -nodefaults does not cover this: it disables
+		// default devices, not the display backend.
+		"-display", "none",
 		"-kernel", spec.Kernel,
 		"-initrd", spec.Initrd,
 		"-append", "console=ttyS0 " + spec.Cmdline,

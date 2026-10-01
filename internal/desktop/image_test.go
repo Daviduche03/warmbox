@@ -294,6 +294,36 @@ func TestWaitReadyQuotesWhyTheHypervisorRefused(t *testing.T) {
 	}
 }
 
+// A guest that dies takes its reason with it: the console log is the only place
+// a panic or a failed init says anything, and it lives in a directory that is
+// removed when the failed boot is cleaned up. Quote it while it is still there.
+func TestWaitReadyQuotesTheGuestConsole(t *testing.T) {
+	m := testManager(t)
+	namedImage(t, m, "img", "")
+	m.backend = &captureBackend{}
+
+	vm, err := m.start(StartSpec{ImageName: "img"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// What a QEMU guest that cannot find its root leaves behind.
+	console := filepath.Join(m.cfg.VMDir(vm.ID), "console.log")
+	body := "[    0.9] /init: mounting root\n[    1.0] /init: no /dev/vda block device\nKernel panic - not syncing: Attempted to kill init!\n"
+	if err := os.WriteFile(console, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	_, err = m.WaitReady(ctx, vm.ID)
+	if err == nil {
+		t.Fatal("WaitReady succeeded for a VM whose process had exited")
+	}
+	if !strings.Contains(err.Error(), "no /dev/vda block device") {
+		t.Errorf("error = %v\nwant it to quote the guest console", err)
+	}
+}
+
 // The excerpt is a tail, not a transcript: a chatty hypervisor must not grow the
 // daemon without bound, and the process we are only watching must never see a
 // short write.

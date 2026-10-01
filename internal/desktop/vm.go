@@ -1,8 +1,11 @@
 package desktop
 
 import (
+	"io"
 	"net"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -91,33 +94,72 @@ func (v *VM) ExitError() error {
 	return v.exitErr
 }
 
-// exitDetail quotes the hypervisor's own last words, when it had any.
+// exitDetail explains a boot that died: what the hypervisor said, and what the
+// guest last managed to print.
 //
-// "exit status 1" is not a diagnosis — a hypervisor that refuses to start has
-// usually already said why ("Could not access KVM kernel module" is the common
-// one), and that sentence is the difference between a fixable failure and a
-// mystery. The last line is normally the reason; keep the one before it too,
-// since some tools print a preamble.
+// "exit status 1" is not a diagnosis. A hypervisor that refuses to start says
+// why on its own stderr; a guest that panics writes it to the serial console —
+// and with -no-reboot on QEMU, a guest whose init dies makes QEMU exit 1 while
+// saying nothing at all. The VM directory holding that console log is removed
+// when the failed boot is cleaned up, so if it is not quoted here it is gone.
 func (v *VM) exitDetail() string {
-	if v.inst == nil || v.inst.Stderr == nil {
+	var parts []string
+	if v.inst != nil && v.inst.Stderr != nil {
+		if s := lastLines(v.inst.Stderr.String(), 2); s != "" {
+			parts = append(parts, s)
+		}
+	}
+	if s := tailOfFile(filepath.Join(v.dir, "console.log"), 4<<10, 3); s != "" {
+		parts = append(parts, "guest console: "+s)
+	}
+	if len(parts) == 0 {
 		return ""
 	}
-	text := v.inst.Stderr.String()
+	quoted := strings.Join(parts, "; ")
+	if len(quoted) > 500 {
+		quoted = quoted[:500] + "…"
+	}
+	return ": " + quoted
+}
+
+// lastLines is the last n non-empty lines of text, joined with ": ".
+func lastLines(text string, n int) string {
 	if text == "" {
 		return ""
 	}
 	var tail []string
 	lines := strings.Split(text, "\n")
-	for i := len(lines) - 1; i >= 0 && len(tail) < 2; i-- {
+	for i := len(lines) - 1; i >= 0 && len(tail) < n; i-- {
 		if s := strings.TrimSpace(lines[i]); s != "" {
 			tail = append([]string{s}, tail...)
 		}
 	}
-	quoted := strings.Join(tail, ": ")
-	if len(quoted) > 400 {
-		quoted = quoted[:400] + "…"
+	return strings.Join(tail, ": ")
+}
+
+// tailOfFile is the last few non-empty lines of a file, reading only its end so
+// that a chatty boot does not cost the whole log. Missing files are not an
+// error: most VMs have no console log worth quoting.
+func tailOfFile(path string, maxBytes int64, lines int) string {
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
 	}
-	return ": " + quoted
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return ""
+	}
+	if offset := st.Size() - maxBytes; offset > 0 {
+		if _, err := f.Seek(offset, io.SeekStart); err != nil {
+			return ""
+		}
+	}
+	b, err := io.ReadAll(io.LimitReader(f, maxBytes))
+	if err != nil {
+		return ""
+	}
+	return lastLines(string(b), lines)
 }
 
 // markReady records the guest IP and signals readiness (idempotent).
