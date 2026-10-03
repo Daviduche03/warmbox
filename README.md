@@ -153,8 +153,7 @@ is all the daemon reads at runtime.
 |---|---|---|---|---|
 | `xfce` | Alpine + XFCE | yes — the default | ~0.9 GB | ~1s pooled, ~7s cold |
 | `lxqt` | Alpine + LXQt | yes | ~0.9 GB | ~7s |
-| `headless` | Alpine + XFCE | **none** | ~0.9 GB | ~6s |
-| `headless-lxqt` | Alpine + LXQt | **none** | ~0.9 GB | ~7s |
+| `headless` | Alpine, no desktop | **none** | ~0.15 GB | ~6s |
 | `omarchy` | Arch + Hyprland | yes — macOS hosts only | ~3.9 GB packed | ~13s |
 
 Sizes and boot times are approximate, and the times come from an Apple Silicon
@@ -167,11 +166,12 @@ warmbox create --image headless       # no screen: the agent API is the only way
 warmbox create                        # whatever --image the daemon was started with
 ```
 
-**Headless images** boot no X server and no desktop session at all. The guest
-still runs the agent, so `exec`, files, runs and sessions all work — there is
-just nothing to look at, and no VNC port to connect to. It is a property of the
-image rather than a flag on `create`, so the guest and the daemon cannot disagree
-about whether a screen exists.
+**Headless images** are built without an X server, a desktop session or a
+browser at all — not merely one that never starts. The guest still runs the
+agent, so `exec`, files, runs and sessions all work — there is just nothing to
+look at, and no VNC port to connect to. It is a property of the image rather
+than a flag on `create`, so the guest and the daemon cannot disagree about
+whether a screen exists.
 
 ### Building, downloading, and moving images
 
@@ -350,7 +350,7 @@ against the published one.
 the hypervisor for whichever host it finds, so the table below is about what can
 run, not what you must install by hand.
 
-| host | overlay images (`xfce`, `lxqt`, `headless`, `headless-lxqt`) | EFI disk images (`omarchy`) |
+| host | overlay images (`xfce`, `lxqt`, `headless`) | EFI disk images (`omarchy`) |
 |---|---|---|
 | macOS 13+, Apple Silicon (vfkit) | ✅ | ✅ |
 | Linux + KVM, x86_64 (QEMU) | ✅ verified | ❌ no OVMF |

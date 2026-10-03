@@ -34,6 +34,15 @@ func TestCheckedInRegistryValidates(t *testing.T) {
 			t.Errorf("registry is missing %q (have %v)", want, names)
 		}
 	}
+	// A published image that is headless *and* installs a desktop is the GUI
+	// image twice: identical weight, nothing on screen to show for it. One
+	// headless image ships, and it installs no desktop (see desktop: none).
+	for _, c := range cfgs {
+		if c.Publish && c.Headless && c.Desktop != "none" {
+			t.Errorf("%s: published headless, but it installs desktop %q — a screenless image ships without one",
+				c.Name, c.Desktop)
+		}
+	}
 }
 
 // DefaultImageName mirrors what the daemon falls back to; the test above pins
@@ -79,6 +88,27 @@ func TestValidateRejectsCombinationsTheEnginesCannotBuild(t *testing.T) {
 			},
 			"overlay-engine fields",
 		},
+		{
+			"desktop none without headless",
+			func(c *Config) {
+				c.Desktop, c.Theme, c.Browser = "none", "default", "none"
+			},
+			"headless must be true",
+		},
+		{
+			"desktop none with a theme",
+			func(c *Config) {
+				c.Desktop, c.Theme, c.Browser, c.Headless = "none", "win11", "none", true
+			},
+			`theme "default"`,
+		},
+		{
+			"desktop none with a browser",
+			func(c *Config) {
+				c.Desktop, c.Theme, c.Browser, c.Headless = "none", "default", "chromium", true
+			},
+			"no X to run it in",
+		},
 	}
 	for _, tc := range cases {
 		c := base
@@ -94,6 +124,14 @@ func TestValidateRejectsCombinationsTheEnginesCannotBuild(t *testing.T) {
 	}
 	if err := base.Validate(); err != nil {
 		t.Errorf("the base config should be valid: %v", err)
+	}
+	// The shape `deploy/images/headless.yaml` uses: no desktop at all, and
+	// therefore nothing to show — which is exactly what headless has to mean.
+	screenless := base
+	screenless.Desktop, screenless.Theme, screenless.Browser, screenless.Headless =
+		"none", "default", "none", true
+	if err := screenless.Validate(); err != nil {
+		t.Errorf("the screenless config should be valid: %v", err)
 	}
 }
 
@@ -140,30 +178,53 @@ func TestMetaJSONIsTheRunTimeContract(t *testing.T) {
 // The env is the script's existing vocabulary: the config is a nicer way to say
 // the same thing, not a second build system.
 func TestEnvSpeaksTheScriptsLanguage(t *testing.T) {
-	overlay := Config{
-		Name: "headless-lxqt", Engine: EngineOverlay,
-		Desktop: "lxqt", Theme: "ambiance", Browser: "chromium", Headless: true,
-	}
-	got := overlay.Env("linux/arm64")
-	for k, want := range map[string]string{
-		"DESKTOP": "lxqt", "THEME": "ambiance", "BROWSER": "chromium",
-		"VARIANT": "headless-lxqt", "HEADLESS": "1",
-		"PLATFORM": "linux/arm64", "META_JSON": `{"headless":true}`,
-		// One docker tag per image, so building one does not re-tag another.
-		"IMAGE": "warmbox-guest:headless-lxqt",
+	for _, tc := range []struct {
+		name string
+		cfg  Config
+		want map[string]string
+	}{
+		{
+			"a desktop image",
+			Config{Name: "lxqt", Engine: EngineOverlay,
+				Desktop: "lxqt", Theme: "ambiance", Browser: "chromium"},
+			map[string]string{
+				"DESKTOP": "lxqt", "THEME": "ambiance", "BROWSER": "chromium",
+				"VARIANT": "lxqt", "HEADLESS": "0",
+				"PLATFORM": "linux/arm64", "META_JSON": `{}`,
+				// One docker tag per image, so building one does not re-tag another.
+				"IMAGE": "warmbox-guest:lxqt",
+			},
+		},
+		{
+			"the screenless image",
+			Config{Name: "headless", Engine: EngineOverlay,
+				Desktop: "none", Theme: "default", Browser: "none", Headless: true},
+			map[string]string{
+				"DESKTOP": "none", "THEME": "default", "BROWSER": "none",
+				"VARIANT": "headless", "HEADLESS": "1",
+				"PLATFORM": "linux/arm64", "META_JSON": `{"headless":true}`,
+				"IMAGE": "warmbox-guest:headless",
+			},
+		},
 	} {
-		if got[k] != want {
-			t.Errorf("overlay env %s = %q, want %q", k, got[k], want)
+		got := tc.cfg.Env("linux/arm64")
+		for k, want := range tc.want {
+			if got[k] != want {
+				t.Errorf("%s env %s = %q, want %q", tc.name, k, got[k], want)
+			}
 		}
-	}
-	// Not an EFI image, so it must not carry EFI variables.
-	if _, ok := got["OMARCHY_NAME"]; ok {
-		t.Error("overlay config leaked OMARCHY_NAME into the env")
+		// Not an EFI image, so it must not carry EFI variables.
+		if _, ok := got["OMARCHY_NAME"]; ok {
+			t.Errorf("%s: overlay config leaked OMARCHY_NAME into the env", tc.name)
+		}
+		if tc.cfg.RequiresInputs() {
+			t.Errorf("%s: the overlay engine builds from the checkout", tc.name)
+		}
 	}
 
 	efi := Config{Name: "omarchy", Engine: EngineEFI, Resolution: "800x600",
 		Runtime: Runtime{GPU: "800x600"}}
-	got = efi.Env("")
+	got := efi.Env("")
 	if got["OMARCHY_NAME"] != "omarchy" || got["RESOLUTION"] != "800x600" {
 		t.Errorf("efi env = %v", got)
 	}
@@ -173,8 +234,8 @@ func TestEnvSpeaksTheScriptsLanguage(t *testing.T) {
 	if _, ok := got["PLATFORM"]; ok {
 		t.Error("an unset platform should not be passed through")
 	}
-	if efi.RequiresInputs() != true || overlay.RequiresInputs() != false {
-		t.Error("RequiresInputs should be true only for the EFI engine")
+	if efi.RequiresInputs() != true {
+		t.Error("RequiresInputs should be true for the EFI engine")
 	}
 }
 

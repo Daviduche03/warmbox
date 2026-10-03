@@ -77,9 +77,11 @@ type Runtime struct {
 	AgentAPI int `yaml:"agent_api"`
 }
 
-// Desktops and browsers the overlay engine knows how to install.
+// Desktops and browsers the overlay engine knows how to install. "none" is the
+// screenless case: no X server, no session, none of the packages that make up
+// a GUI image — which is most of its weight.
 var (
-	desktops = []string{"xfce", "lxqt"}
+	desktops = []string{"none", "xfce", "lxqt"}
 	browsers = []string{"none", "netsurf", "epiphany", "firefox", "chromium"}
 )
 
@@ -211,6 +213,21 @@ func (c Config) Validate() error {
 		}
 		if c.Resolution != "" {
 			return fmt.Errorf("resolution is an EFI-engine field (overlay sizing is --gpu at run time)")
+		}
+		// A desktop of "none" is an image with no X at all, so it can only be
+		// a headless one, it has nothing to theme, and nothing to run a
+		// browser in. Refusing these here rather than at boot keeps a config
+		// from producing an image that boots to a failing Xvnc.
+		if c.Desktop == "none" {
+			if !c.Headless {
+				return fmt.Errorf(`desktop "none" has no screen to show: headless must be true`)
+			}
+			if c.Theme != "default" {
+				return fmt.Errorf(`desktop "none" pairs only with theme "default" (got %q)`, c.Theme)
+			}
+			if c.Browser != "none" {
+				return fmt.Errorf(`desktop "none" cannot run browser %q: there is no X to run it in`, c.Browser)
+			}
 		}
 	case EngineEFI:
 		if c.Headless {

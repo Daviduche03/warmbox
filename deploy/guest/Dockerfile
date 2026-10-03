@@ -5,7 +5,7 @@
 #     --build-arg BROWSER=epiphany deploy/guest
 #
 # BROWSER may be: none | netsurf | epiphany | firefox | chromium
-# DESKTOP may be: xfce | lxqt
+# DESKTOP may be: none | xfce | lxqt   (none = no X at all, for a headless image)
 # THEME may be: default | win11 | ambiance (ambiance pairs with lxqt)
 # The resulting image contains /initramfs.zst (the whole rootfs, zstd) and
 # /boot/vmlinuz-virt (compressed kernel). See `warmbox setup` for extraction.
@@ -30,26 +30,37 @@ ARG BROWSER=chromium
 ARG DESKTOP=xfce
 ARG THEME=default
 
-# Base GUI stack: XFCE (default) or LXQt-Ambiance. Both share TigerVNC +
-# dbus + fonts; only the session layer differs so squashfs/overlay/VNC stay
-# identical across images.
+# What every image needs: kernel modules, the shell tools the agent and its
+# users reach for, dbus, and the compressor the final step packs with.
 RUN set -eux; \
     apk add --no-cache \
-        tigervnc \
-        xsetroot xdpyinfo xprop \
-        dbus dbus-x11 \
-        adwaita-icon-theme hicolor-icon-theme papirus-icon-theme \
-        shared-mime-info gdk-pixbuf \
-        font-misc-misc font-dejavu \
         iproute2 socat bash procps coreutils \
         kmod linux-virt \
-        xmessage \
         darkhttpd \
-        curl zstd; \
+        dbus \
+        curl zstd
+
+# The screen: TigerVNC plus the X plumbing both session layers share, then the
+# session itself — XFCE (default) or LXQt-Ambiance, so squashfs/overlay/VNC
+# stay identical across images. DESKTOP=none installs none of it: a screenless
+# image has no X to run, and this is most of an image's weight.
+RUN set -eux; \
     case "${DESKTOP}" in \
-        xfce) apk add --no-cache xfce4 xfce4-terminal ;; \
-        lxqt) apk add --no-cache lxqt-desktop qterminal \
-                kvantum lxqt-themes obconf-qt ;; \
+        none) ;; \
+        xfce|lxqt) \
+            apk add --no-cache \
+                tigervnc \
+                xsetroot xdpyinfo xprop xmessage \
+                dbus-x11 \
+                adwaita-icon-theme hicolor-icon-theme papirus-icon-theme \
+                shared-mime-info gdk-pixbuf \
+                font-misc-misc font-dejavu; \
+            if [ "${DESKTOP}" = "xfce" ]; then \
+                apk add --no-cache xfce4 xfce4-terminal; \
+            else \
+                apk add --no-cache lxqt-desktop qterminal \
+                    kvantum lxqt-themes obconf-qt; \
+            fi ;; \
         *) echo "unknown DESKTOP=${DESKTOP}" >&2; exit 1 ;; \
     esac
 
@@ -95,7 +106,7 @@ RUN set -eux; \
 # themes/ambiance/ (lxqt.conf, openbox/rc.xml, kvantum theme, autostart).
 COPY themes /themes
 RUN set -eux; \
-    if [ "${THEME}" = "ambiance" ]; then \
+    if [ "${DESKTOP}" != "none" ] && [ "${THEME}" = "ambiance" ]; then \
         mkdir -p /etc/xdg/lxqt /etc/xdg/openbox \
                   /usr/share/Kvantum /etc/xdg/autostart; \
         cp -r /themes/ambiance/lxqt/* /etc/xdg/lxqt/ 2>/dev/null || true; \
@@ -105,7 +116,7 @@ RUN set -eux; \
         install -m 0755 /themes/ambiance/autostart/wallpaper.sh /usr/local/bin/warmbox-wallpaper.sh; \
         gtk-update-icon-cache -qtf /usr/share/icons/Papirus 2>/dev/null || true; \
     fi; \
-    if [ "${THEME}" = "win11" ]; then \
+    if [ "${DESKTOP}" != "none" ] && [ "${THEME}" = "win11" ]; then \
         apk add --no-cache xfce4-whiskermenu-plugin xfce4-docklike-plugin; \
         # GTK + window-manager themes. The GTK theme imports Adwaita (GTK's
         # built-in resource) so every widget still renders, then overrides the

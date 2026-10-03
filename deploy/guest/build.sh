@@ -22,8 +22,10 @@
 # per-VM disk copy and RAM stays low. See deploy/guest/overlay-init.
 #
 # Env:
-#   BROWSER       none|netsurf|epiphany|firefox|chromium   (default epiphany)
-#   DESKTOP       xfce|lxqt                                (default xfce)
+#   BROWSER       none|netsurf|epiphany|firefox|chromium   (default chromium)
+#   DESKTOP       none|xfce|lxqt                           (default xfce)
+#                 none = no X server at all, for a screenless image: requires
+#                 HEADLESS=1 and pairs with THEME=default BROWSER=none.
 #   THEME         default|win11|ambiance                    (default win11;
 #                 ambiance pairs with DESKTOP=lxqt)
 #   VARIANT       output suffix for parallel images, e.g. lxqt-ambiance.
@@ -70,6 +72,21 @@ if [ "$HEADLESS" = "1" ] && [ -z "$VARIANT" ]; then
     echo "==> HEADLESS=1 needs a VARIANT — the built-in image cannot record it." >&2
     echo "    try: HEADLESS=1 VARIANT=headless ./deploy/guest/build.sh" >&2
     exit 1
+fi
+
+# DESKTOP=none installs no X server, so there is no display stack for /init to
+# skip and nothing to theme or browse in. Refuse it here: built by hand, the
+# result would boot to an Xvnc that is not there. `warmbox image build` sets all
+# three together from deploy/images/, so this only catches a hand-run invocation.
+if [ "$DESKTOP" = "none" ]; then
+    if [ "$HEADLESS" != "1" ]; then
+        echo "==> DESKTOP=none has no X server: add HEADLESS=1 for an image with no screen" >&2
+        exit 1
+    fi
+    if [ "$THEME" != "default" ] || [ "$BROWSER" != "none" ]; then
+        echo "==> DESKTOP=none pairs with THEME=default BROWSER=none (got THEME=$THEME BROWSER=$BROWSER)" >&2
+        exit 1
+    fi
 fi
 
 echo "==> building $IMAGE (BROWSER=$BROWSER, DESKTOP=$DESKTOP, THEME=$THEME, headless=$HEADLESS, platform=$PLATFORM, variant=${VARIANT:-default})"
