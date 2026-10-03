@@ -1,6 +1,7 @@
 package desktop
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -79,6 +80,67 @@ func TestQEMUKeepsItsOwnOutput(t *testing.T) {
 	}
 	if inst.Cmd.Stderr == nil {
 		t.Error("QEMU's stderr is not connected to anything; a refusal would be discarded")
+	}
+}
+
+// Software emulation has to be asked for, and it must not also claim to be the
+// host CPU: `-cpu host` describes hardware KVM is passing through, and QEMU
+// refuses it under emulation. This is the mode CI uses to boot an image before
+// it is published.
+func TestQEMUSoftwareEmulationIsCoherent(t *testing.T) {
+	b := &qemuBackend{accel: "tcg"}
+	inst, err := b.Launch(LaunchSpec{CPUs: 1, MemMiB: 512, Kernel: "/k", Initrd: "/i", Console: "/tmp/c.log"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := valueAfter(inst.Cmd.Args, "-machine"); !strings.Contains(got, "accel=tcg") {
+		t.Errorf("-machine %q, want accel=tcg", got)
+	}
+	if got := valueAfter(inst.Cmd.Args, "-cpu"); got == "host" {
+		t.Error("-cpu host under emulation: QEMU rejects that")
+	}
+}
+
+// The default stays KVM with the host CPU.
+func TestQEMUDefaultsToKVM(t *testing.T) {
+	b := &qemuBackend{}
+	inst, err := b.Launch(LaunchSpec{CPUs: 1, MemMiB: 512, Kernel: "/k", Initrd: "/i", Console: "/tmp/c.log"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := valueAfter(inst.Cmd.Args, "-machine"); !strings.Contains(got, "accel=kvm") {
+		t.Errorf("-machine %q, want accel=kvm", got)
+	}
+	if got := valueAfter(inst.Cmd.Args, "-cpu"); got != "host" {
+		t.Errorf("-cpu %q, want host", got)
+	}
+}
+
+// The guest logs to /dev/hvc0. Without a virtio-serial port to back it, those
+// lines go to a device that does not exist and are lost — which is exactly why
+// diagnosing a QEMU guest meant reaching over the agent instead of reading its
+// console.
+func TestQEMUGivesTheGuestSomewhereToLog(t *testing.T) {
+	b := &qemuBackend{}
+	inst, err := b.Launch(LaunchSpec{CPUs: 1, MemMiB: 512, Kernel: "/k", Initrd: "/i", Console: "/tmp/console.log"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := strings.Join(inst.Cmd.Args, " ")
+	if !strings.Contains(args, "virtio-serial-pci") || !strings.Contains(args, "virtconsole") {
+		t.Errorf("no virtio-serial port in %v", inst.Cmd.Args)
+	}
+	if !strings.Contains(args, "path=/tmp/console.log") {
+		t.Errorf("the guest's log does not point at the VM's console file: %v", inst.Cmd.Args)
+	}
+}
+
+func TestUnknownAcceleratorIsRefused(t *testing.T) {
+	if _, err := newBackend(&Config{Backend: "qemu", Accel: "hvf"}); err == nil {
+		t.Error("an unknown accelerator was accepted")
+	}
+	if _, err := newBackend(&Config{Backend: "qemu", Accel: "tcg"}); err != nil {
+		t.Errorf("tcg was refused: %v", err)
 	}
 }
 

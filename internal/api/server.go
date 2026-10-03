@@ -836,7 +836,7 @@ const dashHTML = `<!doctype html>
 <style>html,body{margin:0;height:100%%;background:#111}
 iframe{border:0;width:100vw;height:100vh;display:block}</style></head>
 <body><iframe allow="clipboard-read;clipboard-write"
- src="/vnc/%s/vnc.html?autoconnect=1&resize=scale&show_dot=1&path=/websockify/%s"></iframe>
+ src="/vnc/%s/vnc.html?autoconnect=1&resize=scale&show_dot=1&path=/websockify/%s%s"></iframe>
 </body></html>`
 
 // headlessHTML is what /d/ shows for a desktop with no screen: the link is
@@ -878,8 +878,15 @@ func (s *Server) dash(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/d/"+id, http.StatusFound)
 		return
 	}
+	// noVNC reads `password` from the query string. It is the per-VM VNC
+	// password the guest generated, so the console is not open to anything else
+	// on the host that can reach the guest's port.
+	pass := ""
+	if p := vm.VNCPassword(); p != "" {
+		pass = "&password=" + url.QueryEscape(p)
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	fmt.Fprintf(w, dashHTML, id, id)
+	fmt.Fprintf(w, dashHTML, id, id, pass)
 }
 
 func (s *Server) list(w http.ResponseWriter, r *http.Request) {
@@ -991,6 +998,13 @@ func (s *Server) resume(w http.ResponseWriter, r *http.Request) {
 func (s *Server) ready(w http.ResponseWriter, r *http.Request) {
 	id := r.URL.Query().Get("id")
 	ip := r.URL.Query().Get("ip")
+	// A guest that was asked for a VNC password reports it here, rather than on
+	// a command line every process on the host could read.
+	if pass := r.URL.Query().Get("vncpass"); pass != "" {
+		if vm, ok := s.mgr.Get(id); ok {
+			vm.SetVNCPassword(pass)
+		}
+	}
 	if !s.mgr.MarkReady(id, ip) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown vm"})
 		return

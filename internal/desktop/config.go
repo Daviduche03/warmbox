@@ -50,6 +50,24 @@ type Config struct {
 	// Input attaches virtio keyboard and pointing devices to the guest.
 	Input bool
 
+	// Accel is QEMU's accelerator: "kvm" (the default) or "tcg" (software
+	// emulation, ~20x slower). Only tcg works on a machine without KVM, which
+	// is what CI has — it is how the smoke test boots an image before the image
+	// is published. vfkit ignores it.
+	Accel string
+
+	// TLSCert and TLSKey, when both are set, serve the dashboard over HTTPS.
+	// The daemon refuses a non-loopback address without them (or without
+	// Insecure): everything it serves — the session cookie, the console, the
+	// guest API — is plaintext, and a mistake here is not visible until it is
+	// someone else's.
+	TLSCert string
+	TLSKey  string
+
+	// Insecure permits a non-loopback address with no TLS. It exists so the
+	// decision is explicit and greppable rather than accidental.
+	Insecure bool
+
 	// GUI opens the hypervisor's native window (vfkit --gui). A bring-up aid
 	// for image guests; normal operation streams over VNC.
 	GUI bool
@@ -136,6 +154,7 @@ func DefaultConfig() *Config {
 		WorkDir:         wd,
 		VfkitPath:       "vfkit",
 		Backend:         backend,
+		Accel:           "kvm",
 		ImageDir:        filepath.Join(wd, "images"),
 		NoVNCDir:        filepath.Join(wd, "novnc"),
 		HostAddr:        "192.168.64.1",

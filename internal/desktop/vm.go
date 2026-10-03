@@ -42,6 +42,11 @@ type VM struct {
 	// ImageMeta.Headless): there is nothing behind /d/ to stream.
 	Headless bool
 
+	// vncPass is the password Xvnc in this guest was started with. The guest
+	// generates it and reports it over the readiness callback; empty means the
+	// guest serves without auth (an image built before the flag existed).
+	vncPass string
+
 	forwards map[int]string
 	cmd      *exec.Cmd
 	// inst is the launched process's handle, including the backend control
@@ -84,6 +89,22 @@ func (v *VM) markExited(err error) {
 	v.exitErr = err
 	v.mu.Unlock()
 	v.doneMu.Do(func() { close(v.done) })
+}
+
+// SetVNCPassword records the password the guest generated for its VNC server.
+// It arrives once, with readiness.
+func (v *VM) SetVNCPassword(pass string) {
+	v.mu.Lock()
+	v.vncPass = pass
+	v.mu.Unlock()
+}
+
+// VNCPassword is what a VNC client must present, or "" when the guest serves
+// without auth.
+func (v *VM) VNCPassword() string {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.vncPass
 }
 
 // ExitError is why the VM process ended, or nil if it ended cleanly or has not

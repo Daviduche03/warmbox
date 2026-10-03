@@ -288,8 +288,28 @@ so it starts at boot. Logs are in the journal:
 `journalctl -u warmbox.service -f`.
 
 The daemon needs `--backend qemu` on Linux; `warmbox service install` passes it
-for you. QEMU's user-mode networking is not reachable host→guest, so the backend
-forwards a host port to each guest's VNC — everything else behaves the same.
+for you. QEMU normally asks for KVM; on a machine without it (a CI runner, or a
+container that cannot pass `/dev/kvm` through) `--accel tcg` falls back to
+software emulation, which is roughly twenty times slower but does boot. QEMU's
+user-mode networking is not reachable host→guest, so the backend forwards a host
+port to each guest's VNC and agent; everything else behaves the same.
+
+**Exposing it.** Everything the daemon serves is plaintext — the dashboard, its
+session cookie, the console, the guest API — so it binds `127.0.0.1` and refuses
+a network address without a certificate:
+
+```sh
+# a tunnel needs neither TLS nor an open port
+ssh -L 7070:127.0.0.1:7070 <user>@<host>
+
+# or run it on the network, with a certificate (the service remembers it)
+warmbox service install --pool 1 \
+  --tls-cert /etc/letsencrypt/live/<host>/fullchain.pem \
+  --tls-key  /etc/letsencrypt/live/<host>/privkey.pem
+
+# or accept the risk knowingly
+warmbox service install --pool 1 --addr 0.0.0.0:7070 --insecure
+```
 
 **Warm VMs hold RAM** even when nobody is creating anything, so the pool drains
 itself after 15 minutes without a lease (`--pool-idle-timeout 30m`; `0` keeps it
@@ -383,14 +403,18 @@ images anywhere but macOS, memory snapshots, TLS, and GPU or audio.
 
 ## Limitations
 
-- **No TLS, and the guest trusts anyone who reaches it.** The API is not open —
-  accounts and workspaces gate every stateful route, and everything that reaches
-  a desktop (console streams, the agent API, published guest ports) is scoped to
-  the caller's workspace, with warm-pool VMs kept out of every listing. What is
-  missing is confidentiality and guest hardening: plaintext HTTP, the guest's VNC
-  server running `-SecurityTypes None`, and the guest as **root**. The guest only
-  sits behind the hypervisor's NAT, so its VNC port is reachable from the host —
-  and therefore through the authenticated daemon — rather than from the LAN.
+- **Plaintext unless you say otherwise, and the guest is root.** The API is not
+  open — accounts and workspaces gate every stateful route, and everything that
+  reaches a desktop (console streams, the agent API, published guest ports) is
+  scoped to the caller's workspace, with warm-pool VMs kept out of every listing.
+  But the daemon speaks plain HTTP unless given `--tls-cert`/`--tls-key`, so it
+  binds loopback by default and **refuses** a network address without TLS (or an
+  explicit `--insecure`). Each guest's VNC server requires a per-VM password,
+  generated inside the guest and handed to noVNC with the console URL — the guest
+  still sits behind the hypervisor's NAT, so that port was never on the LAN, but
+  anything else on the host could previously reach it with no credentials at all.
+  What remains is the guest itself: it runs as **root**, and none of this is
+  hardened against someone who already has the desktop.
 - **EFI disk images are macOS-only.** Omarchy is an EFI disk and the QEMU backend
   ships no OVMF firmware, so it cannot boot there. Overlay images need no firmware
   and take the same path on both backends. Omarchy is also arm64, so it would not
@@ -425,6 +449,13 @@ go build -o warmbox ./cmd/warmbox
 `make build-all` rebuilds the dashboard (`web/`) and the binary that embeds it.
 `make test`, `make vet`.
 
+`make smoke IMAGE_NAME=xfce` boots an image with the real daemon and waits for it
+to report ready. That is the check the release workflow runs on every image
+before publishing it — a guest that never comes up, a hypervisor flag that is
+refused, or a readiness gate that never fires is caught there rather than by
+whoever installs it next. On a machine without KVM it uses software emulation, so
+it works on a runner too.
+
 ### Making a release
 
 Push a tag: `git tag v0.3.0 && git push origin v0.3.0`. That builds the binaries
@@ -442,6 +473,8 @@ not need hundreds of MB re-uploaded. Adding an image to the registry does not
 publish it — the **guest image** workflow asks the registry what to build
 (`warmbox image build --publishable`) and is run by hand, because it is minutes
 per image per architecture and must never be able to block a binary release.
+Each image is **booted to readiness before it is uploaded**, so a guest that
+never comes up fails the workflow rather than reaching whoever installs next.
 
 ## Docs
 

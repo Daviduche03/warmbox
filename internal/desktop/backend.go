@@ -109,7 +109,12 @@ func newBackend(cfg *Config) (Backend, error) {
 	case "", "vfkit":
 		return &vfkitBackend{path: cfg.VfkitPath, gui: cfg.GUI}, nil
 	case "qemu":
-		return &qemuBackend{}, nil
+		switch cfg.Accel {
+		case "", "kvm", "tcg":
+		default:
+			return nil, fmt.Errorf("unknown accelerator %q for the qemu backend (kvm or tcg)", cfg.Accel)
+		}
+		return &qemuBackend{accel: cfg.Accel}, nil
 	default:
 		return nil, fmt.Errorf("unknown backend %q (supported: vfkit, qemu)", cfg.Backend)
 	}
@@ -263,8 +268,13 @@ func parseDisplay(s string) (int, int, error) {
 
 // --- QEMU (KVM, Linux) ---
 
+// qemuBackend boots guests with QEMU. accel is "kvm" (hardware, the default) or
+// "tcg" (software emulation: roughly twenty times slower, but it runs where
+// there is no KVM — which includes every CI runner, and is the only way a
+// published image can be booted before it is published).
 type qemuBackend struct {
-	path string // qemu-system-* binary; empty => pick by host arch
+	path  string // qemu-system-* binary; empty => pick by host arch
+	accel string // "kvm" (default) or "tcg"
 }
 
 func (b *qemuBackend) Name() string          { return "qemu" }
@@ -305,8 +315,18 @@ func (b *qemuBackend) Launch(spec LaunchSpec) (*Instance, error) {
 	if runtime.GOARCH == "arm64" {
 		machine = "virt"
 	}
+	accel := b.accel
+	if accel == "" {
+		accel = "kvm"
+	}
+	if accel != "kvm" {
+		// `-cpu host` describes the host CPU, which only means anything when
+		// KVM is passing it through; asking for it under emulation is a lie
+		// QEMU refuses. `max` is the "everything this build can emulate" model.
+		cpu = "max"
+	}
 	args := []string{
-		"-machine", machine + ",accel=kvm",
+		"-machine", machine + ",accel=" + accel,
 		"-cpu", cpu,
 		"-smp", fmt.Sprint(spec.CPUs),
 		"-m", fmt.Sprint(spec.MemMiB),
@@ -323,6 +343,14 @@ func (b *qemuBackend) Launch(spec LaunchSpec) (*Instance, error) {
 		"-initrd", spec.Initrd,
 		"-append", "console=ttyS0 " + spec.Cmdline,
 		"-serial", "file:" + spec.Console,
+		// The guest logs to /dev/hvc0, which is a virtio-*console* — not a
+		// virtio-serial port. `virtserialport` would hand the guest
+		// /dev/vport0p1, a device the guest never writes to, and its lines would
+		// vanish exactly as before. vfkit connects this; now both backends put
+		// the guest's log in the file next to the VM.
+		"-device", "virtio-serial-pci,id=vser0",
+		"-chardev", "file,id=vserchar0,path=" + spec.Console + ",append=on",
+		"-device", "virtconsole,chardev=vserchar0,name=warmbox",
 		"-device", "virtio-rng-pci",
 		"-netdev", fmt.Sprintf("user,id=n0,hostfwd=tcp:127.0.0.1:%d-:5900,hostfwd=tcp:127.0.0.1:%d-:7077", vncPort, agentPort),
 		"-device", "virtio-net-pci,netdev=n0",

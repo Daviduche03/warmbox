@@ -161,6 +161,11 @@ func (m *Manager) start(spec StartSpec) (*VM, error) {
 	if m.cfg.EgressAddr != "" {
 		cmdline += fmt.Sprintf(" warmbox.proxy=%s:%s", hostAddr, portOf(m.cfg.EgressAddr))
 	}
+	// Ask the guest for a per-VM VNC password. The flag is not a secret; the
+	// password itself goes the other way, over the readiness callback. An image
+	// that predates the flag ignores it and serves as it always did, so this is
+	// safe in both directions.
+	cmdline += " warmbox.vncauth=1"
 
 	launch := LaunchSpec{
 		ID:         id,

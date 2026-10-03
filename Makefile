@@ -56,6 +56,11 @@ run: guest-image build
 test:
 	go test ./...
 
+## smoke: boot IMAGE_NAME with the real daemon and wait for it to report ready
+## (the check that would catch a guest that does not boot, before a release)
+smoke: build
+	WARMBOX_BIN=./$(BINARY) ./deploy/guest/smoke.sh $(IMAGE_NAME)
+
 ## vet: run go vet
 vet:
 	go vet ./...

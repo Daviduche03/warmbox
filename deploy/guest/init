@@ -50,6 +50,8 @@ API_PORT="7070"
 SHARE_TAG=""
 HAVE_VOLUME=""
 PROXY=""
+VNC_AUTH=""
+VNCPASS=""
 for kv in $(cat /proc/cmdline); do
     case "$kv" in
         warmbox.id=*)     VM_ID="${kv#warmbox.id=}" ;;
@@ -58,6 +60,7 @@ for kv in $(cat /proc/cmdline); do
         warmbox.share=*)  SHARE_TAG="${kv#warmbox.share=}" ;;
         warmbox.volume=*) HAVE_VOLUME=1 ;;
         warmbox.proxy=*)  PROXY="${kv#warmbox.proxy=}" ;;
+        warmbox.vncauth=*) VNC_AUTH=1 ;;
     esac
 done
 
@@ -140,7 +143,25 @@ if [ -f /etc/warmbox/headless ]; then
     log "headless image: no X server, no desktop session"
 else
     # --- X server + VNC (TigerVNC Xvnc) ---
-    Xvnc :0 -geometry 1280x800 -depth 24 -SecurityTypes None -AlwaysShared \
+    # With no security type, anything that can reach this port owns the desktop,
+    # and the port is reachable from the host. When the host asks (`vncauth` on
+    # the cmdline, which is not a secret) a per-VM password is generated here and
+    # reported back over the readiness callback — never on a command line, where
+    # every process on the host could read it.
+    VNCSEC="-SecurityTypes None"
+    if [ "$VNC_AUTH" = "1" ]; then
+        VNCPASS=$(head -c 24 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 12)
+        if [ -n "$VNCPASS" ] && printf '%s\n' "$VNCPASS" | vncpasswd -f > /root/.vnc-passwd 2>/dev/null; then
+            chmod 600 /root/.vnc-passwd
+            VNCSEC="-SecurityTypes VncAuth -PasswordFile /root/.vnc-passwd"
+            log "vnc auth: a per-VM password is required"
+        else
+            VNCPASS=""
+            log "WARN: could not set a VNC password; serving without one"
+        fi
+    fi
+    # shellcheck disable=SC2086
+    Xvnc :0 -geometry 1280x800 -depth 24 $VNCSEC -AlwaysShared \
         -rfbport 5900 -desktop warmbox >/var/log/xvnc.log 2>&1 &
     XPID=$!
 
@@ -264,10 +285,13 @@ if ss -ltn 2>/dev/null | grep -q ":$READY_PORT"; then
     if [ -n "$VM_ID" ] && [ -n "$HOST_ADDR" ]; then
         # The readiness callback is control-plane traffic: never through the
         # egress proxy (busybox wget ignores no_proxy).
+        READY_URL="http://${HOST_ADDR}:${API_PORT}/internal/ready?id=${VM_ID}&ip=${IP}"
+        if [ -n "$VNCPASS" ]; then
+            READY_URL="${READY_URL}&vncpass=${VNCPASS}"
+        fi
         env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY \
             -u all_proxy -u ALL_PROXY -u no_proxy -u NO_PROXY \
-            wget -q -O /dev/null \
-            "http://${HOST_ADDR}:${API_PORT}/internal/ready?id=${VM_ID}&ip=${IP}" \
+            wget -q -O /dev/null "$READY_URL" \
             && log "reported ready to ${HOST_ADDR}:${API_PORT}" \
             || log "WARN: readiness callback failed"
     fi

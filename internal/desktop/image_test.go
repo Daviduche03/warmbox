@@ -217,6 +217,66 @@ func TestWaitReadySucceedsWhenTheGuestReportedFirst(t *testing.T) {
 	}
 }
 
+// The guest is asked for a per-VM VNC password. The flag is not a secret; the
+// password goes back over the readiness callback, so it never appears on the
+// command line where every process on the host could read it.
+func TestTheGuestIsAskedForAVNCPassword(t *testing.T) {
+	m := testManager(t)
+	namedImage(t, m, "img", "")
+	be := &captureBackend{}
+	m.backend = be
+
+	if _, err := m.start(StartSpec{ImageName: "img"}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(be.spec.Cmdline, "warmbox.vncauth=1") {
+		t.Errorf("cmdline = %q, want it to ask for a VNC password", be.spec.Cmdline)
+	}
+	// The password itself must never be on the command line.
+	if strings.Contains(strings.ToLower(be.spec.Cmdline), "pass") &&
+		!strings.Contains(be.spec.Cmdline, "vncauth=1") {
+		t.Errorf("something password-shaped reached the cmdline: %q", be.spec.Cmdline)
+	}
+}
+
+// A guest reports the password it generated; until then the VM has none, which
+// is also the state for an image built before the flag existed.
+func TestVNCPasswordIsReportedNotAssumed(t *testing.T) {
+	m := testManager(t)
+	namedImage(t, m, "img", "")
+	m.backend = &captureBackend{}
+
+	vm, err := m.start(StartSpec{ImageName: "img"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := vm.VNCPassword(); got != "" {
+		t.Errorf("a fresh VM has VNC password %q, want none", got)
+	}
+	vm.SetVNCPassword("s3cretpass")
+	if got := vm.VNCPassword(); got != "s3cretpass" {
+		t.Errorf("VNCPassword() = %q, want what the guest reported", got)
+	}
+}
+
+// A guest that reports ready must never lose its password to a race with
+// MarkReady — a console that connects without the password gets nothing.
+func TestVNCPasswordSurvivesReadiness(t *testing.T) {
+	m := testManager(t)
+	namedImage(t, m, "img", "")
+	m.backend = &captureBackend{}
+
+	vm, err := m.start(StartSpec{ImageName: "img"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	vm.SetVNCPassword("abcdefgh")
+	m.MarkReady(vm.ID, "10.0.2.15")
+	if got := vm.VNCPassword(); got != "abcdefgh" {
+		t.Errorf("VNCPassword() = %q after readiness, want it kept", got)
+	}
+}
+
 // A headless image is the authority on having no screen: the daemon's own
 // defaults must not arm a GPU and input devices for a compositor that is never
 // going to start.

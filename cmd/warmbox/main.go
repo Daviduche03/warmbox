@@ -20,6 +20,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -233,7 +234,11 @@ func addCommonFlags(fs *flag.FlagSet, cfg *desktop.Config) {
 	fs.StringVar(&cfg.ImageDir, "image-dir", cfg.ImageDir, "directory of guest images (<name>/ with meta.json)")
 	fs.StringVar(&cfg.GPU, "gpu", cfg.GPU, "virtio-gpu size, e.g. 1440x900 (empty = headless)")
 	fs.BoolVar(&cfg.Input, "input", cfg.Input, "attach virtio keyboard/pointing devices")
+	fs.StringVar(&cfg.Accel, "accel", cfg.Accel, "QEMU accelerator: kvm (default) or tcg (software emulation, slow)")
 	fs.BoolVar(&cfg.GUI, "gui", cfg.GUI, "open the hypervisor window (vfkit only; bring-up aid)")
+	fs.StringVar(&cfg.TLSCert, "tls-cert", cfg.TLSCert, "serve the dashboard over HTTPS with this certificate")
+	fs.StringVar(&cfg.TLSKey, "tls-key", cfg.TLSKey, "private key for --tls-cert")
+	fs.BoolVar(&cfg.Insecure, "insecure", cfg.Insecure, "allow a non-loopback --addr with no TLS (plaintext cookies and console)")
 	fs.StringVar(&cfg.NoVNCDir, "novnc", cfg.NoVNCDir, "noVNC asset directory")
 	fs.StringVar(&cfg.VfkitPath, "vfkit", cfg.VfkitPath, "vfkit binary")
 	fs.StringVar(&cfg.Backend, "backend", cfg.Backend, "hypervisor backend (vfkit)")
@@ -313,6 +318,50 @@ func preflightAddr(addr string) {
 // installs no longer write it; the flag itself stays accepted so plists written
 // by older versions keep starting.
 
+// appendServiceFlags puts the configured knobs on the daemon's command line, so
+// a service runs with what it was installed with instead of the built-in
+// defaults. Anything still at its default is left off, which keeps the unit
+// honest about what was chosen and lets a later default reach people who never
+// asked for anything.
+//
+// Sizing used to be accepted by `service install` and then silently dropped:
+// the unit was written without it, the daemon started on 4 GiB and 4 vCPUs, and
+// nothing anywhere said the flag had been ignored. On a small host that is more
+// memory than the machine has.
+func appendServiceFlags(args []string, cfg *desktop.Config) []string {
+	def := desktop.DefaultConfig()
+	if cfg.MemMiB != def.MemMiB {
+		args = append(args, "--mem", fmt.Sprint(cfg.MemMiB))
+	}
+	if cfg.CPUs != def.CPUs {
+		args = append(args, "--cpus", fmt.Sprint(cfg.CPUs))
+	}
+	if cfg.GPU != def.GPU {
+		args = append(args, "--gpu", cfg.GPU)
+	}
+	if cfg.Input != def.Input {
+		args = append(args, "--input")
+	}
+	if cfg.Accel != def.Accel {
+		args = append(args, "--accel", cfg.Accel)
+	}
+	if cfg.GuestAddr != def.GuestAddr {
+		args = append(args, "--guest-addr", cfg.GuestAddr)
+	}
+	// A service bound to the network needs its certificate remembered, or it
+	// would refuse to start when the unit runs it without one.
+	if cfg.TLSCert != "" {
+		args = append(args, "--tls-cert", cfg.TLSCert)
+	}
+	if cfg.TLSKey != "" {
+		args = append(args, "--tls-key", cfg.TLSKey)
+	}
+	if cfg.Insecure {
+		args = append(args, "--insecure")
+	}
+	return args
+}
+
 func writeLaunchAgent(cfg *desktop.Config, pool int) error {
 	if vf, err := exec.LookPath(cfg.VfkitPath); err == nil {
 		cfg.VfkitPath = vf
@@ -331,9 +380,14 @@ func writeLaunchAgent(cfg *desktop.Config, pool int) error {
 		"--pool-idle-timeout", cfg.PoolIdleTimeout.String(),
 		"--vfkit", cfg.VfkitPath,
 	}
+	// Sizing is persisted so `service install --mem 1024` means something. It
+	// used to be accepted and silently dropped, which left the daemon on the
+	// built-in 4 GiB and 4 vCPUs with no way to tell it otherwise — on a small
+	// host that is the whole machine.
 	if cfg.Image != "" {
 		args = append(args, "--image", cfg.Image)
 	}
+	args = appendServiceFlags(args, cfg)
 	esc := strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;").Replace
 	var b strings.Builder
 	for _, a := range args {
@@ -385,6 +439,13 @@ func serviceLaunchd(args []string) {
 	fs.StringVar(&cfg.APIAddr, "addr", cfg.APIAddr, "HTTP listen address (dashboard + API)")
 	fs.StringVar(&cfg.GuestAddr, "guest-addr", cfg.GuestAddr, "address for guest readiness callbacks (default: the guest gateway on the daemon port; \"off\" disables)")
 	fs.StringVar(&cfg.Image, "image", cfg.Image, "default image")
+	fs.UintVar(&cfg.MemMiB, "mem", cfg.MemMiB, "memory per VM (MiB)")
+	fs.UintVar(&cfg.CPUs, "cpus", cfg.CPUs, "vCPUs per VM")
+	fs.StringVar(&cfg.GPU, "gpu", cfg.GPU, "virtio-gpu size, e.g. 1440x900 (empty = headless)")
+	fs.BoolVar(&cfg.Input, "input", cfg.Input, "attach virtio keyboard/pointing devices")
+	fs.StringVar(&cfg.TLSCert, "tls-cert", cfg.TLSCert, "serve the dashboard over HTTPS with this certificate")
+	fs.StringVar(&cfg.TLSKey, "tls-key", cfg.TLSKey, "private key for --tls-cert")
+	fs.BoolVar(&cfg.Insecure, "insecure", cfg.Insecure, "allow a non-loopback --addr with no TLS")
 	fs.IntVar(&pool, "pool", 0, "warm pool size (0 = boot on demand; 1+ = instant create, holds RAM)")
 	sub := ""
 	if len(args) > 0 {
@@ -589,6 +650,7 @@ func writeSystemdUnit(cfg *desktop.Config, pool int, backend string) error {
 	if cfg.Image != "" {
 		args = append(args, "--image", cfg.Image)
 	}
+	args = appendServiceFlags(args, cfg)
 	quoted := make([]string, 0, len(args))
 	for _, a := range args {
 		quoted = append(quoted, systemdQuote(a))
@@ -659,6 +721,14 @@ func serviceSystemd(args []string) {
 	fs.StringVar(&cfg.APIAddr, "addr", cfg.APIAddr, "HTTP listen address (dashboard + API)")
 	fs.StringVar(&cfg.GuestAddr, "guest-addr", cfg.GuestAddr, "address for guest readiness callbacks (default: the guest gateway on the daemon port; \"off\" disables)")
 	fs.StringVar(&cfg.Image, "image", cfg.Image, "default image")
+	fs.UintVar(&cfg.MemMiB, "mem", cfg.MemMiB, "memory per VM (MiB)")
+	fs.UintVar(&cfg.CPUs, "cpus", cfg.CPUs, "vCPUs per VM")
+	fs.StringVar(&cfg.GPU, "gpu", cfg.GPU, "virtio-gpu size, e.g. 1440x900 (empty = headless)")
+	fs.BoolVar(&cfg.Input, "input", cfg.Input, "attach virtio keyboard/pointing devices")
+	fs.StringVar(&cfg.Accel, "accel", cfg.Accel, "QEMU accelerator: kvm (default) or tcg (software emulation, slow)")
+	fs.StringVar(&cfg.TLSCert, "tls-cert", cfg.TLSCert, "serve the dashboard over HTTPS with this certificate")
+	fs.StringVar(&cfg.TLSKey, "tls-key", cfg.TLSKey, "private key for --tls-cert")
+	fs.BoolVar(&cfg.Insecure, "insecure", cfg.Insecure, "allow a non-loopback --addr with no TLS")
 	fs.IntVar(&pool, "pool", 0, "warm pool size (0 = boot on demand; 1+ = instant create, holds RAM)")
 	fs.StringVar(&backend, "backend", backend, "hypervisor backend (qemu on Linux)")
 	sub := ""
@@ -781,6 +851,7 @@ func cmdDaemon(args []string) {
 		fatal("Error: %v", err)
 	}
 	preflightAddr(cfg.APIAddr)
+	requireSafeBind(cfg)
 	// Clear anything a previous daemon left behind before booting new VMs: we
 	// hold the address now, so survivors belong to a crashed run (RAM, control
 	// sockets and attached volumes included).
@@ -806,6 +877,21 @@ func cmdDaemon(args []string) {
 		if meta.AgentAPI > desktop.AgentAPI {
 			fmt.Fprintf(os.Stderr, "warmbox: warning: image %q targets agent API %d, this daemon speaks %d\n",
 				name, meta.AgentAPI, desktop.AgentAPI)
+		}
+	}
+	// A guest sized larger than its host is not caught anywhere else: it boots,
+	// it reports ready, and then everything crawls while the host swaps. Say so
+	// here, while the numbers are still in front of whoever set them.
+	if total := hostRAMMiB(); total > 0 {
+		pool := cfg.PoolSize + 1 // the pool, plus the desktop someone will ask for
+		switch {
+		case int(cfg.MemMiB) > total:
+			fmt.Fprintf(os.Stderr, "warmbox: warning: each VM is sized at %d MiB, more than this host's %d MiB\n", cfg.MemMiB, total)
+			fmt.Fprintln(os.Stderr, "warmbox:   lower it with --mem (a service keeps what `service install --mem` was given)")
+		case int(cfg.MemMiB)*pool > total*9/10:
+			fmt.Fprintf(os.Stderr, "warmbox: warning: %d VM(s) at %d MiB is %d MiB on a %d MiB host\n",
+				pool, cfg.MemMiB, int(cfg.MemMiB)*pool, total)
+			fmt.Fprintln(os.Stderr, "warmbox:   lower --pool or --mem if creates start to crawl")
 		}
 	}
 
@@ -874,7 +960,14 @@ func cmdDaemon(args []string) {
 	srv := &http.Server{Addr: cfg.APIAddr, Handler: apiSrv.Handler()}
 	go func() {
 		fmt.Fprintf(os.Stderr, "warmbox: listening on %s (pool=%d)\n", cfg.APIAddr, cfg.PoolSize)
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		var err error
+		if cfg.TLSCert != "" && cfg.TLSKey != "" {
+			fmt.Fprintf(os.Stderr, "warmbox: TLS on: %s\n", cfg.TLSCert)
+			err = srv.ListenAndServeTLS(cfg.TLSCert, cfg.TLSKey)
+		} else {
+			err = srv.ListenAndServe()
+		}
+		if err != nil && err != http.ErrServerClosed {
 			fmt.Fprintf(os.Stderr, "warmbox: server error: %v\n", err)
 			stop()
 		}
@@ -1019,6 +1112,87 @@ func backfillCatalog(ctx context.Context, cat *catalog.DB, store *volume.Store, 
 			CreatedAt: m.Created,
 		})
 	}
+}
+
+// requireSafeBind refuses to expose a plaintext daemon to the network.
+//
+// The dashboard, its session cookie, the console websocket and the guest agent
+// API all travel in the clear, and each is a way into a machine. Loopback is the
+// default and the only safe answer without TLS, so anything else has to be
+// paired with a certificate or with an explicit --insecure — a decision someone
+// makes on purpose, rather than one that happens because a colon got typed in
+// front of the port.
+func requireSafeBind(cfg *desktop.Config) {
+	if bindIsLoopback(cfg.APIAddr) {
+		return
+	}
+	if cfg.TLSCert != "" && cfg.TLSKey != "" {
+		return
+	}
+	if cfg.Insecure {
+		fmt.Fprintf(os.Stderr, "warmbox: warning: %s is reachable from the network without TLS\n", cfg.APIAddr)
+		fmt.Fprintln(os.Stderr, "warmbox:   the dashboard, its session cookie and every console are plaintext")
+		return
+	}
+	fatal("refusing to listen on %s without TLS.\n"+
+		"  Everything the daemon serves is plaintext: the dashboard, its session cookie,\n"+
+		"  the console stream and the guest API. Pick one:\n"+
+		"    bind 127.0.0.1 and tunnel to it    ssh -L 7070:127.0.0.1:7070 <user>@<host>\n"+
+		"    give it a certificate             --tls-cert cert.pem --tls-key key.pem\n"+
+		"    accept it knowingly               --insecure", cfg.APIAddr)
+}
+
+// bindIsLoopback reports whether an address only accepts connections from this
+// machine. An empty host (":7070") means every interface, which is the opposite
+// of loopback and the case most likely to be typed by accident.
+func bindIsLoopback(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil || host == "" {
+		return false
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+// hostRAMMiB is the machine's total memory, or 0 when it cannot be read.
+// It is used only to warn: a guest sized larger than its host still boots, it
+// just makes everything else slow, and nothing else in the daemon would notice.
+func hostRAMMiB() int {
+	switch runtime.GOOS {
+	case "linux":
+		b, err := os.ReadFile("/proc/meminfo")
+		if err != nil {
+			return 0
+		}
+		for _, line := range strings.Split(string(b), "\n") {
+			if !strings.HasPrefix(line, "MemTotal:") {
+				continue
+			}
+			f := strings.Fields(line)
+			if len(f) < 2 {
+				return 0
+			}
+			kb, err := strconv.Atoi(f[1])
+			if err != nil {
+				return 0
+			}
+			return kb / 1024
+		}
+	case "darwin":
+		out, err := exec.Command("sysctl", "-n", "hw.memsize").Output()
+		if err != nil {
+			return 0
+		}
+		b, err := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64)
+		if err != nil {
+			return 0
+		}
+		return int(b / (1 << 20))
+	}
+	return 0
 }
 
 // missingImages names the images the daemon expects but cannot find.
