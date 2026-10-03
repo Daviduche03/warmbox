@@ -289,11 +289,27 @@ if ss -ltn 2>/dev/null | grep -q ":$READY_PORT"; then
         if [ -n "$VNCPASS" ]; then
             READY_URL="${READY_URL}&vncpass=${VNCPASS}"
         fi
-        env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY \
-            -u all_proxy -u ALL_PROXY -u no_proxy -u NO_PROXY \
-            wget -q -O /dev/null "$READY_URL" \
-            && log "reported ready to ${HOST_ADDR}:${API_PORT}" \
-            || log "WARN: readiness callback failed"
+        # The host's listener on the other side of slirp is bound only once
+        # this VM has brought the vmnet interface up, so a guest that boots
+        # fast can out-run it. One lost callback is not retried anywhere: the
+        # daemon waits out its ~90s boot timeout and destroys a perfectly good
+        # VM, turning a 6s boot into a 97s one. Keep asking for a minute — the
+        # listener appears within seconds of the first VM starting.
+        tries=0
+        while :; do
+            if env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY \
+                    -u all_proxy -u ALL_PROXY -u no_proxy -u NO_PROXY \
+                    wget -q -O /dev/null "$READY_URL"; then
+                log "reported ready to ${HOST_ADDR}:${API_PORT}"
+                break
+            fi
+            tries=$((tries + 1))
+            if [ "$tries" -ge 30 ]; then
+                log "WARN: readiness callback failed after $tries attempts"
+                break
+            fi
+            sleep 2
+        done
     fi
 else
     log "WARN: port $READY_PORT not listening"
