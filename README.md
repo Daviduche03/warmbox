@@ -47,8 +47,8 @@ today, on a server next week, and it is the same machine.
 You need a host: **macOS on Apple Silicon**, or **Linux with KVM**. Then:
 
 ```sh
-# 1. install the binary
-brew install --cask Daviduche03/warmbox/warmbox    # macOS (or Linuxbrew)
+# 1. install the binary — one line, verifies the release checksum first
+curl -fsSL https://raw.githubusercontent.com/Daviduche03/warmbox/master/install.sh | sh
 
 # 2. let it install the rest: hypervisor, noVNC, and the guest image
 warmbox setup
@@ -78,34 +78,31 @@ the source and builds it locally, installing Docker first if it has to.
 `--image-sha256` point it at an archive of your own.
 
 <details>
-<summary>Other ways to install the binary</summary>
+<summary>About the installer, and other ways to install</summary>
 
-One line on a server, which verifies the release's checksum before installing
-anything:
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/Daviduche03/warmbox/master/install.sh | sh
-```
-
-It installs to `/usr/local/bin` as root, otherwise `~/.local/bin`. That URL picks
-which copy of the script runs, not which version you get — with `WARMBOX_VERSION`
-unset it installs the newest release. To pin both, take the script from a tag and
-say so:
+The installer checks the release's sha256 before expanding anything, puts the
+binary in `/usr/local/bin` as root or `~/.local/bin` otherwise, and never asks
+for sudo. That URL picks which copy of the script runs, not which version you
+get — with `WARMBOX_VERSION` unset it installs the newest release. To pin both,
+take the script from a tag and say so:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Daviduche03/warmbox/v0.3.0/install.sh \
-  | WARMBOX_VERSION=v0.3.0 sh
+curl -fsSL https://raw.githubusercontent.com/Daviduche03/warmbox/v0.4.0/install.sh \
+  | WARMBOX_VERSION=v0.4.0 sh
 ```
 
-Debian/Ubuntu and Fedora/RHEL packages are tidier on a server (they deliberately
-do not fetch the guest image — that stays `warmbox setup`):
+Prefer your package manager? The cask, the packages, and plain tarballs all come
+from the same releases:
 
 ```sh
-sudo apt install ./warmbox_0.3.0_linux_amd64.deb
-sudo rpm -i warmbox_0.3.0_linux_amd64.rpm
+brew install --cask Daviduche03/warmbox/warmbox   # macOS (or Linuxbrew)
+
+sudo apt install ./warmbox_0.4.0_linux_amd64.deb # Debian/Ubuntu
+sudo rpm -i warmbox_0.4.0_linux_amd64.rpm        # Fedora/RHEL
 ```
 
-Or unpack the tarball for your platform from the
+The packages deliberately do not fetch the guest image — that stays
+`warmbox setup`. Or unpack the tarball for your platform from the
 [releases page](https://github.com/Daviduche03/warmbox/releases) and run the same
 commands: `./warmbox setup`, then `./warmbox service install --pool 1`.
 
@@ -500,10 +497,4 @@ never comes up fails the workflow rather than reaching whoever installs next.
 - **WebRTC streaming** — replace noVNC/RFB for latency and bandwidth.
 - **Windows** — a WSL2 guide, or a native WHPX QEMU backend. Unverified; the seam
   is `internal/desktop/backend.go`.
-- **Tests** — API and VM-lifecycle integration tests.
-
-See [`CONTRIBUTING.md`](CONTRIBUTING.md).
-
-## License
-
-[Apache-2.0](LICENSE).
+- **Tests** — API and VM-lifecycle integration 
