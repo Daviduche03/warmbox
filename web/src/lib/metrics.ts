@@ -1,4 +1,4 @@
-import type { Sample } from "./store";
+import type { Sample } from "./stores";
 
 export type CountKey = Exclude<keyof Sample, "t">;
 

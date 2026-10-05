@@ -3,7 +3,7 @@
 import { cn } from "@/lib/utils";
 import { useState } from "react";
 import { Button } from "@/components/ui/button";
-import { useStore } from "@/lib/store";
+import { useStore } from "@/lib/stores";
 import { X as XIcon } from "@phosphor-icons/react";
 
 export function LatestChange() {
