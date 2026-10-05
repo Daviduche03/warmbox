@@ -77,37 +77,6 @@ the source and builds it locally, installing Docker first if it has to.
 `--no-install` makes it report instead of installing; `--image-url` and
 `--image-sha256` point it at an archive of your own.
 
-<details>
-<summary>About the installer, and other ways to install</summary>
-
-The installer checks the release's sha256 before expanding anything, puts the
-binary in `/usr/local/bin` as root or `~/.local/bin` otherwise, and never asks
-for sudo. That URL picks which copy of the script runs, not which version you
-get — with `WARMBOX_VERSION` unset it installs the newest release. To pin both,
-take the script from a tag and say so:
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/Daviduche03/warmbox/v0.4.0/install.sh \
-  | WARMBOX_VERSION=v0.4.0 sh
-```
-
-Prefer your package manager? The cask, the packages, and plain tarballs all come
-from the same releases:
-
-```sh
-brew install --cask Daviduche03/warmbox/warmbox   # macOS (or Linuxbrew)
-
-sudo apt install ./warmbox_0.4.0_linux_amd64.deb # Debian/Ubuntu
-sudo rpm -i warmbox_0.4.0_linux_amd64.rpm        # Fedora/RHEL
-```
-
-The packages deliberately do not fetch the guest image — that stays
-`warmbox setup`. Or unpack the tarball for your platform from the
-[releases page](https://github.com/Daviduche03/warmbox/releases) and run the same
-commands: `./warmbox setup`, then `./warmbox service install --pool 1`.
-
-</details>
-
 ## What you can do with it
 
 **Get a desktop in about a second.** The daemon keeps a *warm pool* of VMs that
@@ -321,24 +290,6 @@ vms/<id>/            per-VM state: console log, pid, control socket
 novnc/              the dashboard's VNC client assets
 daemon.log          the service's output
 ```
-
-**Updating.** The binary and the guest images move independently — the guest
-changes far less often, and upgrading the CLI does not touch an image.
-
-```sh
-# the binary
-curl -fsSL https://raw.githubusercontent.com/Daviduche03/warmbox/master/install.sh | sh
-
-# the guest image for this platform (or the Images page in the dashboard)
-warmbox setup                      # installs the default image
-warmbox image pull <name>          # or a specific one
-
-warmbox service restart            # picks up the new binary
-```
-
-The **Settings → Daemon** tab tells you when either half is behind: it compares
-the running version against this repository's releases, and the installed image
-against the published one.
 
 ## What you need, and what runs where
 
