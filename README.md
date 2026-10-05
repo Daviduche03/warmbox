@@ -36,11 +36,11 @@ today, on a server next week, and it is the same machine.
                  └────────────────────────┘
 ```
 
-> **Status: experimental alpha.** Do not put this on the open internet. The
-> dashboard is plaintext HTTP with no TLS, the guest's VNC server accepts anyone
-> who can reach it, and the guest runs as **root**. The API itself *is* behind
-> accounts and workspaces — see [Limitations](#limitations) — but everything
-> assumes a host you trust.
+> **Status: beta.** Tested and packaged, but single-host and short of
+> real-world mileage; the defaults assume a host you trust. Don't put this on
+> the open internet: the dashboard serves plaintext HTTP unless you pass
+> `--tls-cert`/`--tls-key`, and guests run as **root** inside the VM. The API
+> itself *is* behind accounts and workspaces — see [Limitations](#limitations).
 
 ## Get started
 
@@ -399,7 +399,7 @@ Solid and used daily: the XFCE/LXQt desktops over noVNC, the warm pool,
 accounts and workspaces, volumes with snapshots and clones, image build/pack/
 pull, and the agent's `exec` and file APIs. Experimental: `warmbox-app` and the
 `/p/` port proxy. Not built yet: TTY and screenshot/input on the agent API, EFI
-images anywhere but macOS, memory snapshots, TLS, and GPU or audio.
+images anywhere but macOS, memory snapshots, and GPU or audio.
 
 ## Limitations
 

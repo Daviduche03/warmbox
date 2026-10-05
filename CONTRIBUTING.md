@@ -1,6 +1,6 @@
 # Contributing to warmbox
 
-Thanks for taking a look. warmbox is an **experimental alpha**; expect rough
+Thanks for taking a look. warmbox is in **beta**; expect rough
 edges, and please open an issue before large changes so we can agree on the
 shape.
 
