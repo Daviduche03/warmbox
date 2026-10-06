@@ -40,6 +40,11 @@ export const desktops = {
     request<{ checkpoints: { name: string; size: number; created: string; image: string }[] }>(
       `/api/desktops/${id}/checkpoints`,
     ),
+  checkpointDelete: (id: string, name: string) =>
+    request<{ status: string; id: string }>(
+      `/api/desktops/${id}/checkpoints/${encodeURIComponent(name)}`,
+      { method: "DELETE" },
+    ),
   restore: (id: string, name?: string) =>
     request<{ status: string; id: string; restore_ms: number }>(
       `/api/desktops/${id}/restore`,

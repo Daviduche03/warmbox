@@ -9,6 +9,7 @@ import { joinList } from "@/modules/desktops/desktops.data";
 import { DesktopTable } from "@/modules/desktops/desktop-table";
 import { NewDesktopDialog } from "@/modules/desktops/create-desktop-dialog";
 import { EgressPolicyDialog } from "@/modules/desktops/egress-policy-dialog";
+import { CheckpointsDialog } from "@/modules/desktops/checkpoints-dialog";
 import { Plus as PlusIcon } from "@phosphor-icons/react";
 
 /**
@@ -22,6 +23,7 @@ export function DesktopsPage() {
 	const [policyFor, setPolicyFor] = useState<string>();
 	const [policyInitial, setPolicyInitial] = useState({ allow: "", deny: "" });
 	const [pendingDestroy, setPendingDestroy] = useState<string>();
+	const [checkpointsFor, setCheckpointsFor] = useState<string>();
 	const [error, setError] = useState<string>();
 
 	async function destroy(id: string) {
@@ -111,6 +113,7 @@ export function DesktopsPage() {
 				onHibernate={(id) => void hibernate(id)}
 				onWake={(id) => void wake(id)}
 				onCheckpoint={(id) => void checkpoint(id)}
+				onCheckpoints={(id) => setCheckpointsFor(id)}
 				onPolicy={(d) => {
 					setPolicyFor(d.id);
 					setPolicyInitial({ allow: joinList(d.allow), deny: joinList(d.deny) });
@@ -123,6 +126,13 @@ export function DesktopsPage() {
 					initialAllow={policyInitial.allow}
 					initialDeny={policyInitial.deny}
 					onClose={() => setPolicyFor(undefined)}
+					onError={setError}
+				/>
+			) : null}
+			{checkpointsFor ? (
+				<CheckpointsDialog
+					desktopId={checkpointsFor}
+					onClose={() => setCheckpointsFor(undefined)}
 					onError={setError}
 				/>
 			) : null}

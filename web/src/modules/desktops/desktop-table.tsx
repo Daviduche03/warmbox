@@ -18,6 +18,7 @@ import type { Desktop } from "@/lib/types";
 import {
 	ArrowSquareOut as SquareArrowOutUpRightIcon,
 	Camera as CameraIcon,
+	ClockCounterClockwise as HistoryIcon,
 	Globe as GlobeIcon,
 	Moon as MoonIcon,
 	Pause as PauseIcon,
@@ -36,6 +37,7 @@ type Props = {
 	onHibernate: (id: string) => void;
 	onWake: (id: string) => void;
 	onCheckpoint: (id: string) => void;
+	onCheckpoints: (id: string) => void;
 	onPolicy: (d: Desktop) => void;
 	onDestroy: (id: string) => void;
 };
@@ -50,6 +52,7 @@ export function DesktopTable({
 	onHibernate,
 	onWake,
 	onCheckpoint,
+	onCheckpoints,
 	onPolicy,
 	onDestroy,
 }: Props) {
@@ -161,6 +164,15 @@ export function DesktopTable({
 													>
 														<CameraIcon />
 														Checkpoint now
+													</DropdownMenuItem>
+													<DropdownMenuItem
+														disabled={
+															d.state === "booting" || d.state === "dead"
+														}
+														onSelect={() => onCheckpoints(d.id)}
+													>
+														<HistoryIcon />
+														Checkpoints…
 													</DropdownMenuItem>
 												</>
 											)}
