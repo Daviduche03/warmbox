@@ -238,8 +238,9 @@ would put an agent inside a machine. Design and roadmap:
 
 For agents written in Python or TypeScript, the [Python client](sdk/python) and
 [TypeScript client](sdk/typescript) handle API tokens, workspace headers, desktop
-lifecycle, commands, binary files, runs and session streams. Both can be installed
-from this checkout; npm and PyPI publication is pending. Each client README has
+lifecycle, commands, binary files, runs and session streams. The Python client
+is on PyPI (`python -m pip install warmbox`); the TypeScript client installs
+from this checkout until its first npm publish. Each client README has
 an install command and a complete create/exec/destroy example.
 
 ## Running it day to day

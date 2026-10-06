@@ -5,10 +5,10 @@ talks to the host daemon, with an API token from **Settings → API tokens**.
 Use the daemon's HTTPS address for a remote host, or its loopback address through
 an SSH tunnel. Certificate verification stays enabled.
 
-Install from a checkout (the package is not published to PyPI yet):
+Install from PyPI (or from a checkout with `python -m pip install ./sdk/python`):
 
 ```sh
-python -m pip install ./sdk/python
+python -m pip install warmbox
 ```
 
 ## For agents
