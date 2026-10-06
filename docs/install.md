@@ -20,8 +20,8 @@ That URL picks which copy of the script runs, not which version you get: with
 pin both, take the script from a tag and say so:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Daviduche03/warmbox/v0.5.2/install.sh \
-  | WARMBOX_VERSION=v0.5.2 sh
+curl -fsSL https://raw.githubusercontent.com/Daviduche03/warmbox/v0.5.3/install.sh \
+  | WARMBOX_VERSION=v0.5.3 sh
 ```
 
 Also recognized: `WARMBOX_PREFIX` (where the binary lands) and `WARMBOX_REPO`
@@ -35,8 +35,8 @@ The cask, the packages, and plain tarballs all come from the same
 ```sh
 brew install --cask Daviduche03/warmbox/warmbox   # macOS (or Linuxbrew)
 
-sudo apt install ./warmbox_0.5.2_linux_amd64.deb # Debian/Ubuntu
-sudo rpm -i warmbox_0.5.2_linux_amd64.rpm        # Fedora/RHEL
+sudo apt install ./warmbox_0.5.3_linux_amd64.deb # Debian/Ubuntu
+sudo rpm -i warmbox_0.5.3_linux_amd64.rpm        # Fedora/RHEL
 ```
 
 The `.deb` and `.rpm` deliberately do not fetch the guest image — that stays

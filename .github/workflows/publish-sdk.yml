@@ -46,7 +46,12 @@ jobs:
       - run: python -m build
       - uses: pypa/gh-action-pypi-publish@release/v1
 
+  # Disabled 2026-10-06: npm needs the package to exist before a trusted
+  # publisher can be added, and the first hand publish got the account
+  # limited for 72h. Re-enable after the manual publish + publisher setup
+  # (see issue: npm publish re-enable). PyPI is unaffected.
   npm:
+    if: false
     runs-on: ubuntu-latest
     defaults:
       run:

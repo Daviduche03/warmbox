@@ -1,6 +1,6 @@
 {
   "name": "warmbox",
-  "version": "0.5.0",
+  "version": "0.5.3",
   "description": "Typed TypeScript client for the warmbox REST API",
   "type": "module",
   "exports": {
