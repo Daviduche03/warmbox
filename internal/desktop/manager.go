@@ -258,6 +258,8 @@ func (m *Manager) start(spec StartSpec) (*VM, error) {
 		cmd:      cmd,
 		inst:     inst,
 		dir:      dir,
+		launch:   launch,
+		image:    imageName,
 		ready:    make(chan struct{}),
 		done:     make(chan struct{}),
 	}
@@ -268,8 +270,16 @@ func (m *Manager) start(spec StartSpec) (*VM, error) {
 
 	fmt.Fprintf(m.log, "desktop: booting vm %s via %s (pid %d)\n", id, m.backend.Name(), cmd.Process.Pid)
 
+	m.watch(id, vm)
+
+	return vm, nil
+}
+
+// watch records how a VM process ends. Every launched process gets exactly
+// one watcher, whether it booted or was restored from a checkpoint.
+func (m *Manager) watch(id string, vm *VM) {
 	go func() {
-		err := cmd.Wait()
+		err := vm.cmd.Wait()
 		vm.setState(StateDead)
 		vm.markExited(err)
 		if err != nil {
@@ -278,8 +288,6 @@ func (m *Manager) start(spec StartSpec) (*VM, error) {
 			fmt.Fprintf(m.log, "desktop: vm %s exited\n", id)
 		}
 	}()
-
-	return vm, nil
 }
 
 // MarkReady is called by the API when a guest reports readiness.
@@ -352,7 +360,8 @@ func (m *Manager) List() []Info {
 	return out
 }
 
-// Destroy stops and removes a VM.
+// Destroy stops and removes a VM. Its memory checkpoints go with it: a
+// checkpoint without its VM is unrestorable, so snapshots are never orphaned.
 func (m *Manager) Destroy(id string) error {
 	m.mu.Lock()
 	vm, ok := m.vms[id]
@@ -364,21 +373,31 @@ func (m *Manager) Destroy(id string) error {
 		return fmt.Errorf("unknown vm %s", id)
 	}
 
-	if vm.cmd != nil && vm.cmd.Process != nil {
-		_ = vm.cmd.Process.Kill()
-		// Wait briefly for vfkit to exit so an attached volume image is stable
-		// before the destroy hook commits it.
-		for i := 0; i < 30 && vm.Info().State != StateDead; i++ {
-			time.Sleep(100 * time.Millisecond)
-		}
-	}
+	m.killVM(vm)
 	if m.onDestroy != nil {
 		m.onDestroy(vm)
 	}
 	_ = os.RemoveAll(vm.dir)
+	_ = os.RemoveAll(m.cfg.SnapshotDir(id))
 	vm.setState(StateDead)
 	fmt.Fprintf(m.log, "desktop: destroyed vm %s\n", id)
 	return nil
+}
+
+// killVM stops a VM's process and waits (briefly) for the exit to land. The
+// record, directory and checkpoints are untouched: Destroy removes those,
+// hibernate and restore keep them.
+func (m *Manager) killVM(vm *VM) {
+	if vm.cmd == nil || vm.cmd.Process == nil {
+		return
+	}
+	_ = vm.cmd.Process.Kill()
+	// The watcher closes Done when Wait returns; an already-dead process
+	// returns at once, an unkillable one costs the timeout, not forever.
+	select {
+	case <-vm.Done():
+	case <-time.After(3 * time.Second):
+	}
 }
 
 // Pause freezes a VM's vCPUs in place. The guest keeps its memory (and with it

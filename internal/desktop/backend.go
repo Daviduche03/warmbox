@@ -60,6 +60,11 @@ type LaunchSpec struct {
 	// virtio keyboard and pointing devices.
 	Display string
 	Input   bool
+	// Incoming, when non-empty, is a QEMU migration URI (e.g.
+	// "exec:cat /path/to/snap") the new process restores instead of booting.
+	// QEMU starts paused until the state arrives, then resumes on its own.
+	// Only the qemu backend honours it.
+	Incoming string
 	Disks   []Disk
 	Shares  []Share
 	Console string // serial console log path
@@ -280,7 +285,10 @@ type qemuBackend struct {
 func (b *qemuBackend) Name() string          { return "qemu" }
 func (b *qemuBackend) GuestHostAddr() string { return "10.0.2.2" }
 func (b *qemuBackend) Capabilities() Caps {
-	return Caps{GUI: true, SharedFS: true, Snapshot: false, Pause: true}
+	// Snapshot is memory checkpoint/restore via QMP migrate-to-file and
+	// -incoming: boot once, save RAM+device state to disk, restore from it
+	// instead of booting again.
+	return Caps{GUI: true, SharedFS: true, Snapshot: true, Pause: true}
 }
 
 // QEMUSystemBinary is the qemu-system-* binary for this host architecture.
@@ -376,6 +384,9 @@ func (b *qemuBackend) Launch(spec LaunchSpec) (*Instance, error) {
 	if spec.PidFile != "" {
 		args = append(args, "-pidfile", spec.PidFile)
 	}
+	if spec.Incoming != "" {
+		args = append(args, "-incoming", spec.Incoming)
+	}
 	// QEMU's own diagnostics used to go to the daemon's stderr and nowhere
 	// else, so "exit status 1" was all a failed boot could tell you. Keep the
 	// tail for the error, and still pass it through to the daemon's log.
@@ -401,38 +412,122 @@ func (b *qemuBackend) Resume(inst *Instance) error { return qmpExec(inst, "cont"
 // qmpExec runs a single QMP command against a VM's monitor socket and reports
 // the monitor's error, if any.
 func qmpExec(inst *Instance, command string) error {
+	_, err := qmpCommand(inst, command, nil)
+	return err
+}
+
+// qmpCommand runs one QMP command with arguments and returns the monitor's
+// raw result.
+func qmpCommand(inst *Instance, command string, args map[string]any) (json.RawMessage, error) {
 	if inst == nil || inst.Control == "" {
-		return fmt.Errorf("vm has no control channel")
+		return nil, fmt.Errorf("vm has no control channel")
 	}
 	conn, err := net.DialTimeout("unix", inst.Control, 3*time.Second)
 	if err != nil {
-		return fmt.Errorf("qmp dial: %w", err)
+		return nil, fmt.Errorf("qmp dial: %w", err)
 	}
 	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	_ = conn.SetDeadline(time.Now().Add(30 * time.Second))
 	dec := json.NewDecoder(conn)
 	var greeting map[string]json.RawMessage
 	if err := dec.Decode(&greeting); err != nil {
-		return fmt.Errorf("qmp greeting: %w", err)
+		return nil, fmt.Errorf("qmp greeting: %w", err)
+	}
+	msg := map[string]any{"execute": "qmp_capabilities"}
+	if _, err := io.WriteString(conn, encodeQMP(msg)); err != nil {
+		return nil, fmt.Errorf("qmp qmp_capabilities: %w", err)
 	}
 	var ack json.RawMessage
-	for _, cmd := range []string{"qmp_capabilities", command} {
-		if _, err := io.WriteString(conn, fmt.Sprintf("{\"execute\":%q}\n", cmd)); err != nil {
-			return fmt.Errorf("qmp %s: %w", cmd, err)
-		}
+	if err := dec.Decode(&ack); err != nil {
+		return nil, fmt.Errorf("qmp qmp_capabilities: %w", err)
+	}
+	if err := qmpCheckErr("qmp_capabilities", ack); err != nil {
+		return nil, err
+	}
+	msg = map[string]any{"execute": command}
+	if args != nil {
+		msg["arguments"] = args
+	}
+	if _, err := io.WriteString(conn, encodeQMP(msg)); err != nil {
+		return nil, fmt.Errorf("qmp %s: %w", command, err)
+	}
+	// Migration (and stop/cont) emit async events on the same channel; skip
+	// anything that is not the command's reply.
+	for {
+		var ack json.RawMessage
 		if err := dec.Decode(&ack); err != nil {
-			return fmt.Errorf("qmp %s: %w", cmd, err)
+			return nil, fmt.Errorf("qmp %s: %w", command, err)
+		}
+		var keys map[string]json.RawMessage
+		if err := json.Unmarshal(ack, &keys); err != nil {
+			return nil, fmt.Errorf("qmp %s: bad reply: %w", command, err)
+		}
+		if _, ok := keys["event"]; ok {
+			continue
+		}
+		if err := qmpCheckErr(command, ack); err != nil {
+			return nil, err
 		}
 		var out struct {
-			Error *struct {
-				Desc string `json:"desc"`
-			} `json:"error"`
+			Return json.RawMessage `json:"return"`
 		}
-		if err := json.Unmarshal(ack, &out); err == nil && out.Error != nil {
-			return fmt.Errorf("qmp %s: %s", cmd, out.Error.Desc)
+		if err := json.Unmarshal(ack, &out); err != nil {
+			return nil, fmt.Errorf("qmp %s: bad return: %w", command, err)
 		}
+		return out.Return, nil
+	}
+}
+
+func encodeQMP(msg map[string]any) string {
+	b, _ := json.Marshal(msg)
+	return string(b) + "\n"
+}
+
+func qmpCheckErr(command string, ack json.RawMessage) error {
+	var out struct {
+		Error *struct {
+			Desc string `json:"desc"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(ack, &out); err == nil && out.Error != nil {
+		return fmt.Errorf("qmp %s: %s", command, out.Error.Desc)
 	}
 	return nil
+}
+
+// qmpMigrateToFile live-snapshots a running VM's RAM and device state into a
+// file. The guest keeps running throughout (migration, not savevm); the file
+// is only complete once the monitor reports completion, so callers must wait
+// for this to return before killing the VM.
+func qmpMigrateToFile(inst *Instance, path string, log io.Writer, timeout time.Duration) error {
+	if _, err := qmpCommand(inst, "migrate", map[string]any{"uri": "exec:cat > " + path}); err != nil {
+		return err
+	}
+	deadline := time.Now().Add(timeout)
+	for {
+		raw, err := qmpCommand(inst, "query-migrate", nil)
+		if err != nil {
+			return err
+		}
+		var st struct {
+			Status string `json:"status"`
+		}
+		if err := json.Unmarshal(raw, &st); err != nil {
+			return fmt.Errorf("qmp query-migrate: bad status: %w", err)
+		}
+		switch st.Status {
+		case "completed":
+			return nil
+		case "failed", "cancelled":
+			return fmt.Errorf("migration %s", st.Status)
+		}
+		if time.Now().After(deadline) {
+			_, _ = qmpCommand(inst, "migrate_cancel", nil)
+			return fmt.Errorf("migration did not complete within %s", timeout)
+		}
+		fmt.Fprintf(log, "desktop: snapshot migration %s...\n", st.Status)
+		time.Sleep(500 * time.Millisecond)
+	}
 }
 
 func freePort() (int, error) {

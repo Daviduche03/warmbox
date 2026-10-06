@@ -345,9 +345,12 @@ deploy/omarchy      the EFI engine: Omarchy image build + provisioning
 
 Solid and used daily: the XFCE/LXQt desktops over noVNC, the warm pool,
 accounts and workspaces, volumes with snapshots and clones, image build/pack/
-pull, and the agent's `exec` and file APIs. Experimental: `warmbox-app` and the
+pull, and the agent's `exec` and file APIs. Memory checkpoints are solid on
+Linux/KVM (`checkpoint`, `restore`, `hibernate`, `wake` — restore runs in
+about a second where booting takes nine). Experimental: `warmbox-app` and the
 `/p/` port proxy. Not built yet: TTY and screenshot/input on the agent API, EFI
-images anywhere but macOS, memory snapshots, and GPU or audio.
+images anywhere but macOS, memory checkpoints on macOS (vfkit can't save VM
+state), and GPU or audio.
 
 ## Limitations
 

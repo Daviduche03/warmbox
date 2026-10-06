@@ -139,6 +139,15 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/desktops/{id}/resume", s.resume)
 	mux.HandleFunc("POST /api/desktops/{id}/policy", s.setDesktopPolicy)
 
+	// Memory checkpoints: live RAM+device snapshots on disk, restorable
+	// without booting (qemu backend; see docs/snapshots.md).
+	mux.HandleFunc("POST /api/desktops/{id}/checkpoint", s.checkpoint)
+	mux.HandleFunc("GET /api/desktops/{id}/checkpoints", s.checkpoints)
+	mux.HandleFunc("DELETE /api/desktops/{id}/checkpoints/{name}", s.checkpointDelete)
+	mux.HandleFunc("POST /api/desktops/{id}/restore", s.restore)
+	mux.HandleFunc("POST /api/desktops/{id}/hibernate", s.hibernate)
+	mux.HandleFunc("POST /api/desktops/{id}/wake", s.wake)
+
 	// Agent API: exec + files inside the guest (proxied to warmbox-agent).
 	mux.HandleFunc("POST /api/desktops/{id}/exec", s.agentExec)
 	mux.HandleFunc("GET /api/desktops/{id}/files", s.agentFiles)
@@ -995,6 +1004,139 @@ func (s *Server) resume(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "running", "id": id})
 }
 
+// leasedVM is visibleVM plus the pool rule: warm-pool capacity is the daemon's
+// spare, not a desktop, so state-layer operations refuse it like pause does.
+func (s *Server) leasedVM(w http.ResponseWriter, r *http.Request, id string) (*desktop.VM, bool) {
+	vm, ok := s.visibleVM(w, r, id)
+	if !ok {
+		return nil, false
+	}
+	if vm.Info().Workspace == "" {
+		writeJSON(w, http.StatusConflict, map[string]string{
+			"error": "that vm is warm-pool capacity, not one of your desktops",
+		})
+		return nil, false
+	}
+	return vm, true
+}
+
+// checkpoint live-snapshots a desktop's memory to disk; the guest keeps
+// running. Body: {"name": "..."} (optional — the daemon names it by time).
+func (s *Server) checkpoint(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if _, ok := s.leasedVM(w, r, id); !ok {
+		return
+	}
+	var req struct {
+		Name string `json:"name"`
+	}
+	if r.Body != nil {
+		_ = json.NewDecoder(r.Body).Decode(&req)
+	}
+	t0 := time.Now()
+	info, err := s.mgr.Checkpoint(id, req.Name)
+	if err != nil {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"name": info.Name, "size": info.Size, "created": info.Created,
+		"image": info.Image, "checkpoint_ms": time.Since(t0).Milliseconds(),
+	})
+}
+
+// checkpoints lists a desktop's memory checkpoints, oldest first.
+func (s *Server) checkpoints(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if _, ok := s.leasedVM(w, r, id); !ok {
+		return
+	}
+	snaps, err := s.mgr.Snapshots(id)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"checkpoints": snaps})
+}
+
+// checkpointDelete removes one named checkpoint.
+func (s *Server) checkpointDelete(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if _, ok := s.leasedVM(w, r, id); !ok {
+		return
+	}
+	if err := s.mgr.DeleteSnapshot(id, r.PathValue("name")); err != nil {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted", "id": id})
+}
+
+// restore rolls a desktop back to a checkpoint, in place: same id, workspace
+// and volume, guest uptime continuing. Body: {"name": "..."} (optional —
+// defaults to the most recent checkpoint).
+func (s *Server) restore(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if _, ok := s.leasedVM(w, r, id); !ok {
+		return
+	}
+	var req struct {
+		Name string `json:"name"`
+	}
+	if r.Body != nil {
+		_ = json.NewDecoder(r.Body).Decode(&req)
+	}
+	t0 := time.Now()
+	vm, err := s.mgr.Restore(id, req.Name)
+	if err != nil {
+		s.fail(w, http.StatusInternalServerError, "could not restore that desktop", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status": "restored", "id": vm.ID, "restore_ms": time.Since(t0).Milliseconds(),
+	})
+}
+
+// hibernate checkpoints a desktop and stops its process: no RAM, no CPU, with
+// the record kept for wake. Destroy is what deletes; hibernate is what sleeps.
+func (s *Server) hibernate(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	vm, ok := s.leasedVM(w, r, id)
+	if !ok {
+		return
+	}
+	if err := s.mgr.Hibernate(id); err != nil {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+		return
+	}
+	info := vm.Info()
+	if s.catalog != nil {
+		s.recordDesktop(id, info.Volume, "hibernated", info.GuestIP, 0, info.Workspace)
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "hibernated", "id": id})
+}
+
+// wake restores a hibernated desktop from its hibernate checkpoint.
+func (s *Server) wake(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if _, ok := s.leasedVM(w, r, id); !ok {
+		return
+	}
+	t0 := time.Now()
+	vm, err := s.mgr.Wake(id)
+	if err != nil {
+		s.fail(w, http.StatusInternalServerError, "could not wake that desktop", err)
+		return
+	}
+	info := vm.Info()
+	if s.catalog != nil {
+		s.recordDesktop(id, info.Volume, "ready", info.GuestIP, 0, info.Workspace)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status": "awake", "id": vm.ID, "restore_ms": time.Since(t0).Milliseconds(),
+	})
+}
+
 func (s *Server) ready(w http.ResponseWriter, r *http.Request) {
 	id := r.URL.Query().Get("id")
 	ip := r.URL.Query().Get("ip")
@@ -1044,6 +1186,10 @@ func (s *Server) websockify(w http.ResponseWriter, r *http.Request) {
 func (s *Server) agentProxy(w http.ResponseWriter, r *http.Request, id, agentPath string) {
 	vm, ok := s.visibleVM(w, r, id)
 	if !ok {
+		return
+	}
+	if vm.Info().State == desktop.StateHibernated {
+		http.Error(w, "desktop is hibernated — wake it first", http.StatusConflict)
 		return
 	}
 	target := vm.Target(s.cfg.AgentPort)

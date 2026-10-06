@@ -24,7 +24,11 @@ const (
 	// StatePaused is a frozen VM: its vCPUs are stopped but its memory is
 	// still held by the host process (pause saves CPU, not RAM).
 	StatePaused State = "paused"
-	StateDead   State = "dead"
+	// StateHibernated is a VM whose process is gone but whose memory lives on
+	// in a checkpoint file: no RAM, no CPU, resumable with Wake. Hibernate is
+	// the state-layer answer to the pool's RAM cost.
+	StateHibernated State = "hibernated"
+	StateDead       State = "dead"
 )
 
 // VM is a single guest microVM managed by the orchestrator.
@@ -53,6 +57,11 @@ type VM struct {
 	// endpoint used to pause and resume it.
 	inst *Instance
 	dir  string
+	// launch is the spec this VM booted from, kept so a restore can relaunch
+	// the identical machine (same image, disks, shares, cmdline) with only an
+	// -incoming URI added. image names the guest image for checkpoint metadata.
+	launch LaunchSpec
+	image  string
 	// pausedFrom remembers the state to restore when a paused VM resumes.
 	pausedFrom State
 	ready      chan struct{}

@@ -179,9 +179,16 @@ func (c *Config) VMDir(id string) string {
 	return filepath.Join(c.WorkDir, "vms", id)
 }
 
+// SnapshotDir returns the directory holding a VM's memory checkpoints. Each
+// checkpoint is RAM contents (guest secrets included), so the directory is
+// created 0700 like the VM directories.
+func (c *Config) SnapshotDir(id string) string {
+	return filepath.Join(c.WorkDir, "snapshots", id)
+}
+
 // EnsureDirs creates the working directories.
 func (c *Config) EnsureDirs() error {
-	dirs := []string{c.WorkDir, filepath.Join(c.WorkDir, "vms")}
+	dirs := []string{c.WorkDir, filepath.Join(c.WorkDir, "vms"), filepath.Join(c.WorkDir, "snapshots")}
 	if c.VolumeDir != "" {
 		dirs = append(dirs, c.VolumeDir)
 	}

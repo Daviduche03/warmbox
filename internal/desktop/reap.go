@@ -36,6 +36,19 @@ func Reap(cfg *Config, log io.Writer) int {
 		}
 		_ = os.RemoveAll(dir)
 	}
+	// A restart is a clean slate (running VMs are killed above, and the new
+	// manager starts with no records), so memory checkpoints are unrestorable
+	// by definition: their VMs are gone. Hibernated desktops do not survive a
+	// restart either — same rule as running ones. Clear them rather than
+	// leaking RAM-sized files with live guest secrets inside.
+	if snaps, err := os.ReadDir(filepath.Join(cfg.WorkDir, "snapshots")); err == nil {
+		for _, e := range snaps {
+			_ = os.RemoveAll(filepath.Join(cfg.WorkDir, "snapshots", e.Name()))
+		}
+		if len(snaps) > 0 {
+			fmt.Fprintf(log, "warmbox: cleared %d leftover snapshot(s) from a previous run\n", len(snaps))
+		}
+	}
 	return reaped
 }
 

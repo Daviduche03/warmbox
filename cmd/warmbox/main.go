@@ -78,6 +78,16 @@ func main() {
 		cmdList(os.Args[2:])
 	case "destroy":
 		cmdDestroy(os.Args[2:])
+	case "checkpoint":
+		cmdCheckpoint(os.Args[2:])
+	case "checkpoints":
+		cmdCheckpoints(os.Args[2:])
+	case "restore":
+		cmdRestore(os.Args[2:])
+	case "hibernate":
+		cmdHibernate(os.Args[2:])
+	case "wake":
+		cmdWake(os.Args[2:])
 	case "volume":
 		cmdVolume(os.Args[2:])
 	case "snapshot":
@@ -194,6 +204,13 @@ Usage:
   warmbox image list        List the local images (offline)
   warmbox list              List desktops
   warmbox destroy <id>      Destroy a desktop
+  warmbox checkpoint <id> [name]
+                            Save a desktop's live memory to disk (keeps running)
+  warmbox checkpoints <id>  List a desktop's memory checkpoints
+  warmbox restore <id> [name]
+                            Roll a desktop back to a checkpoint, in place
+  warmbox hibernate <id>    Checkpoint a desktop and stop it (no RAM, no CPU)
+  warmbox wake <id>         Resume a hibernated desktop from its checkpoint
   warmbox version           Print the version
 
   warmbox volume create <name> [--size 8G] [--from <name>] [--from-snapshot <id>]
@@ -2232,6 +2249,180 @@ func cmdDestroy(args []string) {
 		fatal("destroy failed: %s", resp.Status)
 	}
 	fmt.Fprintf(os.Stderr, "destroyed %s\n", rest[0])
+}
+
+// --- memory checkpoints (live RAM snapshots; qemu backend) ---
+
+func checkpointFlags(args []string, name string) (addr, token string, rest []string) {
+	addr = ":7070"
+	token = tokenDefault()
+	fs := flag.NewFlagSet(name, flag.ExitOnError)
+	fs.StringVar(&addr, "addr", addr, "daemon API address")
+	fs.StringVar(&token, "token", token, "user API token (or `warmbox login` first)")
+	rest = parseInterspersed(fs, args)
+	return addr, token, rest
+}
+
+// apiErr reads the daemon's {"error": ...} body, falling back to the status.
+func apiErr(resp *http.Response) string {
+	var e struct {
+		Error string `json:"error"`
+	}
+	if json.NewDecoder(resp.Body).Decode(&e) == nil && e.Error != "" {
+		return e.Error
+	}
+	return resp.Status
+}
+
+func cmdCheckpoint(args []string) {
+	addr, token, rest := checkpointFlags(args, "checkpoint")
+	if len(rest) < 1 || len(rest) > 2 {
+		fatal("Usage: warmbox checkpoint <id> [name]")
+	}
+	req := map[string]string{}
+	if len(rest) > 1 {
+		req["name"] = rest[1]
+	}
+	var body io.Reader
+	if len(req) > 0 {
+		b, _ := json.Marshal(req)
+		body = strings.NewReader(string(b))
+	}
+	resp, err := postAuthed(withToken(apiBase(addr)+"/api/desktops/"+rest[0]+"/checkpoint", token), "application/json", body)
+	if err != nil {
+		fatal("Error: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		fatal("checkpoint failed: %s", apiErr(resp))
+	}
+	var out struct {
+		Name         string `json:"name"`
+		Size         int64  `json:"size"`
+		CheckpointMs int64  `json:"checkpoint_ms"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		fatal("Error decoding response: %v", err)
+	}
+	fmt.Fprintf(os.Stderr, "checkpointed %s as %q (%d bytes in %dms, still running)\n",
+		rest[0], out.Name, out.Size, out.CheckpointMs)
+}
+
+func cmdCheckpoints(args []string) {
+	addr, token, rest := checkpointFlags(args, "checkpoints")
+	if len(rest) < 1 {
+		fatal("Usage: warmbox checkpoints <id> | warmbox checkpoints rm <id> <name>")
+	}
+	if rest[0] == "rm" {
+		if len(rest) != 3 {
+			fatal("Usage: warmbox checkpoints rm <id> <name>")
+		}
+		req, _ := http.NewRequest(http.MethodDelete, withToken(apiBase(addr)+"/api/desktops/"+rest[1]+"/checkpoints/"+rest[2], token), nil)
+		resp, err := doAuthed(req)
+		if err != nil {
+			fatal("Error: %v", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			fatal("delete failed: %s", apiErr(resp))
+		}
+		fmt.Fprintf(os.Stderr, "deleted checkpoint %q of %s\n", rest[2], rest[1])
+		return
+	}
+	if len(rest) != 1 {
+		fatal("Usage: warmbox checkpoints <id> | warmbox checkpoints rm <id> <name>")
+	}
+	resp, err := getAuthed(withToken(apiBase(addr)+"/api/desktops/"+rest[0]+"/checkpoints", token))
+	if err != nil {
+		fatal("Error: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		fatal("list failed: %s", apiErr(resp))
+	}
+	var out struct {
+		Checkpoints []struct {
+			Name    string `json:"name"`
+			Size    int64  `json:"size"`
+			Created string `json:"created"`
+			Image   string `json:"image"`
+		} `json:"checkpoints"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		fatal("Error decoding response: %v", err)
+	}
+	if len(out.Checkpoints) == 0 {
+		fmt.Fprintf(os.Stderr, "%s has no checkpoints\n", rest[0])
+		return
+	}
+	for _, c := range out.Checkpoints {
+		fmt.Fprintf(os.Stdout, "%s  %d bytes  %s  %s\n", c.Name, c.Size, c.Created, c.Image)
+	}
+}
+
+func cmdRestore(args []string) {
+	addr, token, rest := checkpointFlags(args, "restore")
+	if len(rest) < 1 || len(rest) > 2 {
+		fatal("Usage: warmbox restore <id> [name]  (no name: most recent checkpoint)")
+	}
+	req := map[string]string{}
+	if len(rest) > 1 {
+		req["name"] = rest[1]
+	}
+	var body io.Reader
+	if len(req) > 0 {
+		b, _ := json.Marshal(req)
+		body = strings.NewReader(string(b))
+	}
+	resp, err := postAuthed(withToken(apiBase(addr)+"/api/desktops/"+rest[0]+"/restore", token), "application/json", body)
+	if err != nil {
+		fatal("Error: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		fatal("restore failed: %s", apiErr(resp))
+	}
+	var out struct {
+		RestoreMs int64 `json:"restore_ms"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&out)
+	fmt.Fprintf(os.Stderr, "restored %s in %dms (same desktop, guest uptime continues)\n", rest[0], out.RestoreMs)
+}
+
+func cmdHibernate(args []string) {
+	addr, token, rest := checkpointFlags(args, "hibernate")
+	if len(rest) != 1 {
+		fatal("Usage: warmbox hibernate <id>")
+	}
+	resp, err := postAuthed(withToken(apiBase(addr)+"/api/desktops/"+rest[0]+"/hibernate", token), "", nil)
+	if err != nil {
+		fatal("Error: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		fatal("hibernate failed: %s", apiErr(resp))
+	}
+	fmt.Fprintf(os.Stderr, "hibernated %s (no RAM, no CPU — wake it with: warmbox wake %s)\n", rest[0], rest[0])
+}
+
+func cmdWake(args []string) {
+	addr, token, rest := checkpointFlags(args, "wake")
+	if len(rest) != 1 {
+		fatal("Usage: warmbox wake <id>")
+	}
+	resp, err := postAuthed(withToken(apiBase(addr)+"/api/desktops/"+rest[0]+"/wake", token), "", nil)
+	if err != nil {
+		fatal("Error: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		fatal("wake failed: %s", apiErr(resp))
+	}
+	var out struct {
+		RestoreMs int64 `json:"restore_ms"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&out)
+	fmt.Fprintf(os.Stderr, "woke %s in %dms\n", rest[0], out.RestoreMs)
 }
 
 // --- volumes ---
