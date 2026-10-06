@@ -17,19 +17,25 @@ import { uptime } from "@/lib/format";
 import type { Desktop } from "@/lib/types";
 import {
 	ArrowSquareOut as SquareArrowOutUpRightIcon,
+	Camera as CameraIcon,
 	Globe as GlobeIcon,
+	Moon as MoonIcon,
 	Pause as PauseIcon,
 	Play as PlayIcon,
+	Sun as SunIcon,
 	Trash as TrashIcon,
 } from "@phosphor-icons/react";
 
 type Props = {
 	desktops: Desktop[];
-	/** Failure of the last destroy/pause/resume, shown above the list. */
+	/** Failure of the last destroy/pause/resume/checkpoint/hibernate, shown above the list. */
 	error?: string;
 	onOpen: (id: string) => void;
 	onPause: (id: string) => void;
 	onResume: (id: string) => void;
+	onHibernate: (id: string) => void;
+	onWake: (id: string) => void;
+	onCheckpoint: (id: string) => void;
 	onPolicy: (d: Desktop) => void;
 	onDestroy: (id: string) => void;
 };
@@ -41,6 +47,9 @@ export function DesktopTable({
 	onOpen,
 	onPause,
 	onResume,
+	onHibernate,
+	onWake,
+	onCheckpoint,
 	onPolicy,
 	onDestroy,
 }: Props) {
@@ -104,7 +113,9 @@ export function DesktopTable({
 											) : (
 												<DropdownMenuItem
 													disabled={
-														d.state === "dead" || d.state === "paused"
+														d.state === "dead" ||
+														d.state === "paused" ||
+														d.state === "hibernated"
 													}
 													onSelect={() => onOpen(d.id)}
 												>
@@ -117,16 +128,41 @@ export function DesktopTable({
 													<PlayIcon />
 													Resume
 												</DropdownMenuItem>
-											) : (
-												<DropdownMenuItem
-													disabled={
-														d.state === "booting" || d.state === "dead"
-													}
-													onSelect={() => onPause(d.id)}
-												>
-													<PauseIcon />
-													Pause
+											) : d.state === "hibernated" ? (
+												<DropdownMenuItem onSelect={() => onWake(d.id)}>
+													<SunIcon />
+													Wake
 												</DropdownMenuItem>
+											) : (
+												<>
+													<DropdownMenuItem
+														disabled={
+															d.state === "booting" || d.state === "dead"
+														}
+														onSelect={() => onPause(d.id)}
+													>
+														<PauseIcon />
+														Pause
+													</DropdownMenuItem>
+													<DropdownMenuItem
+														disabled={
+															d.state === "booting" || d.state === "dead"
+														}
+														onSelect={() => onHibernate(d.id)}
+													>
+														<MoonIcon />
+														Hibernate
+													</DropdownMenuItem>
+													<DropdownMenuItem
+														disabled={
+															d.state === "booting" || d.state === "dead"
+														}
+														onSelect={() => onCheckpoint(d.id)}
+													>
+														<CameraIcon />
+														Checkpoint now
+													</DropdownMenuItem>
+												</>
 											)}
 											<DropdownMenuItem onSelect={() => onPolicy(d)}>
 												<GlobeIcon />

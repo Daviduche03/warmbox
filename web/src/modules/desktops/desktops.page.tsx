@@ -54,6 +54,36 @@ export function DesktopsPage() {
 		}
 	}
 
+	async function hibernate(id: string) {
+		setError(undefined);
+		try {
+			await api.desktops.hibernate(id);
+			await refresh();
+		} catch (e) {
+			setError(e instanceof Error ? e.message : "hibernate failed");
+		}
+	}
+
+	async function wake(id: string) {
+		setError(undefined);
+		try {
+			await api.desktops.wake(id);
+			await refresh();
+		} catch (e) {
+			setError(e instanceof Error ? e.message : "wake failed");
+		}
+	}
+
+	async function checkpoint(id: string) {
+		setError(undefined);
+		try {
+			await api.desktops.checkpoint(id);
+			await refresh();
+		} catch (e) {
+			setError(e instanceof Error ? e.message : "checkpoint failed");
+		}
+	}
+
 	function open(id: string) {
 		window.open(`/d/${id}`, "_blank", "noopener");
 	}
@@ -68,7 +98,7 @@ export function DesktopsPage() {
 					</Button>
 				}
 				badge={<Badge variant="secondary">{desktops.length}</Badge>}
-				desc="MicroVMs managed by this daemon. Creating one boots it into the pool. Pause keeps a desktop's memory; Destroy frees it."
+				desc="MicroVMs managed by this daemon. Pause freezes one in place; Hibernate checkpoints it to disk and frees its RAM; Destroy frees it."
 				title="Desktops"
 			/>
 			<DesktopTable
@@ -77,11 +107,14 @@ export function DesktopsPage() {
 				onDestroy={setPendingDestroy}
 				onOpen={open}
 				onPause={(id) => void pause(id)}
+				onResume={(id) => void resume(id)}
+				onHibernate={(id) => void hibernate(id)}
+				onWake={(id) => void wake(id)}
+				onCheckpoint={(id) => void checkpoint(id)}
 				onPolicy={(d) => {
 					setPolicyFor(d.id);
 					setPolicyInitial({ allow: joinList(d.allow), deny: joinList(d.deny) });
 				}}
-				onResume={(id) => void resume(id)}
 			/>
 			<NewDesktopDialog onClose={setCreating} open={creating} />
 			{policyFor ? (

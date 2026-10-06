@@ -10,6 +10,7 @@ const tone: Record<DesktopState, StatusIndicatorProps["color"]> = {
 	busy: "sky",
 	booting: "amber",
 	paused: "slate",
+	hibernated: "violet",
 	dead: "rose",
 };
 

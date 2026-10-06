@@ -17,6 +17,7 @@ const statusIndicatorVariants = cva(
 				amber: "text-amber-500",
 				sky: "text-sky-500",
 				slate: "text-slate-400 dark:text-slate-500",
+				violet: "text-violet-500",
 			},
 			pulse: {
 				true: "[&_[data-slot=indicator-ping]]:animate-ping",

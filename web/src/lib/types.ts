@@ -1,7 +1,7 @@
 // The JSON shapes the daemon serves. Mirrors internal/api/server.go,
 // internal/catalog and internal/desktop — keep these in step with the Go.
 
-export type DesktopState = "booting" | "ready" | "busy" | "paused" | "dead";
+export type DesktopState = "booting" | "ready" | "busy" | "paused" | "hibernated" | "dead";
 
 export interface Desktop {
   id: string;
