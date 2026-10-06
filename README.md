@@ -236,6 +236,12 @@ There are also background/streaming runs (`/runs`) and interactive sessions
 would put an agent inside a machine. Design and roadmap:
 [`docs/agent-api.md`](docs/agent-api.md).
 
+For agents written in Python or TypeScript, the [Python client](sdk/python) and
+[TypeScript client](sdk/typescript) handle API tokens, workspace headers, desktop
+lifecycle, commands, binary files, runs and session streams. Both can be installed
+from this checkout; npm and PyPI publication is pending. Each client README has
+an install command and a complete create/exec/destroy example.
+
 ## Running it day to day
 
 **The daemon** serves the dashboard and the API on `127.0.0.1:7070` by default.
