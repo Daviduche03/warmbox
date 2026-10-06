@@ -1,0 +1,67 @@
+name: publish-sdk
+
+# Publishes the Python + TypeScript clients on release tags via OIDC trusted
+# publishing: no API tokens anywhere. Each registry trusts THIS file by name,
+# so do not rename it without updating both registries.
+#
+# One-time registry setup (the release after this file lands):
+#   PyPI  (project settings > Trusted Publishers > Add):
+#     project=warmbox, owner=Daviduche03, repo=warmbox,
+#     workflow=publish-sdk.yml, environment empty.
+#     The first publish creates the project; both names are currently free.
+#   npm (package settings > Trusted Publisher):
+#     same coordinates (GitHub Actions publisher). If the first publish
+#     refuses a brand-new package, publish once by hand, then OIDC after.
+#
+# Versions: sdk/*/ versions must equal the tag (checked below — the publish
+# fails otherwise), so bump them in the release-prep commit like the docs
+# versions. Every release therefore ships clients too: one version everywhere.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  pypi:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdk/python
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - name: Version must match the tag
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          ver=$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml","rb"))["project"]["version"])')
+          [ "$ver" = "$tag" ] || { echo "pyproject $ver != tag $tag: bump sdk versions first"; exit 1; }
+      - run: python -m unittest discover -s tests
+      - run: python -m pip install build
+      - run: python -m build
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  npm:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdk/typescript
+    steps:
+      - uses: actions/checkout@v7
+      - name: Version must match the tag
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          ver=$(node -p 'require("./package.json").version')
+          [ "$ver" = "$tag" ] || { echo "package.json $ver != tag $tag: bump sdk versions first"; exit 1; }
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - run: npm ci
+      - run: npm test
+      - run: npm publish --provenance --access public
