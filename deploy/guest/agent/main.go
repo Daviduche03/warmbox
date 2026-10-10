@@ -37,6 +37,14 @@ func envOr(k, d string) string {
 
 func main() {
 	root = filepath.Clean(root)
+	// The guest init starts this process with SIGINT ignored; without the
+	// reset every child would inherit an uninterruptible Ctrl-C (see
+	// resetsignals). A failure here is fatal: silently continuing would
+	// boot an image whose shells cannot be interrupted.
+	if err := resetsignals(); err != nil {
+		fmt.Fprintln(os.Stderr, "warmbox-agent: reset signals:", err)
+		os.Exit(1)
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "ok") })
 	mux.HandleFunc("POST /exec", handleExec)
@@ -52,6 +60,7 @@ func main() {
 	// Sessions: a run of an interactive shell (cwd/env persist across inputs).
 	mux.HandleFunc("POST /sessions", handleSessionCreate)
 	mux.HandleFunc("POST /sessions/{id}/input", handleSessionInput)
+	mux.HandleFunc("POST /sessions/{id}/resize", handleSessionResize)
 	mux.HandleFunc("GET /sessions/{id}/output", handleRunStream)
 	mux.HandleFunc("GET /sessions/{id}", handleRunGet)
 	mux.HandleFunc("DELETE /sessions/{id}", handleRunKill)

@@ -20,6 +20,8 @@ func newTestMux() *http.ServeMux {
 	mux.HandleFunc("DELETE /runs/{id}", handleRunKill)
 	mux.HandleFunc("POST /sessions", handleSessionCreate)
 	mux.HandleFunc("POST /sessions/{id}/input", handleSessionInput)
+	mux.HandleFunc("POST /sessions/{id}/resize", handleSessionResize)
+	mux.HandleFunc("GET /sessions/{id}", handleRunGet)
 	mux.HandleFunc("GET /sessions/{id}/output", handleRunStream)
 	return mux
 }

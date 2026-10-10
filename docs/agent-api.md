@@ -117,11 +117,20 @@ A session is a run of an interactive shell, so `cwd`/env/exports **persist
 across inputs** — the thing one-shot exec could never do.
 
 ```
-POST /sessions               -> {id}            (interactive shell)
-POST /sessions/{id}/input    -> write a shell line (newline appended)
+POST /sessions               -> {id, pty}       (interactive shell)
+POST /sessions/{id}/input    -> write a shell line (newline appended),
+                                 or raw bytes when the session has a pty
+POST /sessions/{id}/resize   -> {cols, rows} (terminal sessions only)
 GET  /sessions/{id}/output   -> SSE stream
 DELETE /sessions/{id}        -> kill
 ```
+
+Create takes `{"shell", "cwd", "env"}` plus, for a real terminal,
+`{"pty": true, "cols", "rows"}`. The agent allocates a pseudoterminal
+(Linux guests), runs the shell with the slave as its controlling tty, and
+answers `"pty": true`; `TERM` comes from `env` (default `xterm-256color`)
+and defaults to 80x24. A client that asked for a pty and did not get one is
+talking to an old agent: fall back to line mode or rebuild the image.
 
 **Sessions are runs**, not a separate mechanism: they live in the same registry,
 so a session's id also works everywhere a run id does. Concretely, the session
@@ -134,11 +143,21 @@ routes are sugar over the run routes:
 | `GET /sessions/{id}` | `GET /runs/{id}` (same handler) |
 | `DELETE /sessions/{id}` | `DELETE /runs/{id}` (same handler) |
 
-So the only genuine difference is the newline (and that `POST /sessions` starts
-`/bin/sh` instead of your command). If you want raw bytes to a process, use
-`/runs/{id}/stdin`; if you want to *type at a shell*, use `/sessions/{id}/input`.
-Both are kept: the raw form is what a program's stdin needs, the line form is
-what a person means.
+So the genuine differences are the newline and the terminal: a pipe session
+takes shell lines (`POST /sessions/{id}/input` appends `\n`), while a pty
+session takes raw bytes — the local terminal is in raw mode, so every
+keystroke including Ctrl-C as 0x03 arrives untouched and the pty line
+discipline does the rest. And `POST /sessions` starts `/bin/sh` instead of
+your command. If you want raw bytes to a process, use `/runs/{id}/stdin`;
+if you want to *type at a shell*, use `/sessions/{id}/input`; if you want a
+*terminal* (job control, cursor addressing, resize, full-screen programs),
+create the session with `pty: true` and drive `/resize`. All three are kept
+because they mean different things: program stdin, person typing, terminal.
+
+Ctrl-C works because the agent resets job-control signals to default at
+startup: the guest init runs with SIGINT ignored, and an ignored disposition
+survives `exec` into every child. Without the reset, every shell — and
+everything it runs — would inherit an uninterruptible interrupt.
 
 Everything is scoped to the desktop (and therefore to the desktop's workspace):
 the daemon proxies it through the same `visibleVM` check as `exec`, and no new
@@ -170,7 +189,9 @@ Today `exec` is one-shot. Planned, in priority order:
   to a session.
 
 **Tier 2**
-- `tty: true` (correct output for tools that check `isatty`).
+- ✅ `pty: true` — real pseudoterminal sessions: `test -t` passes, window
+  size via `POST /sessions/{id}/resize`, job control and full-screen
+  programs work (`warmbox connect` uses it when both sides support it).
 - shell selection (`sh`/`bash`).
 - binary-safe output (`encoding: "base64"`).
 - richer result: `signal`, `truncated`, `stdout_bytes`/`stderr_bytes`.

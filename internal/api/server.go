@@ -168,6 +168,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/desktops/{id}/sessions/{run}", s.agentRunGet)
 	mux.HandleFunc("GET /api/desktops/{id}/sessions/{run}/output", s.agentSessionOutput)
 	mux.HandleFunc("POST /api/desktops/{id}/sessions/{run}/input", s.agentSessionInput)
+	mux.HandleFunc("POST /api/desktops/{id}/sessions/{run}/resize", s.agentSessionResize)
 	mux.HandleFunc("DELETE /api/desktops/{id}/sessions/{run}", s.agentRunKill)
 
 	// Volumes: portable, cloud-backed disks.
@@ -1262,6 +1263,9 @@ func (s *Server) agentSessionCreate(w http.ResponseWriter, r *http.Request) {
 }
 func (s *Server) agentSessionInput(w http.ResponseWriter, r *http.Request) {
 	s.agentProxy(w, r, r.PathValue("id"), "/sessions/"+r.PathValue("run")+"/input")
+}
+func (s *Server) agentSessionResize(w http.ResponseWriter, r *http.Request) {
+	s.agentProxy(w, r, r.PathValue("id"), "/sessions/"+r.PathValue("run")+"/resize")
 }
 func (s *Server) agentSessionOutput(w http.ResponseWriter, r *http.Request) {
 	s.agentProxy(w, r, r.PathValue("id"), "/sessions/"+r.PathValue("run")+"/output")

@@ -28,6 +28,8 @@ import (
 
 	"golang.org/x/term"
 
+	"golang.org/x/sys/unix"
+
 	_ "github.com/rclone/rclone/backend/all"
 	rfs "github.com/rclone/rclone/fs"
 
@@ -208,6 +210,7 @@ Usage:
   warmbox list              List desktops
   warmbox destroy <id>      Destroy a desktop
   warmbox connect <id>      Open an interactive shell inside a desktop
+                            (full terminal when the image supports it)
   warmbox checkpoint <id> [name]
                             Save a desktop's live memory to disk (keeps running)
   warmbox checkpoints <id>  List a desktop's memory checkpoints
@@ -2431,12 +2434,13 @@ func cmdWake(args []string) {
 
 // --- connect: an interactive shell inside a desktop ---
 //
-// The guest agent runs /bin/sh with its stdin held open (a session) and
+// The guest agent runs a shell with its stdin held open (a session) and
 // streams everything it prints as Server-Sent Events. Connect wires those to
-// this terminal: stdin lines go in, output comes out. There is no PTY on the
-// guest side, so this is line-oriented, not raw: type a line, see its output.
-// Ctrl-C ends the session (there is no job control to interrupt into),
-// Ctrl-D or `exit` leaves it cleanly.
+// this terminal. With a terminal on this side and a new enough image on the
+// other, the session gets a real pseudoterminal: raw mode, cursor addressing,
+// job control, resize — opencode, vim and friends work. Otherwise (piped
+// input, or an image predating pty support) it falls back to line mode:
+// type a line, see its output. Ctrl-D or `exit` leaves cleanly either way.
 func cmdConnect(args []string) {
 	addr := ":7070"
 	token := tokenDefault()
@@ -2451,15 +2455,29 @@ func cmdConnect(args []string) {
 	}
 	id := rest[0]
 	base := withToken(apiBase(addr)+"/api/desktops/"+id+"/sessions", token)
+	interactive := term.IsTerminal(int(os.Stdin.Fd()))
 
-	// 1. Start the session.
-	createBody, _ := json.Marshal(map[string]string{"shell": shell})
+	// 1. Start the session, asking for a terminal when we have one to offer.
+	createReq := map[string]any{"shell": shell}
+	if interactive {
+		cols, rows := terminalSize(int(os.Stdin.Fd()))
+		termEnv := os.Getenv("TERM")
+		if termEnv == "" {
+			termEnv = "xterm-256color"
+		}
+		createReq["pty"] = true
+		createReq["cols"] = cols
+		createReq["rows"] = rows
+		createReq["env"] = map[string]string{"TERM": termEnv}
+	}
+	createBody, _ := json.Marshal(createReq)
 	resp, err := postAuthed(base, "application/json", strings.NewReader(string(createBody)))
 	if err != nil {
 		fatal("Error: %v", err)
 	}
 	var created struct {
-		ID string `json:"id"`
+		ID  string `json:"id"`
+		Pty bool   `json:"pty"`
 	}
 	if resp.StatusCode != http.StatusCreated {
 		msg := apiErr(resp)
@@ -2493,22 +2511,34 @@ func cmdConnect(args []string) {
 		}
 	}
 
-	interactive := term.IsTerminal(int(os.Stdin.Fd()))
+	if interactive && created.Pty {
+		connectRaw(id, sessURL, token, cleanup)
+		return
+	}
+	if interactive {
+		fmt.Fprintln(os.Stderr, "guest agent is too old for terminal mode (rebuild the image) — line mode")
+	}
+	connectLine(id, sessURL, token, interactive, cleanup)
+}
+
+// connectLine is the fallback when either side has no terminal: stdin lines
+// go in, output comes out. The guest appends the newline, so whole lines.
+func connectLine(id, sessURL, token string, interactive bool, cleanup func()) {
 	if interactive {
 		fmt.Fprintf(os.Stderr, "connected to %s — Ctrl-D or `exit` to leave\n", id)
 	}
 
-	// 2. Stream output in the background until the shell exits.
+	// Stream output in the background until the shell exits.
 	done := make(chan int, 1) // shell exit code, once
 	go func() {
 		code := streamSession(sessURL+"/output", id)
 		done <- code
 	}()
 
-	// 3. Feed stdin lines to the shell. Ctrl-C kills the session and exits
+	// Feed stdin lines to the shell. Ctrl-C kills the session and exits
 	// (there is no foreground process group to interrupt into).
 	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 	go func() {
 		<-sig
 		fmt.Fprintln(os.Stderr)
@@ -2518,28 +2548,174 @@ func cmdConnect(args []string) {
 
 	reader := bufio.NewReader(os.Stdin)
 	prompt := id + "$ "
-	for {
-		if interactive {
-			fmt.Fprint(os.Stdout, prompt)
-		}
-		line, err := reader.ReadString('\n')
-		if line != "" {
-			if perr := postSessionInput(sessURL+"/input", token, line); perr != nil {
-				fmt.Fprintf(os.Stderr, "\nsession gone: %v\n", perr)
-				cleanup()
-				os.Exit(1)
+	// stdinResult carries one line (or read error) from the reader goroutine.
+	// The reader runs detached because stdin can outlive the shell: once the
+	// user types `exit`, done fires while a Read is still blocked, and the
+	// loop must notice without waiting for another keystroke.
+	type stdinResult struct {
+		line string
+		err  error
+	}
+	inch := make(chan stdinResult)
+	go func() {
+		for {
+			line, err := reader.ReadString('\n')
+			if line != "" {
+				inch <- stdinResult{line: line}
+			}
+			if err != nil {
+				inch <- stdinResult{err: err}
+				return
 			}
 		}
-		if err != nil { // EOF (or a real read error): leave cleanly
-			postSessionInput(sessURL+"/input", token, "exit\n")
-			break
+	}()
+	if interactive {
+		fmt.Fprint(os.Stdout, prompt)
+	}
+	eofSent := false
+	for {
+		select {
+		case r := <-inch:
+			if r.line != "" {
+				if perr := postSessionInput(sessURL+"/input", token, r.line); perr != nil {
+					fmt.Fprintf(os.Stderr, "\nsession gone: %v\n", perr)
+					cleanup()
+					os.Exit(1)
+				}
+				if interactive {
+					fmt.Fprint(os.Stdout, prompt)
+				}
+			}
+			if r.err != nil && !eofSent { // EOF: leave cleanly
+				eofSent = true
+				postSessionInput(sessURL+"/input", token, "exit\n")
+			}
+		case code := <-done: // the shell exited on its own (typed `exit`)
+			if code != 0 {
+				fmt.Fprintf(os.Stderr, "session ended (exit %d)\n", code)
+			}
+			return
 		}
 	}
+}
 
-	code := <-done
-	if code != 0 {
-		fmt.Fprintf(os.Stderr, "session ended (exit %d)\n", code)
+// connectRaw is the full terminal: the local tty goes raw, bytes flow both
+// ways untouched, and window changes propagate. Ctrl-C arrives as 0x03 and
+// the guest's line discipline turns it into SIGINT for whatever runs there —
+// exactly like ssh. Terminal state is always restored, including on signals
+// (os.Exit skips defers, so the signal path restores explicitly).
+func connectRaw(id, sessURL, token string, cleanup func()) {
+	fd := int(os.Stdin.Fd())
+	oldState, err := term.MakeRaw(fd)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "raw terminal failed (%v) — line mode\n", err)
+		connectLine(id, sessURL, token, true, cleanup)
+		return
 	}
+	restore := func() {
+		_ = term.Restore(fd, oldState)
+	}
+	fmt.Fprintf(os.Stderr, "connected to %s — Ctrl-D or `exit` to leave\n", id)
+
+	// Stream output in the background until the shell exits.
+	done := make(chan int, 1) // shell exit code, once
+	go func() {
+		code := streamSession(sessURL+"/output", id)
+		done <- code
+	}()
+
+	// Signals: terminal size changes propagate; everything else restores the
+	// tty, kills the session and exits.
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGWINCH, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+	go func() {
+		for s := range sig {
+			if s == syscall.SIGWINCH {
+				cols, rows := terminalSize(fd)
+				_ = postSessionResize(sessURL+"/resize", token, cols, rows)
+				continue
+			}
+			fmt.Fprintln(os.Stderr)
+			restore()
+			cleanup()
+			os.Exit(130)
+		}
+	}()
+
+	// Forward keystrokes as they arrive (small reads, no line buffering).
+	// The reader runs detached, like line mode: once the shell exits, done
+	// fires while a Read is still blocked, and the loop must notice.
+	type stdinChunk struct {
+		buf []byte
+		err error
+	}
+	inch := make(chan stdinChunk)
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			n, err := os.Stdin.Read(buf)
+			if n > 0 {
+				cp := make([]byte, n)
+				copy(cp, buf[:n])
+				inch <- stdinChunk{buf: cp}
+			}
+			if err != nil {
+				inch <- stdinChunk{err: err}
+				return
+			}
+		}
+	}()
+	eofSent := false
+	for {
+		select {
+		case c := <-inch:
+			if len(c.buf) > 0 {
+				if perr := postSessionInput(sessURL+"/input", token, string(c.buf)); perr != nil {
+					fmt.Fprintf(os.Stderr, "\nsession gone: %v\n", perr)
+					restore()
+					cleanup()
+					os.Exit(1)
+				}
+			}
+			if c.err != nil && !eofSent { // EOF (Ctrl-D): ask the shell to exit
+				eofSent = true
+				postSessionInput(sessURL+"/input", token, "exit\n")
+			}
+		case code := <-done: // the shell exited on its own
+			restore()
+			if code != 0 {
+				fmt.Fprintf(os.Stderr, "session ended (exit %d)\n", code)
+			}
+			return
+		}
+	}
+}
+
+// terminalSize reads the tty dimensions, falling back to 80x24 when the fd
+// is not a terminal or the ioctl fails (piped, CI, odd terminals).
+func terminalSize(fd int) (cols, rows int) {
+	cols, rows = 80, 24
+	if ws, err := unix.IoctlGetWinsize(fd, unix.TIOCGWINSZ); err == nil && ws != nil {
+		if ws.Col > 0 && ws.Row > 0 {
+			cols, rows = int(ws.Col), int(ws.Row)
+		}
+	}
+	return cols, rows
+}
+
+// postSessionResize tells a terminal session its new size (the guest kernel
+// raises SIGWINCH to the foreground process group itself).
+func postSessionResize(url, token string, cols, rows int) error {
+	body, _ := json.Marshal(map[string]int{"cols": cols, "rows": rows})
+	resp, err := postAuthed(withToken(url, token), "application/json", strings.NewReader(string(body)))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("%s", apiErr(resp))
+	}
+	return nil
 }
 
 // postSessionInput sends raw bytes to a session's stdin. Unlike the agent's

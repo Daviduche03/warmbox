@@ -110,6 +110,10 @@ if [ "$HAVE_VOLUME" = "1" ]; then
 fi
 
 # --- agent API (host -> guest exec/files), localhost only ---
+# NOTE: busybox `trap - SIG` does NOT reset to default here — it ignores
+# (verified: SigIgn gained SIGQUIT). Do not "fix" Ctrl-C with a trap line;
+# the agent resets its own dispositions at startup (see resetsignals in the
+# agent source), which is what its children inherit.
 /usr/local/bin/warmbox-agent >/var/log/warmbox-agent.log 2>&1 &
 log "warmbox-agent started"
 

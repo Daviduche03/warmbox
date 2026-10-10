@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -74,6 +75,31 @@ func TestPostSessionInputError(t *testing.T) {
 	err := postSessionInput(srv.URL, "", "echo hi\n")
 	if err == nil || !strings.Contains(err.Error(), "hibernated") {
 		t.Fatalf("expected the daemon error, got %v", err)
+	}
+}
+
+// postSessionResize must send cols/rows as JSON; the guest sizes itself off
+// exactly those keys.
+func TestPostSessionResize(t *testing.T) {
+	var got struct {
+		Cols int `json:"cols"`
+		Rows int `json:"rows"`
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("method = %s, want POST", r.Method)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Errorf("decode: %v", err)
+		}
+		fmt.Fprint(w, `{"status":"resized"}`)
+	}))
+	defer srv.Close()
+	if err := postSessionResize(srv.URL, "", 100, 40); err != nil {
+		t.Fatalf("resize: %v", err)
+	}
+	if got.Cols != 100 || got.Rows != 40 {
+		t.Fatalf("sent %dx%d, want 100x40", got.Cols, got.Rows)
 	}
 }
 func TestBindIsLoopback(t *testing.T) {

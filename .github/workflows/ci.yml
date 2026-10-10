@@ -18,6 +18,24 @@ jobs:
       - run: go vet ./...
       - run: go test ./...
 
+  # The guest agent is a separate module (it is baked into the guest image),
+  # so the root ./... above never touches it. It runs on Linux in
+  # production, and ubuntu-latest is Linux, so the pty tests run for real.
+  guest-agent:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: deploy/guest/agent
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: deploy/guest/agent/go.mod
+          cache: true
+      - run: go build ./...
+      - run: go vet ./...
+      - run: go test -count=1 ./...
+
   python-sdk:
     runs-on: ubuntu-latest
     strategy:

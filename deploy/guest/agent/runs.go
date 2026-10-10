@@ -33,6 +33,12 @@ type run struct {
 	cmd   *exec.Cmd
 	stdin io.WriteCloser
 
+	// pty is set for terminal sessions: master is the agent's side of the
+	// pseudoterminal (reads output, takes input, owns the window size) and
+	// the child runs with the slave as its controlling terminal.
+	pty    bool
+	master *os.File
+
 	mu        sync.Mutex
 	out       []byte // stdout+stderr, interleaved
 	truncated bool
@@ -118,6 +124,12 @@ func (r *run) finish(err error, timedOut bool) {
 	} else if err != nil {
 		r.exit = -1
 	}
+	// Releasing the master ends the output pump (reads answer EIO once every
+	// slave fd is gone) and SIGHUPs nothing — the child is already reaped.
+	if r.master != nil {
+		_ = r.master.Close()
+		r.master = nil
+	}
 }
 
 // kill terminates the whole process group.
@@ -172,6 +184,12 @@ type runReq struct {
 	Stdin       string            `json:"stdin"`
 	TimeoutMS   int               `json:"timeout_ms"`
 	MaxBytes    int64             `json:"max_bytes"`
+	// Pty runs the command under a pseudoterminal instead of pipes, so shells
+	// and full-screen programs see a real tty (TERM, resize, job control).
+	// Cols/Rows size it; 0 means the 80x24 default.
+	Pty  bool `json:"pty"`
+	Cols int  `json:"cols"`
+	Rows int  `json:"rows"`
 }
 
 func startRun(req runReq) (*run, error) {
@@ -204,25 +222,82 @@ func startRun(req runReq) (*run, error) {
 		r.maxOut = req.MaxBytes
 	}
 	r.id = newRunID()
-	cmd.Stdout, cmd.Stderr = r, r
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		return nil, err
-	}
-	r.stdin = stdin
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if req.Pty {
+		// A terminal session: the child gets the slave as stdio and
+		// controlling tty (Setsid + Setctty), the agent keeps the master.
+		// Output is pumped from the master into the run buffer by a
+		// goroutine; input writes go straight to the master.
+		master, slavePath, err := openPTY()
+		if err != nil {
+			return nil, err
+		}
+		slave, err := os.OpenFile(slavePath, os.O_RDWR, 0)
+		if err != nil {
+			master.Close()
+			return nil, fmt.Errorf("open pty slave: %w", err)
+		}
+		cmd.Stdin, cmd.Stdout, cmd.Stderr = slave, slave, slave
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true, Setctty: true, Ctty: 0}
+		cols, rows := req.Cols, req.Rows
+		if cols <= 0 {
+			cols = 80
+		}
+		if rows <= 0 {
+			rows = 24
+		}
+		if err := setWinsize(master, cols, rows); err != nil {
+			slave.Close()
+			master.Close()
+			return nil, err
+		}
+		// A terminal without TERM renders as dumb everywhere; the caller
+		// decides, the default only saves it from itself.
+		if _, ok := req.Env["TERM"]; !ok {
+			if _, ok := os.LookupEnv("TERM"); !ok {
+				cmd.Env = append(cmd.Env, "TERM=xterm-256color")
+			}
+		}
+		r.pty, r.master, r.stdin = true, master, master
+		if err := cmd.Start(); err != nil {
+			slave.Close()
+			master.Close()
+			return nil, err
+		}
+		// The parent's slave fd would keep the pty open after the child
+		// exits (no EOF, no SIGHUP on close); only the master stays.
+		slave.Close()
+		r.cmd = cmd
+		storeRun(r)
+		go func() {
+			_, _ = io.Copy(r, master)
+		}()
+	} else {
+		cmd.Stdout, cmd.Stderr = r, r
+		stdin, err := cmd.StdinPipe()
+		if err != nil {
+			return nil, err
+		}
+		r.stdin = stdin
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
-	if err := cmd.Start(); err != nil {
-		return nil, err
+		if err := cmd.Start(); err != nil {
+			return nil, err
+		}
+		r.cmd = cmd
+		storeRun(r)
 	}
-	r.cmd = cmd
-	storeRun(r)
 
 	if req.Stdin != "" {
-		_, _ = io.WriteString(stdin, req.Stdin)
+		_, _ = io.WriteString(r.stdin, req.Stdin)
 	}
 	if !req.Interactive {
-		_ = stdin.Close()
+		// For a pipe session this closes stdin (EOF to the child). For a pty
+		// session stdin is the master: never close it here — that would
+		// SIGHUP the shell. A non-interactive pty command exits on its own
+		// and finish() releases the master.
+		if !r.pty {
+			_ = r.stdin.Close()
+		}
 	}
 	if req.TimeoutMS > 0 {
 		time.AfterFunc(time.Duration(req.TimeoutMS)*time.Millisecond, func() {
@@ -371,6 +446,12 @@ func handleSessionCreate(w http.ResponseWriter, r *http.Request) {
 		Cwd   string            `json:"cwd"`
 		Env   map[string]string `json:"env"`
 		Shell string            `json:"shell"`
+		// Pty allocates a pseudoterminal (Linux guests): the shell sees a
+		// real tty, so job control, cursor addressing and full-screen
+		// programs work. Cols/Rows size it; 0 means 80x24.
+		Pty  bool `json:"pty"`
+		Cols int  `json:"cols"`
+		Rows int  `json:"rows"`
 	}
 	if r.Body != nil {
 		_ = json.NewDecoder(r.Body).Decode(&req)
@@ -378,14 +459,15 @@ func handleSessionCreate(w http.ResponseWriter, r *http.Request) {
 	if req.Shell == "" {
 		req.Shell = "/bin/sh"
 	}
-	rn, err := startRun(runReq{Cwd: req.Cwd, Env: req.Env, Shell: req.Shell, Interactive: true})
+	rn, err := startRun(runReq{Cwd: req.Cwd, Env: req.Env, Shell: req.Shell, Interactive: true,
+		Pty: req.Pty, Cols: req.Cols, Rows: req.Rows})
 	if err != nil {
 		fail(w, http.StatusBadRequest, err)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
-	_ = json.NewEncoder(w).Encode(map[string]any{"id": rn.id})
+	_ = json.NewEncoder(w).Encode(map[string]any{"id": rn.id, "pty": rn.pty})
 }
 
 func handleSessionInput(w http.ResponseWriter, r *http.Request) {
@@ -403,9 +485,11 @@ func handleSessionInput(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusInternalServerError, err)
 		return
 	}
-	// A session input is a shell line: append a newline unless it already ends
-	// with one.
-	if len(body) > 0 && body[len(body)-1] != '\n' {
+	// A terminal session takes raw bytes: the local terminal is in raw mode,
+	// so every keystroke (including Ctrl-C as 0x03) arrives here and the pty
+	// line discipline does the rest. A pipe session takes a shell line:
+	// append a newline unless it already ends with one.
+	if !rn.pty && len(body) > 0 && body[len(body)-1] != '\n' {
 		body = append(body, '\n')
 	}
 	if _, err := rn.stdin.Write(body); err != nil {
@@ -413,4 +497,32 @@ func handleSessionInput(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_, _ = io.WriteString(w, `{"status":"sent"}`)
+}
+
+// handleSessionResize sizes a terminal session (TIOCSWINSZ; the kernel raises
+// SIGWINCH to the foreground process group itself). Pipe sessions have no
+// size and answer 409.
+func handleSessionResize(w http.ResponseWriter, r *http.Request) {
+	rn := getRun(r.PathValue("id"))
+	if rn == nil {
+		fail(w, http.StatusNotFound, fmt.Errorf("unknown session"))
+		return
+	}
+	if !rn.pty || rn.master == nil {
+		fail(w, http.StatusConflict, fmt.Errorf("not a terminal session"))
+		return
+	}
+	var req struct {
+		Cols int `json:"cols"`
+		Rows int `json:"rows"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		fail(w, http.StatusBadRequest, fmt.Errorf("invalid json: %w", err))
+		return
+	}
+	if err := setWinsize(rn.master, req.Cols, req.Rows); err != nil {
+		fail(w, http.StatusBadRequest, err)
+		return
+	}
+	_, _ = io.WriteString(w, `{"status":"resized"}`)
 }
