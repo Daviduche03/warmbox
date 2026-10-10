@@ -1,6 +1,10 @@
 package main
 
 import (
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"warmbox/internal/desktop"
@@ -9,6 +13,69 @@ import (
 // Whether an address is reachable from the network decides whether the daemon
 // refuses to start, so it has to be right for the shapes people actually type —
 // including the accidental one, a bare ":7070", which is every interface.
+// A session stream is Server-Sent Events ending in an exit event. Feed the
+// parser canned streams: no daemon, no VM, no network beyond localhost.
+func TestReadSSEStream(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		out  string
+		code int
+	}{
+		{
+			"out then exit",
+			"data: {\"out\":\"hello\\n\"}\n\ndata: {\"exit\":{\"exit\":0}}\n\n",
+			"hello\n", 0,
+		},
+		{
+			"nonzero exit reported",
+			"data: {\"exit\":{\"exit\":3}}\n\n",
+			"", 3,
+		},
+		{
+			"blank lines and comments ignored",
+			"\n: ping\n\ndata: {\"out\":\"x\"}\n\ndata: {\"exit\":{\"exit\":0}}\n\n",
+			"x", 0,
+		},
+		{
+			"malformed event skipped, stream continues",
+			"data: not-json\n\ndata: {\"out\":\"ok\"}\n\ndata: {\"exit\":{\"exit\":0}}\n\n",
+			"ok", 0,
+		},
+		{
+			"EOF without exit is a broken stream",
+			"data: {\"out\":\"half\"}\n\n",
+			"half", -1,
+		},
+		{
+			"empty stream",
+			"",
+			"", -1,
+		},
+	}
+	for _, c := range cases {
+		var out strings.Builder
+		if code := readSSEStream(strings.NewReader(c.body), &out); code != c.code {
+			t.Errorf("%s: code = %d, want %d", c.name, code, c.code)
+		} else if out.String() != c.out {
+			t.Errorf("%s: out = %q, want %q", c.name, out.String(), c.out)
+		}
+	}
+}
+
+// postSessionInput is a thin POST; the one thing that must not regress is that
+// the daemon's {"error": ...} body surfaces instead of a bare status.
+func TestPostSessionInputError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusConflict)
+		fmt.Fprint(w, `{"error":"desktop is hibernated — wake it first"}`)
+	}))
+	defer srv.Close()
+	err := postSessionInput(srv.URL, "", "echo hi\n")
+	if err == nil || !strings.Contains(err.Error(), "hibernated") {
+		t.Fatalf("expected the daemon error, got %v", err)
+	}
+}
 func TestBindIsLoopback(t *testing.T) {
 	cases := []struct {
 		addr string

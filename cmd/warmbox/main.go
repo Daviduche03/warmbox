@@ -5,6 +5,7 @@ package main
 
 import (
 	"archive/tar"
+	"bufio"
 	"compress/gzip"
 	"context"
 	"encoding/json"
@@ -78,6 +79,8 @@ func main() {
 		cmdList(os.Args[2:])
 	case "destroy":
 		cmdDestroy(os.Args[2:])
+	case "connect":
+		cmdConnect(os.Args[2:])
 	case "checkpoint":
 		cmdCheckpoint(os.Args[2:])
 	case "checkpoints":
@@ -204,6 +207,7 @@ Usage:
   warmbox image list        List the local images (offline)
   warmbox list              List desktops
   warmbox destroy <id>      Destroy a desktop
+  warmbox connect <id>      Open an interactive shell inside a desktop
   warmbox checkpoint <id> [name]
                             Save a desktop's live memory to disk (keeps running)
   warmbox checkpoints <id>  List a desktop's memory checkpoints
@@ -2423,6 +2427,207 @@ func cmdWake(args []string) {
 	}
 	_ = json.NewDecoder(resp.Body).Decode(&out)
 	fmt.Fprintf(os.Stderr, "woke %s in %dms\n", rest[0], out.RestoreMs)
+}
+
+// --- connect: an interactive shell inside a desktop ---
+//
+// The guest agent runs /bin/sh with its stdin held open (a session) and
+// streams everything it prints as Server-Sent Events. Connect wires those to
+// this terminal: stdin lines go in, output comes out. There is no PTY on the
+// guest side, so this is line-oriented, not raw: type a line, see its output.
+// Ctrl-C ends the session (there is no job control to interrupt into),
+// Ctrl-D or `exit` leaves it cleanly.
+func cmdConnect(args []string) {
+	addr := ":7070"
+	token := tokenDefault()
+	shell := "/bin/sh"
+	fs := flag.NewFlagSet("connect", flag.ExitOnError)
+	fs.StringVar(&addr, "addr", addr, "daemon API address")
+	fs.StringVar(&token, "token", token, "user API token (or `warmbox login` first)")
+	fs.StringVar(&shell, "shell", shell, "shell to run inside the desktop")
+	rest := parseInterspersed(fs, args)
+	if len(rest) != 1 {
+		fatal("Usage: warmbox connect <id>")
+	}
+	id := rest[0]
+	base := withToken(apiBase(addr)+"/api/desktops/"+id+"/sessions", token)
+
+	// 1. Start the session.
+	createBody, _ := json.Marshal(map[string]string{"shell": shell})
+	resp, err := postAuthed(base, "application/json", strings.NewReader(string(createBody)))
+	if err != nil {
+		fatal("Error: %v", err)
+	}
+	var created struct {
+		ID string `json:"id"`
+	}
+	if resp.StatusCode != http.StatusCreated {
+		msg := apiErr(resp)
+		resp.Body.Close()
+		switch resp.StatusCode {
+		case http.StatusNotFound:
+			fatal("no such desktop %q", id)
+		case http.StatusConflict:
+			fatal("%s (try: warmbox wake %s)", msg, id)
+		case http.StatusServiceUnavailable:
+			fatal("%s (the desktop may still be booting)", msg)
+		default:
+			fatal("connect failed: %s", msg)
+		}
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&created); err != nil || created.ID == "" {
+		resp.Body.Close()
+		fatal("daemon returned no session (status %s)", resp.Status)
+	}
+	resp.Body.Close()
+	sid := created.ID
+	sessURL := base + "/" + sid
+
+	// From here on every exit path kills the guest shell, so a Ctrl-C does
+	// not orphan a shell holding the session open. (sessURL already carries
+	// ?token= via withToken, so DELETE needs no extra auth work.)
+	cleanup := func() {
+		req, _ := http.NewRequest(http.MethodDelete, sessURL, nil)
+		if resp, err := doAuthed(req); err == nil {
+			resp.Body.Close()
+		}
+	}
+
+	interactive := term.IsTerminal(int(os.Stdin.Fd()))
+	if interactive {
+		fmt.Fprintf(os.Stderr, "connected to %s — Ctrl-D or `exit` to leave\n", id)
+	}
+
+	// 2. Stream output in the background until the shell exits.
+	done := make(chan int, 1) // shell exit code, once
+	go func() {
+		code := streamSession(sessURL+"/output", id)
+		done <- code
+	}()
+
+	// 3. Feed stdin lines to the shell. Ctrl-C kills the session and exits
+	// (there is no foreground process group to interrupt into).
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sig
+		fmt.Fprintln(os.Stderr)
+		cleanup()
+		os.Exit(130)
+	}()
+
+	reader := bufio.NewReader(os.Stdin)
+	prompt := id + "$ "
+	for {
+		if interactive {
+			fmt.Fprint(os.Stdout, prompt)
+		}
+		line, err := reader.ReadString('\n')
+		if line != "" {
+			if perr := postSessionInput(sessURL+"/input", token, line); perr != nil {
+				fmt.Fprintf(os.Stderr, "\nsession gone: %v\n", perr)
+				cleanup()
+				os.Exit(1)
+			}
+		}
+		if err != nil { // EOF (or a real read error): leave cleanly
+			postSessionInput(sessURL+"/input", token, "exit\n")
+			break
+		}
+	}
+
+	code := <-done
+	if code != 0 {
+		fmt.Fprintf(os.Stderr, "session ended (exit %d)\n", code)
+	}
+}
+
+// postSessionInput sends raw bytes to a session's stdin. Unlike the agent's
+// /runs stdin endpoint this one adds a trailing newline, but connect already
+// reads whole lines, so sending them as-is is correct either way.
+func postSessionInput(url, token, line string) error {
+	resp, err := postAuthed(withToken(url, token), "application/octet-stream", strings.NewReader(line))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("%s", apiErr(resp))
+	}
+	return nil
+}
+
+// streamSession reads the session's SSE output until the server ends it with
+// an exit event, printing each chunk. Returns the shell's exit code, or -1
+// when the stream itself broke.
+func streamSession(url, _ string) int {
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "\nstream failed: %v\n", err)
+		return -1
+	}
+	resp, err := doAuthed(req)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "\nstream failed: %v\n", err)
+		return -1
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		fmt.Fprintf(os.Stderr, "\nstream failed: %s\n", apiErr(resp))
+		return -1
+	}
+	return readSSEStream(resp.Body, os.Stdout)
+}
+
+// readSSEStream copies a session's SSE output to out until the server ends it
+// with an exit event. Returns the shell's exit code, or -1 when the stream
+// itself broke.
+func readSSEStream(r io.Reader, out io.Writer) int {
+	// Event lines can be megabytes (the buffer holds up to 4 MiB of
+	// scrollback), so ReadBytes, not a capped Scanner.
+	reader := bufio.NewReader(r)
+	var data []string
+	flush := func() int {
+		if len(data) == 0 {
+			return -1 // keep going; blank line with no event
+		}
+		var ev struct {
+			Out  string `json:"out"`
+			Exit *struct {
+				Exit int `json:"exit"`
+			} `json:"exit"`
+		}
+		joined := strings.Join(data, "\n")
+		data = nil
+		if err := json.Unmarshal([]byte(joined), &ev); err != nil {
+			return -1 // a malformed event is not worth dying over
+		}
+		if ev.Out != "" {
+			fmt.Fprint(out, ev.Out)
+		}
+		if ev.Exit != nil {
+			return ev.Exit.Exit
+		}
+		return -1
+	}
+	for {
+		line, err := reader.ReadBytes('\n')
+		s := strings.TrimRight(string(line), "\r\n")
+		if strings.HasPrefix(s, "data:") {
+			v := s[len("data:"):]
+			data = append(data, strings.TrimPrefix(v, " "))
+		} else if s == "" {
+			if code := flush(); code >= 0 {
+				return code
+			}
+		}
+		if err != nil { // EOF or broken pipe: shell is gone either way
+			if code := flush(); code >= 0 {
+				return code
+			}
+			return -1
+		}
+	}
 }
 
 // --- volumes ---
