@@ -1672,12 +1672,38 @@ func sessionCookieValue() string {
 // --token still travels as ?token= (user API tokens work there); the session
 // cookie takes precedence server-side. A 401 means login is missing or
 // expired, never a transient error, so it explains itself.
+// defaultAPITimeout bounds every daemon call: a stalled network used to hang
+// the CLI forever (a hung connect even survived SIGTERM, because its cleanup
+// call hung too). Commands that legitimately wait override it per call.
+const defaultAPITimeout = 30 * time.Second
+
+// createTimeout covers a cold boot: the server waits up to ~120s for
+// readiness before giving up, so anything shorter would kill healthy creates.
+const createTimeout = 180 * time.Second
+
+// cleanupTimeout bounds best-effort teardown (connect's session DELETE):
+// long enough for a slow daemon, short enough that Ctrl-C always exits.
+const cleanupTimeout = 5 * time.Second
+
 func doAuthed(req *http.Request) (*http.Response, error) {
+	return doAuthedTimeout(req, defaultAPITimeout)
+}
+
+// doAuthedTimeout is doAuthed with an explicit timeout; timeout <= 0 means
+// none (the connect output stream lives as long as the session).
+func doAuthedTimeout(req *http.Request, timeout time.Duration) (*http.Response, error) {
 	if s := sessionCookieValue(); s != "" {
 		req.AddCookie(&http.Cookie{Name: "warmbox_session", Value: s})
 	}
-	resp, err := http.DefaultClient.Do(req)
-	if err == nil && resp.StatusCode == http.StatusUnauthorized {
+	client := http.DefaultClient
+	if timeout > 0 {
+		client = &http.Client{Timeout: timeout}
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("%v (is the daemon at %s up?)", err, req.URL.Host)
+	}
+	if resp.StatusCode == http.StatusUnauthorized {
 		resp.Body.Close()
 		fatal("not logged in — run `warmbox login` (or pass --token with a user API token)")
 	}
@@ -1701,6 +1727,19 @@ func postAuthed(rawURL, contentType string, body io.Reader) (*http.Response, err
 		req.Header.Set("Content-Type", contentType)
 	}
 	return doAuthed(req)
+}
+
+// postAuthedTimeout is postAuthed with an explicit timeout (create waits out
+// a whole cold boot server-side).
+func postAuthedTimeout(rawURL, contentType string, body io.Reader, timeout time.Duration) (*http.Response, error) {
+	req, err := http.NewRequest(http.MethodPost, rawURL, body)
+	if err != nil {
+		return nil, err
+	}
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
+	return doAuthedTimeout(req, timeout)
 }
 
 // readPassword prompts without echoing when a TTY is available.
@@ -1845,7 +1884,7 @@ func cmdCreate(args []string) {
 		b, _ := json.Marshal(req)
 		body = strings.NewReader(string(b))
 	}
-	resp, err := postAuthed(withToken(apiBase(addr)+"/api/desktops", token), "application/json", body)
+	resp, err := postAuthedTimeout(withToken(apiBase(addr)+"/api/desktops", token), "application/json", body, createTimeout)
 	if err != nil {
 		fatal("Error: %v", err)
 	}
@@ -2506,7 +2545,7 @@ func cmdConnect(args []string) {
 	// ?token= via withToken, so DELETE needs no extra auth work.)
 	cleanup := func() {
 		req, _ := http.NewRequest(http.MethodDelete, sessURL, nil)
-		if resp, err := doAuthed(req); err == nil {
+		if resp, err := doAuthedTimeout(req, cleanupTimeout); err == nil {
 			resp.Body.Close()
 		}
 	}
@@ -2742,7 +2781,7 @@ func streamSession(url, _ string) int {
 		fmt.Fprintf(os.Stderr, "\nstream failed: %v\n", err)
 		return -1
 	}
-	resp, err := doAuthed(req)
+	resp, err := doAuthedTimeout(req, 0) // the stream lives as long as the session
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "\nstream failed: %v\n", err)
 		return -1

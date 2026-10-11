@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"warmbox/internal/desktop"
 )
@@ -61,6 +62,28 @@ func TestReadSSEStream(t *testing.T) {
 		} else if out.String() != c.out {
 			t.Errorf("%s: out = %q, want %q", c.name, out.String(), c.out)
 		}
+	}
+}
+
+// A stalled daemon must fail fast, not hang forever: this server answers
+// nothing, so the default 30s timeout (not the multi-minute hang the old
+// un-timed client produced) fires, and the error names the address.
+func TestDoAuthedTimeout(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(5 * time.Second)
+	}))
+	defer srv.Close()
+	start := time.Now()
+	req, _ := http.NewRequest(http.MethodGet, srv.URL, nil)
+	_, err := doAuthedTimeout(req, 300*time.Millisecond)
+	if err == nil {
+		t.Fatal("expected a timeout error")
+	}
+	if time.Since(start) > 4*time.Second {
+		t.Fatalf("took %v, timeout did not fire", time.Since(start))
+	}
+	if !strings.Contains(err.Error(), "is the daemon at") {
+		t.Fatalf("error should name the daemon address, got %v", err)
 	}
 }
 
