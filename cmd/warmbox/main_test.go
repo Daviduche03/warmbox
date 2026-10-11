@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -23,45 +24,103 @@ func TestReadSSEStream(t *testing.T) {
 		body string
 		out  string
 		code int
+		// wantErr marks streams that break instead of ending in an exit
+		// event: EOF or empty input surfaces as an error now, so the caller
+		// can tell "broke" from "exited nonzero" and resume the former.
+		wantErr bool
 	}{
 		{
 			"out then exit",
 			"data: {\"out\":\"hello\\n\"}\n\ndata: {\"exit\":{\"exit\":0}}\n\n",
-			"hello\n", 0,
+			"hello\n", 0, false,
 		},
 		{
 			"nonzero exit reported",
 			"data: {\"exit\":{\"exit\":3}}\n\n",
-			"", 3,
+			"", 3, false,
 		},
 		{
 			"blank lines and comments ignored",
 			"\n: ping\n\ndata: {\"out\":\"x\"}\n\ndata: {\"exit\":{\"exit\":0}}\n\n",
-			"x", 0,
+			"x", 0, false,
 		},
 		{
 			"malformed event skipped, stream continues",
 			"data: not-json\n\ndata: {\"out\":\"ok\"}\n\ndata: {\"exit\":{\"exit\":0}}\n\n",
-			"ok", 0,
+			"ok", 0, false,
 		},
 		{
 			"EOF without exit is a broken stream",
 			"data: {\"out\":\"half\"}\n\n",
-			"half", -1,
+			"half", -1, true,
 		},
 		{
 			"empty stream",
 			"",
-			"", -1,
+			"", -1, true,
 		},
 	}
 	for _, c := range cases {
 		var out strings.Builder
-		if code := readSSEStream(strings.NewReader(c.body), &out); code != c.code {
+		code, consumed, err := readSSEStream(io.NopCloser(strings.NewReader(c.body)), &out, time.Minute)
+		if c.wantErr {
+			if err == nil {
+				t.Errorf("%s: expected an error, got code %d", c.name, code)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("%s: unexpected error: %v", c.name, err)
+			continue
+		}
+		if code != c.code {
 			t.Errorf("%s: code = %d, want %d", c.name, code, c.code)
 		} else if out.String() != c.out {
 			t.Errorf("%s: out = %q, want %q", c.name, out.String(), c.out)
 		}
+		_ = consumed
+	}
+}
+
+// Keepalive comments carry no bytes and must not disturb the offset: a
+// stream of prompt, pings, more output, exit reports exactly the output
+// bytes, so ?from= resumption neither skips nor repeats.
+func TestReadSSEStreamKeepaliveAndOffset(t *testing.T) {
+	body := "data: {\"out\":\"ab\"}\n\n" +
+		": ping\n\n" +
+		": ping\n\n" +
+		"data: {\"out\":\"cde\"}\n\n" +
+		"data: {\"exit\":{\"exit\":0}}\n\n"
+	var out strings.Builder
+	code, consumed, err := readSSEStream(io.NopCloser(strings.NewReader(body)), &out, time.Minute)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if code != 0 {
+		t.Fatalf("code = %d, want 0", code)
+	}
+	if out.String() != "abcde" {
+		t.Fatalf("out = %q, want %q", out.String(), "abcde")
+	}
+	if consumed != 5 {
+		t.Fatalf("consumed = %d, want 5", consumed)
+	}
+}
+
+// A wire gone silent past the idle timeout is a broken stream, not a slow
+// one: half-open sockets produce no error and no data, forever.
+func TestReadSSEStreamIdleTimeout(t *testing.T) {
+	pr, pw := io.Pipe()
+	defer pr.Close()
+	defer pw.Close()
+	var out strings.Builder
+	start := time.Now()
+	_, _, err := readSSEStream(pr, &out, 200*time.Millisecond)
+	if err == nil {
+		t.Fatal("expected an idle-timeout error")
+	}
+	if time.Since(start) > 10*time.Second {
+		t.Fatalf("took %v, idle timeout did not fire", time.Since(start))
 	}
 }
 

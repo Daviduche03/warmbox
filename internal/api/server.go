@@ -1182,6 +1182,19 @@ func (s *Server) websockify(w http.ResponseWriter, r *http.Request) {
 	vnc.Proxy(w, r, target, s.log)
 }
 
+// guestTransport is shared by every reverse proxy to a desktop (agent API,
+// port exposures). A Transport per request leaks: idle keep-alive
+// connections are reaped only after IdleConnTimeout, and the zero value
+// never reaps — thousands of ESTABLISHED sockets piled up within hours.
+// Transports are safe for concurrent use and the pool is keyed by host;
+// streams hold their connection while running and are unaffected.
+var guestTransport = &http.Transport{
+	DialContext: func(_ context.Context, _, addr string) (net.Conn, error) {
+		return vnc.Dial(addr)
+	},
+	IdleConnTimeout: 30 * time.Second,
+}
+
 // agentProxy forwards a request to warmbox-agent inside the guest, preserving
 // the method, body and query (the agent exposes /exec, /files, /file, ...).
 func (s *Server) agentProxy(w http.ResponseWriter, r *http.Request, id, agentPath string) {
@@ -1207,11 +1220,7 @@ func (s *Server) agentProxy(w http.ResponseWriter, r *http.Request, id, agentPat
 			req.URL = u
 			req.Host = target
 		},
-		Transport: &http.Transport{
-			DialContext: func(_ context.Context, _, addr string) (net.Conn, error) {
-				return vnc.Dial(addr)
-			},
-		},
+		Transport: guestTransport,
 		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, err error) {
 			s.fail(w, http.StatusBadGateway, "could not reach the desktop's agent", err)
 		},
@@ -1303,11 +1312,7 @@ func (s *Server) expose(w http.ResponseWriter, r *http.Request) {
 			}
 			req.Host = target
 		},
-		Transport: &http.Transport{
-			DialContext: func(_ context.Context, _, addr string) (net.Conn, error) {
-				return vnc.Dial(addr)
-			},
-		},
+		Transport: guestTransport,
 		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, err error) {
 			s.fail(w, http.StatusBadGateway, "could not reach that port on the desktop", err)
 		},

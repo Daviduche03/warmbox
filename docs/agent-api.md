@@ -108,7 +108,10 @@ DELETE /runs/{id}            -> kill the process group
 ```
 
 Output is buffered (4 MiB of scrollback) so a client can attach late and still
-read the tail; `from=N` resumes a stream at an offset. A build that used to hit
+read the tail; `from=N` resumes a stream at an offset. Streams also emit an
+SSE comment (`: ping`) every 15s: silence past ~45s means the connection is
+dead, and the client should re-open from its last offset rather than hang.
+A build that used to hit
 the 60s exec cap now runs for as long as it needs with live output.
 
 ## Sessions — landed

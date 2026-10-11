@@ -407,6 +407,8 @@ func handleRunStream(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 
 	from, _ := strconv.ParseInt(r.URL.Query().Get("from"), 10, 64)
+	keepalive := time.NewTicker(15 * time.Second)
+	defer keepalive.Stop()
 	emit := func(v any) bool {
 		b, err := json.Marshal(v)
 		if err != nil {
@@ -434,6 +436,16 @@ func handleRunStream(w http.ResponseWriter, r *http.Request) {
 		select {
 		case <-r.Context().Done():
 			return
+		case <-keepalive.C:
+			// A comment event: valid SSE, ignored by every parser (and by
+			// browsers' EventSource), but it puts bytes on a wire that would
+			// otherwise sit silent. Clients treat 3 missed keepalives as a
+			// dead connection and re-open from their last offset instead of
+			// hanging forever on a half-open socket.
+			if _, err := io.WriteString(w, ": ping\n\n"); err != nil {
+				return
+			}
+			flusher.Flush()
 		case <-time.After(100 * time.Millisecond):
 		}
 	}

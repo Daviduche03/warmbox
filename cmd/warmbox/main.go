@@ -2772,35 +2772,113 @@ func postSessionInput(url, token, line string) error {
 	return nil
 }
 
+// streamIdleTimeout bounds wire silence: the server sends a keepalive
+// comment every 15s, so 45s with no bytes at all means the connection is
+// dead (half-open sockets otherwise hang forever with no error).
+const streamIdleTimeout = 45 * time.Second
+
+// maxStreamRetries bounds reconnection: about half a minute of outage is
+// tolerated, then the user gets an answer instead of an eternal hang.
+const maxStreamRetries = 5
+
 // streamSession reads the session's SSE output until the server ends it with
-// an exit event, printing each chunk. Returns the shell's exit code, or -1
-// when the stream itself broke.
+// an exit event. A stalled or broken connection is re-opened from the last
+// confirmed byte offset (the server supports ?from=), so a network flap
+// prints "resuming…" and continues instead of freezing forever.
 func streamSession(url, _ string) int {
-	req, err := http.NewRequest(http.MethodGet, url, nil)
+	var offset int64
+	backoff := time.Second
+	for fails := 0; ; fails++ {
+		code, consumed, gone, err := openStream(url, offset)
+		offset += consumed
+		if err == nil {
+			return code // clean exit event
+		}
+		if gone {
+			fmt.Fprintf(os.Stderr, "\nsession is gone (the desktop or its shell ended)\n")
+			return -1
+		}
+		if fails >= maxStreamRetries {
+			fmt.Fprintf(os.Stderr, "\nconnection to the desktop lost (%v)\n", err)
+			return -1
+		}
+		fmt.Fprintf(os.Stderr, "\nconnection stalled, resuming…\n")
+		time.Sleep(backoff)
+		backoff *= 2
+	}
+}
+
+// openStream reads one stream lifetime: clean exit event (err nil), a gone
+// session/desktop (gone true, don't retry), or a broken connection (retry).
+func openStream(rawURL string, offset int64) (code int, consumed int64, gone bool, err error) {
+	u := rawURL
+	if offset > 0 {
+		// The URL already carries ?token= when a token is in play; extend
+		// its query rather than appending a second one.
+		parsed, perr := url.Parse(u)
+		if perr != nil {
+			return -1, 0, false, perr
+		}
+		q := parsed.Query()
+		q.Set("from", strconv.FormatInt(offset, 10))
+		parsed.RawQuery = q.Encode()
+		u = parsed.String()
+	}
+	req, err := http.NewRequest(http.MethodGet, u, nil)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "\nstream failed: %v\n", err)
-		return -1
+		return -1, 0, false, err
 	}
 	resp, err := doAuthedTimeout(req, 0) // the stream lives as long as the session
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "\nstream failed: %v\n", err)
-		return -1
+		return -1, 0, false, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		fmt.Fprintf(os.Stderr, "\nstream failed: %s\n", apiErr(resp))
-		return -1
+	if resp.StatusCode == http.StatusNotFound {
+		return -1, 0, true, fmt.Errorf("%s", apiErr(resp))
 	}
-	return readSSEStream(resp.Body, os.Stdout)
+	if resp.StatusCode != http.StatusOK {
+		return -1, 0, false, fmt.Errorf("%s", apiErr(resp))
+	}
+	// A break here is always retryable: if the session is actually gone, the
+	// re-opened stream 404s and reports it as such.
+	code, consumed, streamErr := readSSEStream(resp.Body, os.Stdout, streamIdleTimeout)
+	return code, consumed, false, streamErr
 }
 
 // readSSEStream copies a session's SSE output to out until the server ends it
-// with an exit event. Returns the shell's exit code, or -1 when the stream
-// itself broke.
-func readSSEStream(r io.Reader, out io.Writer) int {
+// with an exit event. Comment events (: ping keepalives) are ignored per the
+// SSE spec. Returns the shell's exit code and the bytes consumed (the ?from=
+// offset for resuming), or a non-nil error when the stream broke first —
+// including idleness past idleTimeout with no bytes at all, which is how a
+// half-open socket (no RST, no error, no data, forever) is detected.
+func readSSEStream(r io.ReadCloser, out io.Writer, idle time.Duration) (code int, consumed int64, err error) {
 	// Event lines can be megabytes (the buffer holds up to 4 MiB of
 	// scrollback), so ReadBytes, not a capped Scanner.
 	reader := bufio.NewReader(r)
+	defer r.Close()
+	// Lines arrive on lines; the watchdog fires when the wire goes quiet.
+	// The reader goroutine exits with the function (done closes) so a timed
+	// out stream does not leak it behind a blocked channel send.
+	type lineRes struct {
+		line []byte
+		err  error
+	}
+	lines := make(chan lineRes, 1)
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		for {
+			line, err := reader.ReadBytes('\n')
+			select {
+			case lines <- lineRes{line, err}:
+			case <-done:
+				return
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
 	var data []string
 	flush := func() int {
 		if len(data) == 0 {
@@ -2819,28 +2897,43 @@ func readSSEStream(r io.Reader, out io.Writer) int {
 		}
 		if ev.Out != "" {
 			fmt.Fprint(out, ev.Out)
+			consumed += int64(len(ev.Out))
 		}
 		if ev.Exit != nil {
 			return ev.Exit.Exit
 		}
 		return -1
 	}
+	idleTimer := time.NewTimer(idle)
+	defer idleTimer.Stop()
 	for {
-		line, err := reader.ReadBytes('\n')
-		s := strings.TrimRight(string(line), "\r\n")
-		if strings.HasPrefix(s, "data:") {
-			v := s[len("data:"):]
-			data = append(data, strings.TrimPrefix(v, " "))
-		} else if s == "" {
-			if code := flush(); code >= 0 {
-				return code
+		select {
+		case res := <-lines:
+			if !idleTimer.Stop() {
+				select {
+				case <-idleTimer.C:
+				default:
+				}
 			}
-		}
-		if err != nil { // EOF or broken pipe: shell is gone either way
-			if code := flush(); code >= 0 {
-				return code
+			idleTimer.Reset(idle)
+			s := strings.TrimRight(string(res.line), "\r\n")
+			if strings.HasPrefix(s, "data:") {
+				v := s[len("data:"):]
+				data = append(data, strings.TrimPrefix(v, " "))
+			} else if s == "" {
+				if code := flush(); code >= 0 {
+					return code, consumed, nil
+				}
 			}
-			return -1
+			// Anything else (SSE comments like ": ping") is ignored.
+			if res.err != nil { // EOF or broken pipe
+				if code := flush(); code >= 0 {
+					return code, consumed, nil
+				}
+				return -1, consumed, fmt.Errorf("stream ended without an exit event")
+			}
+		case <-idleTimer.C:
+			return -1, consumed, fmt.Errorf("no output for %s (connection may be dead)", idle)
 		}
 	}
 }
