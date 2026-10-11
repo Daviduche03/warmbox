@@ -109,7 +109,11 @@ if [ "$HAVE_VOLUME" = "1" ]; then
     log "volume sync loop started"
 fi
 
-# --- agent API (host -> guest exec/files), localhost only ---
+# --- agent API (host -> guest exec/files) ---
+# Reachable from the host (and sibling VMs) over the NAT network — there is
+# deliberately no auth here; the NAT is the boundary and this host is
+# single-user (see docs/agent-api.md). Do not expose the guest network
+# beyond the host, and revisit before any multi-tenant use.
 # NOTE: busybox `trap - SIG` does NOT reset to default here — it ignores
 # (verified: SigIgn gained SIGQUIT). Do not "fix" Ctrl-C with a trap line;
 # the agent resets its own dispositions at startup (see resetsignals in the
