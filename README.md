@@ -66,6 +66,7 @@ Prefer the command line? Sign in once, then create:
 ```sh
 warmbox login
 warmbox create            # prints the desktop's URL
+warmbox connect <id>      # a terminal inside it (full pty: vim, htop, Ctrl-C)
 ```
 
 `warmbox setup` installs what is missing rather than handing you a list of
