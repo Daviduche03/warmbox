@@ -1350,6 +1350,8 @@ func ensureHypervisor(cfg *desktop.Config, allowInstall bool) bool {
 		if err := kvmUsable(); err != nil {
 			fmt.Fprintf(os.Stderr, "✗ /dev/kvm is not usable: %v\n", err)
 			fmt.Fprintln(os.Stderr, "  enable virtualisation (BIOS/VM settings), or let this user open /dev/kvm (the kvm group)")
+			fmt.Fprintln(os.Stderr, "  no KVM on this machine (Docker, WSL1, no VT)? desktops can still run emulated, about 20x slower:")
+			fmt.Fprintln(os.Stderr, "    warmbox service install --pool 1 --accel tcg")
 			return false
 		}
 	}
