@@ -108,11 +108,17 @@ func TestReadSSEStreamKeepaliveAndOffset(t *testing.T) {
 }
 
 // A wire gone silent past the idle timeout is a broken stream, not a slow
-// one: half-open sockets produce no error and no data, forever.
+// one: half-open sockets produce no error and no data, forever. The timer
+// arms only after a keepalive comment (older agents stay silent when idle,
+// and must not trigger reconnect churn), so the test pings first.
 func TestReadSSEStreamIdleTimeout(t *testing.T) {
 	pr, pw := io.Pipe()
 	defer pr.Close()
-	defer pw.Close()
+	go func() {
+		fmt.Fprint(pw, ": ping\n\n")
+		// Then silence: never write again, never close.
+		select {}
+	}()
 	var out strings.Builder
 	start := time.Now()
 	_, _, err := readSSEStream(pr, &out, 200*time.Millisecond)
@@ -121,6 +127,27 @@ func TestReadSSEStreamIdleTimeout(t *testing.T) {
 	}
 	if time.Since(start) > 10*time.Second {
 		t.Fatalf("took %v, idle timeout did not fire", time.Since(start))
+	}
+}
+
+// Without any keepalive, silence is normal (old agents): the stream waits
+// unbounded rather than churning reconnects. Proved with a short window by
+// racing the timeout against a delayed exit event.
+func TestReadSSEStreamNoPingNoTimeout(t *testing.T) {
+	pr, pw := io.Pipe()
+	defer pr.Close()
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		fmt.Fprint(pw, "data: {\"exit\":{\"exit\":0}}\n\n")
+		pw.Close()
+	}()
+	var out strings.Builder
+	code, _, err := readSSEStream(pr, &out, 100*time.Millisecond)
+	if err != nil {
+		t.Fatalf("silent-then-exit stream must not time out: %v", err)
+	}
+	if code != 0 {
+		t.Fatalf("code = %d, want 0", code)
 	}
 }
 

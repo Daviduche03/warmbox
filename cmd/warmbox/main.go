@@ -2906,7 +2906,17 @@ func readSSEStream(r io.ReadCloser, out io.Writer, idle time.Duration) (code int
 	}
 	idleTimer := time.NewTimer(idle)
 	defer idleTimer.Stop()
+	// pingSeen arms the idle timer: only streams from agents that emit
+	// keepalive comments (new images) are ever declared dead by silence.
+	// Older agents stay silent when idle, and churning reconnects there
+	// would spam and leak a server-side stream handler per cycle — so
+	// without a single observed ping, wait unbounded as before.
+	pingSeen := false
 	for {
+		var timeoutCh <-chan time.Time
+		if pingSeen {
+			timeoutCh = idleTimer.C
+		}
 		select {
 		case res := <-lines:
 			if !idleTimer.Stop() {
@@ -2917,7 +2927,9 @@ func readSSEStream(r io.ReadCloser, out io.Writer, idle time.Duration) (code int
 			}
 			idleTimer.Reset(idle)
 			s := strings.TrimRight(string(res.line), "\r\n")
-			if strings.HasPrefix(s, "data:") {
+			if strings.HasPrefix(s, ":") {
+				pingSeen = true
+			} else if strings.HasPrefix(s, "data:") {
 				v := s[len("data:"):]
 				data = append(data, strings.TrimPrefix(v, " "))
 			} else if s == "" {
@@ -2925,14 +2937,13 @@ func readSSEStream(r io.ReadCloser, out io.Writer, idle time.Duration) (code int
 					return code, consumed, nil
 				}
 			}
-			// Anything else (SSE comments like ": ping") is ignored.
 			if res.err != nil { // EOF or broken pipe
 				if code := flush(); code >= 0 {
 					return code, consumed, nil
 				}
 				return -1, consumed, fmt.Errorf("stream ended without an exit event")
 			}
-		case <-idleTimer.C:
+		case <-timeoutCh:
 			return -1, consumed, fmt.Errorf("no output for %s (connection may be dead)", idle)
 		}
 	}
