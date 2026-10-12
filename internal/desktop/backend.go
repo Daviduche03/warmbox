@@ -78,7 +78,7 @@ type LaunchSpec struct {
 // Instance is a launched VM. Forwards maps a guest port to a host dial address
 // (host:port) when the host cannot reach the guest directly (QEMU user
 // networking); when empty the manager dials the guest IP + guest port (vfkit
-// NAT). The VNC port (5900) and agent port (7077) are the ones used today.
+// NAT). VNC (5900), agent (7077) and SSH (22) are the ones used today.
 type Instance struct {
 	Cmd      *exec.Cmd
 	Forwards map[int]string
@@ -309,12 +309,17 @@ func (b *qemuBackend) Launch(spec LaunchSpec) (*Instance, error) {
 	}
 
 	// QEMU user networking can't be reached host->guest, so forward host ports to
-	// the guest's VNC (5900) and agent (7077) servers and dial those instead.
+	// the guest's VNC (5900), agent (7077) and SSH (22) servers and dial those
+	// instead.
 	vncPort, err := freePort()
 	if err != nil {
 		return nil, err
 	}
 	agentPort, err := freePort()
+	if err != nil {
+		return nil, err
+	}
+	sshPort, err := freePort()
 	if err != nil {
 		return nil, err
 	}
@@ -360,7 +365,7 @@ func (b *qemuBackend) Launch(spec LaunchSpec) (*Instance, error) {
 		"-chardev", "file,id=vserchar0,path=" + spec.Console + ",append=on",
 		"-device", "virtconsole,chardev=vserchar0,name=warmbox",
 		"-device", "virtio-rng-pci",
-		"-netdev", fmt.Sprintf("user,id=n0,hostfwd=tcp:127.0.0.1:%d-:5900,hostfwd=tcp:127.0.0.1:%d-:7077", vncPort, agentPort),
+		"-netdev", fmt.Sprintf("user,id=n0,hostfwd=tcp:127.0.0.1:%d-:5900,hostfwd=tcp:127.0.0.1:%d-:7077,hostfwd=tcp:127.0.0.1:%d-:22", vncPort, agentPort, sshPort),
 		"-device", "virtio-net-pci,netdev=n0",
 	}
 	for i, d := range spec.Disks {
@@ -398,6 +403,7 @@ func (b *qemuBackend) Launch(spec LaunchSpec) (*Instance, error) {
 		Forwards: map[int]string{
 			5900: fmt.Sprintf("127.0.0.1:%d", vncPort),
 			7077: fmt.Sprintf("127.0.0.1:%d", agentPort),
+			22:   fmt.Sprintf("127.0.0.1:%d", sshPort),
 		},
 		Control: control,
 		Stderr:  stderr,

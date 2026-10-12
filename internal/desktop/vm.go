@@ -278,6 +278,10 @@ type Info struct {
 	// Allow and Deny are the desktop's egress policy (set by the API).
 	Allow []string `json:"allow,omitempty"`
 	Deny  []string `json:"deny,omitempty"`
+	// SSH is the host address (host:port) to dial for the guest's SSH
+	// server: a forwarded port on QEMU, the guest IP on vfkit. Empty until
+	// the VM exists with networking (booting guests may not have an IP yet).
+	SSH string `json:"ssh,omitempty"`
 }
 
 // Info returns a copy safe for serialisation.

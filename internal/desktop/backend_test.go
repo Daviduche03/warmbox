@@ -45,9 +45,34 @@ func TestQEMUAsksForNoHostDisplay(t *testing.T) {
 	}
 }
 
-// The kernel and initrd the caller asked for must reach QEMU: warmbox passes a
-// bzImage or an ELF vmlinux depending on the platform, and either is fine, but
-// it must be the one the image actually shipped.
+// A forwarded SSH port is how `warmbox ssh` reaches QEMU guests: the host
+// cannot dial the guest directly, so -incoming restores and fresh boots alike
+// need it in the same place as the VNC and agent forwards.
+func TestQEMUForwardsSSH(t *testing.T) {
+	b := &qemuBackend{}
+	inst, err := b.Launch(LaunchSpec{
+		CPUs: 2, MemMiB: 1024,
+		Kernel:  "/tmp/vmlinux",
+		Initrd: "/tmp/initramfs-overlay",
+		Console: "/tmp/console.log",
+	})
+	if err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+	args := inst.Cmd.Args
+	var netdev string
+	for i, a := range args {
+		if a == "-netdev" && i+1 < len(args) {
+			netdev = args[i+1]
+		}
+	}
+	if !strings.Contains(netdev, "-:22") {
+		t.Errorf("no guest-:22 forward in %q", netdev)
+	}
+	if addr, ok := inst.Forwards[22]; !ok || !strings.HasPrefix(addr, "127.0.0.1:") {
+		t.Errorf("Forwards[22] = %q, %v; want loopback host:port", addr, ok)
+	}
+}
 func TestQEMUPassesTheKernelItWasGiven(t *testing.T) {
 	b := &qemuBackend{}
 	inst, err := b.Launch(LaunchSpec{

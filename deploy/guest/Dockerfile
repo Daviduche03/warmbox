@@ -38,7 +38,8 @@ RUN set -eux; \
         kmod linux-virt \
         darkhttpd \
         dbus \
-        curl zstd
+        curl zstd \
+        dropbear
 
 # The screen: TigerVNC plus the X plumbing both session layers share, then the
 # session itself — XFCE (default) or LXQt-Ambiance, so squashfs/overlay/VNC

@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"net/http"
@@ -170,6 +171,92 @@ func TestDoAuthedTimeout(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "is the daemon at") {
 		t.Fatalf("error should name the daemon address, got %v", err)
+	}
+}
+
+// A bare -- ends flag parsing with the remainder verbatim: remote commands
+// with dash-args (`ssh <id> -- ls -la`) must pass through, not die as
+// unknown flags. Both positional parsers share the contract.
+func TestDoubleDashEndsFlagParsing(t *testing.T) {
+	for name, fn := range map[string]func(*flag.FlagSet, []string) []string{
+		"parseArgsAnywhere": parseArgsAnywhere,
+		"parseInterspersed": parseInterspersed,
+	} {
+		fs := flag.NewFlagSet("test", flag.ContinueOnError)
+		var addr string
+		fs.StringVar(&addr, "addr", ":7070", "")
+		got := fn(fs, []string{"-addr", ":17071", "abc123", "--", "ls", "-la", "/tmp"})
+		want := []string{"abc123", "ls", "-la", "/tmp"}
+		if len(got) != len(want) {
+			t.Fatalf("%s = %v, want %v", name, got, want)
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Fatalf("%s = %v, want %v", name, got, want)
+			}
+		}
+		if addr != ":17071" {
+			t.Fatalf("%s: addr = %q, want :17071", name, addr)
+		}
+	}
+}
+
+// buildSSHArgs must pin everything to warmbox-owned material: its own key,
+// its own known_hosts, the VM id as the host-key alias (per-boot rotation
+// must never read as an attack), and batch mode so a rejected key fails
+// instead of hanging on a password prompt dropbear would never answer.
+func TestBuildSSHArgs(t *testing.T) {	args := buildSSHArgs("/usr/bin/ssh", "/home/u/.warmbox/ssh_client_key",
+		"/home/u/.warmbox/known_hosts", "abc123", "127.0.0.1", "2222",
+		[]string{"uptime"})
+	want := []string{"/usr/bin/ssh",
+		"-i", "/home/u/.warmbox/ssh_client_key",
+		"-p", "2222",
+		"-o", "IdentitiesOnly=yes",
+		"-o", "BatchMode=yes",
+		"-o", "ConnectTimeout=10",
+		"-o", "StrictHostKeyChecking=accept-new",
+		"-o", "UserKnownHostsFile=/home/u/.warmbox/known_hosts",
+		"-o", "HostKeyAlias=abc123",
+		"root@127.0.0.1",
+		"uptime",
+	}
+	if len(args) != len(want) {
+		t.Fatalf("args = %v, want %v", args, want)
+	}
+	for i := range want {
+		if args[i] != want[i] {
+			t.Fatalf("args = %v, want %v", args, want)
+		}
+	}
+	// No remote command: plain interactive login, and never the user's keys.
+	bare := buildSSHArgs("/usr/bin/ssh", "/k", "/kh", "id1", "10.0.0.5", "22", nil)
+	if bare[len(bare)-1] != "root@10.0.0.5" {
+		t.Fatalf("bare args = %v", bare)
+	}
+	for _, a := range bare {
+		if strings.Contains(a, ".ssh/") {
+			t.Fatalf("leaks the user's ssh config: %v", bare)
+		}
+	}
+}
+
+// mergeAuthorizedKeys is append-if-missing, byte-stable otherwise: re-running
+// provisioning must not duplicate lines or rewrite the file's tail.
+func TestMergeAuthorizedKeys(t *testing.T) {
+	key := "ssh-ed25519 AAAA warmbox"
+	if got := mergeAuthorizedKeys("", key); got != key+"\n" {
+		t.Fatalf("empty = %q", got)
+	}
+	if got := mergeAuthorizedKeys("ssh-ed25519 BBBB other\n", key); got != "ssh-ed25519 BBBB other\n"+key+"\n" {
+		t.Fatalf("append = %q", got)
+	}
+	existing := "ssh-ed25519 BBBB other\n" + key + "\n"
+	if got := mergeAuthorizedKeys(existing, key); got != existing {
+		t.Fatalf("present must be untouched, got %q", got)
+	}
+	// Missing trailing newline on the existing file still merges cleanly.
+	if got := mergeAuthorizedKeys("ssh-ed25519 BBBB other", key); got != "ssh-ed25519 BBBB other\n"+key+"\n" {
+		t.Fatalf("no-trailing-newline = %q", got)
 	}
 }
 

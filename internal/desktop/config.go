@@ -101,6 +101,9 @@ type Config struct {
 
 	// AgentPort is the port warmbox-agent listens on inside the guest.
 	AgentPort int
+	// GuestSSHPort is the port the guest's SSH server listens on (dropbear,
+	// key-only). QEMU forwards a host port to it; vfkit dials it directly.
+	GuestSSHPort int
 
 	// PoolSize is the number of pre-booted idle VMs kept warm.
 	PoolSize int
@@ -164,6 +167,7 @@ func DefaultConfig() *Config {
 		Display:         "1280x800",
 		GuestVNCPort:    5900,
 		AgentPort:       7077,
+		GuestSSHPort:    22,
 		PoolSize:        2,
 		PoolIdleTimeout: 15 * time.Minute,
 		ShareTag:        "workspace",

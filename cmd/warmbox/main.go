@@ -83,6 +83,8 @@ func main() {
 		cmdDestroy(os.Args[2:])
 	case "connect":
 		cmdConnect(os.Args[2:])
+	case "ssh":
+		cmdSSH(os.Args[2:])
 	case "checkpoint":
 		cmdCheckpoint(os.Args[2:])
 	case "checkpoints":
@@ -211,6 +213,7 @@ Usage:
   warmbox destroy <id>      Destroy a desktop
   warmbox connect <id>      Open an interactive shell inside a desktop
                             (full terminal when the image supports it)
+  warmbox ssh <id> [-- cmd]  SSH into a desktop (dropbear, key-only, port 22)
   warmbox checkpoint <id> [name]
                             Save a desktop's live memory to disk (keeps running)
   warmbox checkpoints <id>  List a desktop's memory checkpoints
@@ -1663,6 +1666,16 @@ func sessionFile() string {
 	return filepath.Join(home, ".warmbox", "session")
 }
 
+// warmboxDir is the CLI's home for its own key material (session-adjacent,
+// never the user's ssh config).
+func warmboxDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".warmbox")
+}
+
 func sessionCookieValue() string {
 	p := sessionFile()
 	if p == "" {
@@ -1747,6 +1760,19 @@ func postAuthedTimeout(rawURL, contentType string, body io.Reader, timeout time.
 		req.Header.Set("Content-Type", contentType)
 	}
 	return doAuthedTimeout(req, timeout)
+}
+
+// putAuthed is postAuthed with PUT: some endpoints (guest files) only speak
+// it, and the mux answers any other method with 405.
+func putAuthed(rawURL, contentType string, body io.Reader) (*http.Response, error) {
+	req, err := http.NewRequest(http.MethodPut, rawURL, body)
+	if err != nil {
+		return nil, err
+	}
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
+	return doAuthed(req)
 }
 
 // readPassword prompts without echoing when a TTY is available.
@@ -2010,6 +2036,12 @@ func cmdImage(args []string) {
 func parseArgsAnywhere(fs *flag.FlagSet, args []string) []string {
 	var rest []string
 	for {
+		// A bare -- ends flag parsing: everything after it is positional,
+		// verbatim. This is what lets `warmbox ssh <id> -- ls -la` pass
+		// dash-args through instead of choking on them as unknown flags.
+		if len(args) > 0 && args[0] == "--" {
+			return append(rest, args[1:]...)
+		}
 		_ = fs.Parse(args)
 		args = fs.Args()
 		if len(args) == 0 {
@@ -2956,6 +2988,202 @@ func readSSEStream(r io.ReadCloser, out io.Writer, idle time.Duration) (code int
 	}
 }
 
+// --- ssh: real SSH into a desktop ---
+//
+// The guest runs dropbear (key-only root on 22); QEMU forwards a host port to
+// it, vfkit dials the guest IP directly, and the daemon reports the dial
+// address as the desktop's "ssh" field. This command keeps its own ed25519
+// keypair, provisions the public half into /root/.ssh/authorized_keys over
+// the agent file API on first use, pins the guest host key per desktop id in
+// its own known_hosts (host keys rotate every boot, so TOFU scoped to
+// warmbox instead of the system file), and execs ssh so the terminal and
+// signals behave natively — Ctrl-C, job control, scp-style use, all of it.
+func cmdSSH(args []string) {
+	addr := ":7070"
+	token := tokenDefault()
+	fs := flag.NewFlagSet("ssh", flag.ExitOnError)
+	fs.StringVar(&addr, "addr", addr, "daemon API address")
+	fs.StringVar(&token, "token", token, "user API token (or `warmbox login` first)")
+	rest := parseInterspersed(fs, args)
+	if len(rest) < 1 {
+		fatal("Usage: warmbox ssh <id> [-- command...]")
+	}
+	id, remote := rest[0], rest[1:]
+
+	sshBin, err := exec.LookPath("ssh")
+	if err != nil {
+		fatal("ssh not found: install OpenSSH to use `warmbox ssh`")
+	}
+	keyPath, err := sshClientKey()
+	if err != nil {
+		fatal("Error: %v", err)
+	}
+
+	var info struct {
+		State string `json:"state"`
+		SSH   string `json:"ssh"`
+	}
+	resp, err := getAuthed(withToken(apiBase(addr)+"/api/desktops/"+id, token))
+	if err != nil {
+		fatal("Error: %v", err)
+	}
+	defer resp.Body.Close()
+	switch resp.StatusCode {
+	case http.StatusOK:
+		if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
+			fatal("Error decoding response: %v", err)
+		}
+	case http.StatusNotFound:
+		fatal("no such desktop %q", id)
+	case http.StatusConflict:
+		fatal("%s (try: warmbox wake %s)", apiErr(resp), id)
+	default:
+		fatal("ssh failed: %s", apiErr(resp))
+	}
+	if info.SSH == "" {
+		fatal("no SSH address for %s: the desktop may still be booting, or daemon and image predate sshd support", id)
+	}
+	host, port, err := net.SplitHostPort(info.SSH)
+	if err != nil {
+		fatal("bad SSH address %q: %v", info.SSH, err)
+	}
+	if err := provisionSSHKey(addr, token, id, keyPath); err != nil {
+		fatal("Error: %v", err)
+	}
+	if warmboxDir() == "" {
+		fatal("cannot find a home directory for known_hosts")
+	}
+	knownHosts := filepath.Join(warmboxDir(), "known_hosts")
+	sshArgs := buildSSHArgs(sshBin, keyPath, knownHosts, id, host, port, remote)
+	if err := execSSH(sshBin, sshArgs); err != nil {
+		fatal("Error: %v", err)
+	}
+}
+
+// buildSSHArgs assembles the ssh invocation: its own key, its own
+// known_hosts (never the user's), the VM id as HostKeyAlias so per-boot key
+// rotation lands on per-desktop entries instead of scary-changed warnings,
+// batch mode so a rejected key fails instead of hanging on a password prompt
+// dropbear would never answer (passwords are disabled in the guest).
+func buildSSHArgs(sshBin, keyPath, knownHosts, id, host, port string, remote []string) []string {
+	args := []string{sshBin,
+		"-i", keyPath,
+		"-p", port,
+		"-o", "IdentitiesOnly=yes",
+		"-o", "BatchMode=yes",
+		"-o", "ConnectTimeout=10",
+		"-o", "StrictHostKeyChecking=accept-new",
+		"-o", "UserKnownHostsFile=" + knownHosts,
+		"-o", "HostKeyAlias=" + id,
+		"root@" + host,
+	}
+	return append(args, remote...)
+}
+
+// execSSH replaces the CLI with ssh so the terminal, job control and signals
+// behave exactly like a native ssh session.
+func execSSH(sshBin string, args []string) error {
+	if runtime.GOOS == "windows" {
+		cmd := exec.Command(sshBin, args[1:]...)
+		cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+		return cmd.Run()
+	}
+	return syscall.Exec(sshBin, args, os.Environ())
+}
+
+// sshClientKey returns the CLI's managed keypair path, creating it (ed25519,
+// no passphrase) on first use. It belongs to warmbox, not the user: never the
+// user's own keys, never ssh-agent negotiation surprises.
+func sshClientKey() (string, error) {
+	dir := warmboxDir()
+	if dir == "" {
+		return "", fmt.Errorf("cannot find a home directory for the client key")
+	}
+	path := filepath.Join(dir, "ssh_client_key")
+	if _, err := os.Stat(path + ".pub"); err == nil {
+		return path, nil
+	}
+	if _, err := exec.LookPath("ssh-keygen"); err != nil {
+		return "", fmt.Errorf("ssh-keygen not found: install OpenSSH to use `warmbox ssh`")
+	}
+	cmd := exec.Command("ssh-keygen", "-t", "ed25519", "-N", "", "-C", "warmbox", "-f", path)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return "", fmt.Errorf("ssh-keygen: %v: %s", err, strings.TrimSpace(string(out)))
+	}
+	return path, nil
+}
+
+// provisionSSHKey ensures the CLI's public key is in the guest's root
+// authorized_keys (read-modify-write over the agent file API; agent PUT
+// creates parents and writes root-owned, which satisfies dropbear's
+// permission checks). Idempotent: a key already present is left alone.
+func provisionSSHKey(addr, token, id, keyPath string) error {
+	pub, err := os.ReadFile(keyPath + ".pub")
+	if err != nil {
+		return err
+	}
+	pubKey := strings.TrimSpace(string(pub))
+	const authKeys = "/root/.ssh/authorized_keys"
+	existing, err := sshFileGet(addr, token, id, authKeys)
+	if err != nil {
+		return err
+	}
+	for _, line := range strings.Split(existing, "\n") {
+		if strings.TrimSpace(line) == pubKey {
+			return nil
+		}
+	}
+	merged := mergeAuthorizedKeys(existing, pubKey)
+	return sshFilePut(addr, token, id, authKeys, merged)
+}
+
+// mergeAuthorizedKeys appends a key unless already present (exact line
+// match). Kept pure for testing; the guest round-trip is covered by the
+// agent's own file tests.
+func mergeAuthorizedKeys(existing, pubKey string) string {
+	for _, line := range strings.Split(existing, "\n") {
+		if strings.TrimSpace(line) == pubKey {
+			return existing
+		}
+	}
+	if existing == "" || strings.HasSuffix(existing, "\n") {
+		return existing + pubKey + "\n"
+	}
+	return existing + "\n" + pubKey + "\n"
+}
+
+func sshFileGet(addr, token, id, path string) (string, error) {
+	resp, err := getAuthed(withToken(apiBase(addr)+"/api/desktops/"+id+"/file?path="+url.QueryEscape(path), token))
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return "", nil // no authorized_keys yet: first provisioning
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("%s", apiErr(resp))
+	}
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
+}
+
+func sshFilePut(addr, token, id, path, content string) error {
+	resp, err := putAuthed(withToken(apiBase(addr)+"/api/desktops/"+id+"/file?path="+url.QueryEscape(path), token),
+		"application/octet-stream", strings.NewReader(content))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("%s", apiErr(resp))
+	}
+	return nil
+}
+
 // --- volumes ---
 
 func volumeUsage() {
@@ -2975,6 +3203,11 @@ Usage:
 func parseInterspersed(fs *flag.FlagSet, args []string) []string {
 	var positional []string
 	for {
+		// A bare -- ends flag parsing: everything after it is positional,
+		// verbatim (`warmbox ssh <id> -- ls -la` must not choke on -la).
+		if len(args) > 0 && args[0] == "--" {
+			return append(positional, args[1:]...)
+		}
 		_ = fs.Parse(args)
 		rest := fs.Args()
 		if len(rest) == 0 {

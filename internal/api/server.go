@@ -921,6 +921,9 @@ func (s *Server) list(w http.ResponseWriter, r *http.Request) {
 		}
 		p := s.policyFor(info.ID)
 		info.Allow, info.Deny = p.Allow, p.Deny
+		if vm, ok := s.mgr.Get(info.ID); ok {
+			info.SSH = vm.Target(s.cfg.GuestSSHPort)
+		}
 		infos = append(infos, info)
 	}
 	if infos == nil {
@@ -950,6 +953,7 @@ func (s *Server) get(w http.ResponseWriter, r *http.Request) {
 	info := vm.Info()
 	p := s.policyFor(id)
 	info.Allow, info.Deny = p.Allow, p.Deny
+	info.SSH = vm.Target(s.cfg.GuestSSHPort)
 	writeJSON(w, http.StatusOK, info)
 }
 

@@ -121,6 +121,17 @@ fi
 /usr/local/bin/warmbox-agent >/var/log/warmbox-agent.log 2>&1 &
 log "warmbox-agent started"
 
+# --- ssh (host -> guest shell) ---
+# Dropbear serves key-only root logins on 22 for `warmbox ssh`. Passwords
+# stay disabled (-s): the CLI provisions its own key into authorized_keys
+# over the agent file API, so there is no password to leak or brute-force.
+# Host keys regenerate every boot (-R into a tmpfs /etc) — the CLI pins them
+# per-desktop in its own known_hosts (TOFU), so rotation is expected, not an
+# attack. Same NAT boundary as the agent above.
+mkdir -p /etc/dropbear
+dropbear -R -s -p 22 >/var/log/dropbear.log 2>&1 &
+log "dropbear started (key-only, port 22)"
+
 # --- optional virtiofs workspace share ---
 # The host can attach a directory with `--device virtio-fs,sharedDir=...,
 # mountTag=<tag>`; we mount it at /workspace so agents/editors in the guest see

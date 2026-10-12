@@ -67,6 +67,7 @@ Prefer the command line? Sign in once, then create:
 warmbox login
 warmbox create            # prints the desktop's URL
 warmbox connect <id>      # a terminal inside it (full pty: vim, htop, Ctrl-C)
+warmbox ssh <id>          # real SSH into it (dropbear, key-only, port 22)
 ```
 
 `warmbox setup` installs what is missing rather than handing you a list of
