@@ -117,16 +117,30 @@ tar -xzf "${tmp}/${asset}" -C "$tmp"
 [ -f "${tmp}/warmbox" ] || die "archive did not contain a warmbox binary"
 
 mkdir -p "$PREFIX"
-cp "${tmp}/warmbox" "${PREFIX}/warmbox"
-chmod 0755 "${PREFIX}/warmbox"
+
+# Copy next to the target and rename over it. Writing into the binary in place
+# fails with "Text file busy" while a daemon is running from it; a rename swaps
+# the directory entry instead, and the running daemon keeps the file it opened.
+staged="${PREFIX}/.warmbox.new.$$"
+trap 'rm -rf "$tmp" "$staged"' EXIT INT TERM
+cp "${tmp}/warmbox" "$staged"
+chmod 0755 "$staged"
 
 # macOS kills an arm64 binary whose signature the copy invalidated.
 if [ "$os" = darwin ] && have codesign; then
-	codesign --force --sign - "${PREFIX}/warmbox" >/dev/null 2>&1 ||
+	codesign --force --sign - "$staged" >/dev/null 2>&1 ||
 		echo "install: warning: could not re-sign the binary; if it refuses to run, run: codesign --force --sign - ${PREFIX}/warmbox" >&2
 fi
 
+mv -f "$staged" "${PREFIX}/warmbox"
+
 echo "installed ${PREFIX}/warmbox"
+
+if have pgrep && pgrep -x warmbox >/dev/null 2>&1; then
+	echo
+	echo "note: a warmbox daemon is still running the old version. Restart it:"
+	echo "  warmbox service restart"
+fi
 
 case ":${PATH}:" in
 *":${PREFIX}:"*) ;;
