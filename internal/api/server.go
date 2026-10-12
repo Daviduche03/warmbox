@@ -362,6 +362,17 @@ func (s *Server) fail(w http.ResponseWriter, code int, msg string, err error) {
 	writeJSON(w, code, map[string]string{"error": msg})
 }
 
+// failAcquire reports a create the pool could not serve. A VM that died during
+// boot gets the same answer a direct boot gives in waitOrFail, reason included,
+// so the caller is told why and not left with "could not start a desktop".
+func (s *Server) failAcquire(w http.ResponseWriter, err error) {
+	if errors.Is(err, desktop.ErrExitedBeforeReady) {
+		s.fail(w, http.StatusBadGateway, "the desktop failed to boot: "+err.Error(), err)
+		return
+	}
+	s.fail(w, http.StatusServiceUnavailable, "could not start a desktop", err)
+}
+
 func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
@@ -420,7 +431,7 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 	default:
 		vm, err := s.pool.Acquire(r.Context())
 		if err != nil {
-			s.fail(w, http.StatusServiceUnavailable, "could not start a desktop", err)
+			s.failAcquire(w, err)
 			return
 		}
 		ws, _ := s.callerScope(r)
@@ -506,7 +517,7 @@ func (s *Server) createImage(w http.ResponseWriter, r *http.Request, name string
 	if name == deflt && cpus == 0 && mem == 0 {
 		vm, err := s.pool.Acquire(r.Context())
 		if err != nil {
-			s.fail(w, http.StatusServiceUnavailable, "could not start a desktop", err)
+			s.failAcquire(w, err)
 			return
 		}
 		ws, _ := s.callerScope(r)

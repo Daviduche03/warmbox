@@ -4,6 +4,7 @@ package desktop
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"sync"
@@ -190,6 +191,13 @@ func (p *Pool) Acquire(ctx context.Context) (*VM, error) {
 		vm, err := p.bootOne(ctx)
 		if err == nil {
 			return vm, nil
+		}
+		// A VM that died during boot will die the same way on the next try
+		// (no /dev/kvm, a refused flag, a guest whose init exits). Retrying
+		// only holds the caller until its own timeout with no reason given,
+		// so hand the failure back now.
+		if errors.Is(err, ErrExitedBeforeReady) {
+			return nil, err
 		}
 		// Back off and retry unless the context is done.
 		select {

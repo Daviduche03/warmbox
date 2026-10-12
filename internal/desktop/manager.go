@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -303,6 +304,11 @@ func (m *Manager) MarkReady(id, ip string) bool {
 	return true
 }
 
+// ErrExitedBeforeReady is a boot whose VM process ended before the guest
+// reported ready. It is a dead boot rather than a slow one: the hypervisor
+// refused to start or the guest died, and trying again gives the same answer.
+var ErrExitedBeforeReady = errors.New("the vm exited before it became ready")
+
 // WaitReady blocks until the VM is ready or ctx is done.
 func (m *Manager) WaitReady(ctx context.Context, id string) (*VM, error) {
 	m.mu.Lock()
@@ -324,9 +330,9 @@ func (m *Manager) WaitReady(ctx context.Context, id string) (*VM, error) {
 			return vm, nil
 		}
 		if err := vm.ExitError(); err != nil {
-			return nil, fmt.Errorf("the vm exited before it became ready: %w%s", err, vm.exitDetail())
+			return nil, fmt.Errorf("%w: %w%s", ErrExitedBeforeReady, err, vm.exitDetail())
 		}
-		return nil, fmt.Errorf("the vm exited before it became ready%s", vm.exitDetail())
+		return nil, fmt.Errorf("%w%s", ErrExitedBeforeReady, vm.exitDetail())
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
