@@ -2,6 +2,7 @@ package desktop
 
 import (
 	"context"
+	"errors"
 	"io"
 	"os"
 	"os/exec"
@@ -431,6 +432,31 @@ func TestPoolBacksOffAfterAFailedBoot(t *testing.T) {
 		if got := nextBackoff(c.current); got != c.want {
 			t.Errorf("nextBackoff(%s) = %s, want %s", c.current, got, c.want)
 		}
+	}
+}
+
+// A create served by the pool must fail as soon as the VM dies, with the
+// reason. Acquire used to boot a fresh VM every second until the caller's own
+// timeout ran out, so a host that cannot boot looked like a create that hangs.
+func TestAcquireFailsAtOnceWhenTheVMDiesDuringBoot(t *testing.T) {
+	m := testManager(t)
+	namedImage(t, m, "img", "")
+	m.cfg.Image = "img"
+	m.backend = &captureBackend{stderr: "failed to initialize kvm: No such file or directory"}
+	p := NewPool(m, 0, 0, io.Discard)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	began := time.Now()
+	_, err := p.Acquire(ctx)
+	if !errors.Is(err, ErrExitedBeforeReady) {
+		t.Fatalf("Acquire error = %v, want ErrExitedBeforeReady", err)
+	}
+	if !strings.Contains(err.Error(), "failed to initialize kvm") {
+		t.Errorf("error = %v, want it to quote what the hypervisor said", err)
+	}
+	if took := time.Since(began); took > 10*time.Second {
+		t.Errorf("took %v; a dead boot should be reported at once, not retried until the timeout", took)
 	}
 }
 
