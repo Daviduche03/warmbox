@@ -437,6 +437,8 @@ never comes up fails the workflow rather than reaching whoever installs next.
 
 ## Docs
 
+- [`docs/install.md`](docs/install.md) — install, package managers, and updating.
+- [`docs/remote-access.md`](docs/remote-access.md) — use warmbox from anywhere: Tailscale, manual TLS, SSH tunnel.
 - [`docs/architecture.md`](docs/architecture.md) — the cloud-native design.
 - [`docs/volumes.md`](docs/volumes.md) — volumes, sizing, API.
 - [`docs/snapshots.md`](docs/snapshots.md) — snapshots and the fast-resume plan.

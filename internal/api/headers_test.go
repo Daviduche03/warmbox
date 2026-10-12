@@ -1,6 +1,7 @@
 package api
 
 import (
+	"crypto/tls"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -29,7 +30,24 @@ func TestSecurityHeadersCoverTheDashboard(t *testing.T) {
 	}
 }
 
-// noVNC must not inherit it.
+// HSTS goes out over TLS only: it would brick plaintext loopback, and a
+// self-hosted daemon must not upgrade sibling vhosts either (no
+// includeSubDomains).
+func TestHSTSOnlyOverTLS(t *testing.T) {
+	s := &Server{}
+	if got := headerFor(t, s, "/").Get("Strict-Transport-Security"); got != "" {
+		t.Errorf("plaintext response carries HSTS %q", got)
+	}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.TLS = &tls.ConnectionState{}
+	s.securityHeaders(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})).ServeHTTP(rec, req)
+	if got := rec.Header().Get("Strict-Transport-Security"); got != "max-age=31536000" {
+		t.Errorf("TLS response HSTS = %q, want max-age without subdomains", got)
+	}
+}
 //
 // vnc.html boots from an inline module script, which `script-src 'self'`
 // refuses. Blocked, noVNC's UI never starts, so it never opens the websocket —

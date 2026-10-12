@@ -268,6 +268,14 @@ func (s *Server) securityHeaders(next http.Handler) http.Handler {
 		h.Set("Referrer-Policy", "no-referrer")
 		h.Set("X-Content-Type-Options", "nosniff")
 		h.Set("X-Frame-Options", "SAMEORIGIN")
+		// HSTS only makes sense (and is only safe to send) over TLS: it
+		// tells browsers to refuse plaintext for a year. No includeSubDomains:
+		// warmbox is often one vhost among many, and we must not upgrade
+		// siblings the operator serves plain. Plaintext loopback stays
+		// header-free so local HTTP keeps working.
+		if r.TLS != nil {
+			h.Set("Strict-Transport-Security", "max-age=31536000")
+		}
 		next.ServeHTTP(w, r)
 	})
 }
