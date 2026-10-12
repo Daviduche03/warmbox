@@ -1356,6 +1356,32 @@ func (s *Server) recordDesktop(id, vol, state, ip string, pid int, ws string) {
 	_ = s.catalog.UpsertDesktop(&catalog.Desktop{ID: id, Volume: vol, State: state, GuestIP: ip, PID: pid, WorkspaceID: ws})
 }
 
+// ReapStaleLeases releases every volume lease. Call once at daemon startup,
+// right after Reap: no VM survives a restart (leftovers are killed first),
+// so any lease on disk belongs to a dead run — typically a daemon that died
+// without cleanup. Without this, crashed runs wedge their volumes forever
+// and every later create with one fails 409. Live operation always pairs
+// lock/unlock, so nothing held at boot can be legitimate.
+func (s *Server) ReapStaleLeases() int {
+	if s.catalog == nil {
+		return 0
+	}
+	leases, err := s.catalog.ListLeases()
+	if err != nil || len(leases) == 0 {
+		return 0
+	}
+	n := 0
+	for vol, owner := range leases {
+		if err := s.catalog.ReleaseLease(vol, owner); err == nil {
+			n++
+			if s.log != nil {
+				fmt.Fprintf(s.log, "warmbox: reclaimed stale volume lease %s from %s\n", vol, owner)
+			}
+		}
+	}
+	return n
+}
+
 // lockVolume takes the single-writer lock for a volume (a catalog lease when
 // available, otherwise the in-process store lock).
 func (s *Server) lockVolume(name, owner string) error {

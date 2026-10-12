@@ -949,6 +949,13 @@ func cmdDaemon(args []string) {
 
 	apiSrv := api.New(mgr, p, cfg, store, cat, os.Stderr)
 
+	// Leases never survive their VM, but they survive a daemon crash (SQLite
+	// outlives the process that wrote it): reclaim anything a dead run left
+	// held, or its volumes 409 forever.
+	if n := apiSrv.ReapStaleLeases(); n > 0 {
+		fmt.Fprintf(os.Stderr, "warmbox: reclaimed %d stale volume lease(s) from a previous run\n", n)
+	}
+
 	if cfg.EgressAddr != "" {
 		policy := egress.Policy{Allow: cfg.Allow, Deny: cfg.Deny}
 		eg := egress.New(cfg.EgressAddr, policy, os.Stderr, apiSrv.EgressPolicyForIP)
