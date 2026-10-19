@@ -162,3 +162,16 @@ network. On a remote machine, tunnel to it instead:
 
   ssh -L 7070:127.0.0.1:7070 <user>@<this-host>     # then open http://localhost:7070
 EOS
+
+if [ "$os" = darwin ]; then
+	cat <<'EOS'
+
+On macOS, install the service as a system daemon with sudo:
+
+  sudo warmbox service install --pool 1
+
+macOS local-network privacy exempts launchd daemons but denies per-user
+agents, so the daemon must run in the system domain to reach its guests.
+It still runs as you, not root.
+EOS
+fi

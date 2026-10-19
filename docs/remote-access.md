@@ -37,6 +37,7 @@ warmbox configuration — the daemon still sees loopback traffic.
 Bind the daemon to the network with a real certificate:
 
 ```sh
+# sudo it on macOS: the service runs as a system daemon (see running.md#macos)
 warmbox service install --addr 0.0.0.0:7070 \
   --tls-cert /etc/letsencrypt/live/<host>/fullchain.pem \
   --tls-key /etc/letsencrypt/live/<host>/privkey.pem

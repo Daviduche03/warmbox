@@ -205,7 +205,8 @@ func TestDoubleDashEndsFlagParsing(t *testing.T) {
 // its own known_hosts, the VM id as the host-key alias (per-boot rotation
 // must never read as an attack), and batch mode so a rejected key fails
 // instead of hanging on a password prompt dropbear would never answer.
-func TestBuildSSHArgs(t *testing.T) {	args := buildSSHArgs("/usr/bin/ssh", "/home/u/.warmbox/ssh_client_key",
+func TestBuildSSHArgs(t *testing.T) {
+	args := buildSSHArgs("/usr/bin/ssh", "/home/u/.warmbox/ssh_client_key",
 		"/home/u/.warmbox/known_hosts", "abc123", "127.0.0.1", "2222",
 		[]string{"uptime"})
 	want := []string{"/usr/bin/ssh",
@@ -374,4 +375,36 @@ func hasPair(args []string, flag, value string) bool {
 		}
 	}
 	return false
+}
+
+// The macOS daemon must be a system LaunchDaemon that runs as the invoking
+// user, not root: macOS local-network privacy exempts launchd daemons but denies
+// per-user agents (Apple TN3179), and the old per-user agent is exactly what
+// left guests unreachable ("no route to host" / "could not reach the agent").
+// Pin the shape so an install cannot quietly regress to an agent or to root.
+func TestLaunchDaemonPlistRunsAsUser(t *testing.T) {
+	cfg := desktop.DefaultConfig()
+	cfg.WorkDir = "/Users/alice/.warmbox"
+	owner := serviceOwner{name: "alice", group: "staff", uid: 501, gid: 20, home: "/Users/alice"}
+	plist, err := renderLaunchDaemonPlist(cfg, 1, owner)
+	if err != nil {
+		t.Fatalf("renderLaunchDaemonPlist: %v", err)
+	}
+	for _, want := range []string{
+		"<key>Label</key><string>com.warmbox.daemon</string>",
+		"<key>UserName</key><string>alice</string>",
+		"<key>GroupName</key><string>staff</string>",
+		"<key>HOME</key><string>/Users/alice</string>",
+		"<key>RunAtLoad</key><true/>",
+		"<key>KeepAlive</key><true/>",
+		"--workdir",
+		"/Users/alice/.warmbox",
+	} {
+		if !strings.Contains(plist, want) {
+			t.Errorf("plist missing %q:\n%s", want, plist)
+		}
+	}
+	if strings.Contains(plist, "<string>root</string>") {
+		t.Errorf("plist names root as the run user:\n%s", plist)
+	}
 }

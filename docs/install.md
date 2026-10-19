@@ -42,7 +42,8 @@ sudo rpm -i warmbox_0.5.5_linux_amd64.rpm        # Fedora/RHEL
 The `.deb` and `.rpm` deliberately do not fetch the guest image — that stays
 `warmbox setup`. Or unpack the tarball for your platform and run the same
 commands as everyone else: `./warmbox setup`, then
-`./warmbox service install --pool 1`.
+`./warmbox service install --pool 1` (`sudo` it on macOS — see
+[running.md](running.md#macos)).
 
 ## Updating
 

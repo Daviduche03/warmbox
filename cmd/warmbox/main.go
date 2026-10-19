@@ -18,6 +18,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"os/user"
 	"path/filepath"
 	"runtime"
 	"slices"
@@ -304,18 +305,83 @@ func (l listFlag) Set(s string) error {
 
 const warmboxLabel = "com.warmbox.daemon"
 
-func launchAgentPath() string {
-	home, _ := os.UserHomeDir()
+// On macOS the daemon runs as a system LaunchDaemon (/Library/LaunchDaemons),
+// not a per-user LaunchAgent. macOS local-network privacy (Apple TN3179)
+// exempts launchd *daemons* — and root, and Terminal/SSH children — but
+// explicitly not launchd *agents*. An agent is therefore denied vmnet, the
+// 192.168.64.0/24 network vfkit puts guests on: the daemon cannot dial its own
+// guests, and every exec, console and `warmbox connect` fails with
+// "no route to host" (which the API reports as "could not reach the desktop's
+// agent"). A daemon is exempt, so this is the shape that reaches guests.
+func launchDaemonPath() string {
+	return filepath.Join("/Library/LaunchDaemons", warmboxLabel+".plist")
+}
+
+// legacyLaunchAgentPath is the old per-user path. `service install` migrates
+// away from it; it survives so the stale plist can be found and removed.
+func legacyLaunchAgentPath(home string) string {
 	return filepath.Join(home, "Library", "LaunchAgents", warmboxLabel+".plist")
 }
 
-// launchdLoaded reports whether the warmbox background service is loaded.
+// serviceOwner is the account the daemon runs as: the user who invoked
+// `sudo warmbox service install`, never root. The daemon owns that user's
+// ~/.warmbox, and it still reaches vmnet because local-network privacy exempts
+// a launchd daemon regardless of the uid it runs as (TN3179).
+type serviceOwner struct {
+	name  string
+	group string
+	uid   int
+	gid   int
+	home  string
+}
+
+// resolveServiceOwner finds the real user behind a possible `sudo`. sudo sets
+// SUDO_USER to the invoking account; without it (already root, or no sudo) we
+// fall back to the current user.
+func resolveServiceOwner() (serviceOwner, error) {
+	name := os.Getenv("SUDO_USER")
+	if name == "" || name == "root" {
+		u, err := user.Current()
+		if err != nil {
+			return serviceOwner{}, err
+		}
+		name = u.Username
+	}
+	u, err := user.Lookup(name)
+	if err != nil {
+		return serviceOwner{}, fmt.Errorf("cannot resolve user %q: %w", name, err)
+	}
+	uid, _ := strconv.Atoi(u.Uid)
+	gid, _ := strconv.Atoi(u.Gid)
+	group := u.Gid
+	if grp, err := user.LookupGroupId(u.Gid); err == nil {
+		group = grp.Name
+	}
+	return serviceOwner{name: u.Username, group: group, uid: uid, gid: gid, home: u.HomeDir}, nil
+}
+
+// launchdLoaded reports whether the warmbox daemon is loaded. It checks the
+// system domain (the supported install) and, for an install that predates the
+// LaunchDaemon, the invoking user's per-user agent domain.
 func launchdLoaded() bool {
 	if runtime.GOOS != "darwin" {
 		return false
 	}
-	domain := fmt.Sprintf("gui/%d", os.Getuid())
-	c := exec.Command("launchctl", "print", domain+"/"+warmboxLabel)
+	if launchctlPrint("system/" + warmboxLabel) {
+		return true
+	}
+	uid := os.Getuid()
+	if s := os.Getenv("SUDO_UID"); s != "" {
+		if n, err := strconv.Atoi(s); err == nil {
+			uid = n
+		}
+	}
+	return launchctlPrint(fmt.Sprintf("gui/%d/%s", uid, warmboxLabel))
+}
+
+// launchctlPrint reports whether launchctl knows about a target (a loaded job).
+func launchctlPrint(target string) bool {
+	c := exec.Command("launchctl", "print", target)
 	c.Stdout, c.Stderr = nil, nil
 	return c.Run() == nil
 }
@@ -389,13 +455,16 @@ func appendServiceFlags(args []string, cfg *desktop.Config) []string {
 	return args
 }
 
-func writeLaunchAgent(cfg *desktop.Config, pool int) error {
+// renderLaunchDaemonPlist builds the system plist. It runs as the invoking
+// user (UserName + GroupName + HOME), so the daemon owns that user's ~/.warmbox
+// while still counting as a launchd daemon for local-network privacy.
+func renderLaunchDaemonPlist(cfg *desktop.Config, pool int, owner serviceOwner) (string, error) {
 	if vf, err := exec.LookPath(cfg.VfkitPath); err == nil {
 		cfg.VfkitPath = vf
 	}
 	self, err := os.Executable()
 	if err != nil {
-		return err
+		return "", err
 	}
 	logPath := filepath.Join(cfg.WorkDir, "daemon.log")
 
@@ -426,22 +495,66 @@ func writeLaunchAgent(cfg *desktop.Config, pool int) error {
 <plist version="1.0">
 <dict>
   <key>Label</key><string>%s</string>
+  <key>UserName</key><string>%s</string>
+  <key>GroupName</key><string>%s</string>
   <key>ProgramArguments</key>
   <array>
 %s  </array>
   <key>EnvironmentVariables</key>
-  <dict><key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string></dict>
+  <dict>
+    <key>HOME</key><string>%s</string>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>StandardOutPath</key><string>%s</string>
   <key>StandardErrorPath</key><string>%s</string>
 </dict>
 </plist>
-`, warmboxLabel, b.String(), esc(logPath), esc(logPath))
-	if err := os.MkdirAll(filepath.Dir(launchAgentPath()), 0o755); err != nil {
+`, warmboxLabel, esc(owner.name), esc(owner.group), b.String(), esc(owner.home), esc(logPath), esc(logPath))
+	return plist, nil
+}
+
+// writeLaunchDaemon installs the plist into /Library/LaunchDaemons. launchd
+// requires the file to be root:wheel 0644, so this must run as root (via sudo).
+func writeLaunchDaemon(plist string) error {
+	if err := os.MkdirAll(filepath.Dir(launchDaemonPath()), 0o755); err != nil {
 		return err
 	}
-	return os.WriteFile(launchAgentPath(), []byte(plist), 0o644)
+	if err := os.WriteFile(launchDaemonPath(), []byte(plist), 0o644); err != nil {
+		return err
+	}
+	if err := os.Chown(launchDaemonPath(), 0, 0); err != nil {
+		return err
+	}
+	return os.Chmod(launchDaemonPath(), 0o644)
+}
+
+// ensureDirsOwned creates the daemon's state directories owned by the user it
+// runs as. `sudo warmbox service install` runs as root, so a plain MkdirAll
+// would leave the daemon unable to write its own state.
+func ensureDirsOwned(cfg *desktop.Config, owner serviceOwner) error {
+	dirs := []string{cfg.WorkDir, filepath.Join(cfg.WorkDir, "vms"), filepath.Join(cfg.WorkDir, "snapshots")}
+	if cfg.VolumeDir != "" {
+		dirs = append(dirs, cfg.VolumeDir)
+	}
+	for _, d := range dirs {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			return err
+		}
+		if err := os.Chown(d, owner.uid, owner.gid); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// migrateLegacyAgent removes a per-user LaunchAgent left by an older install.
+// It must be booted out before the system daemon starts, or the old job keeps
+// the API port and the daemon cannot bind.
+func migrateLegacyAgent(owner serviceOwner, lcQuiet func(...string) error) {
+	_ = lcQuiet("bootout", fmt.Sprintf("gui/%d/%s", owner.uid, warmboxLabel))
+	_ = os.Remove(legacyLaunchAgentPath(owner.home))
 }
 
 // cmdService manages the warmbox daemon as a background service: launchd on
@@ -457,7 +570,9 @@ func cmdService(args []string) {
 	}
 }
 
-// serviceLaunchd manages the daemon as a launchd user agent (macOS).
+// serviceLaunchd manages the daemon as a system launchd daemon (macOS). A
+// system daemon is what reaches vmnet guests under local-network privacy; see
+// the note on launchDaemonPath.
 func serviceLaunchd(args []string) {
 	cfg := desktop.DefaultConfig()
 	pool := 0
@@ -483,7 +598,17 @@ func serviceLaunchd(args []string) {
 	setFlags := map[string]bool{}
 	fs.Visit(func(f *flag.Flag) { setFlags[f.Name] = true })
 
-	domain := fmt.Sprintf("gui/%d", os.Getuid())
+	owner, err := resolveServiceOwner()
+	if err != nil {
+		fatal("Error: %v", err)
+	}
+	// Under sudo, HOME is root's home. The service belongs to the human who ran
+	// it, so default the state directory there too.
+	if !setFlags["workdir"] {
+		cfg.WorkDir = filepath.Join(owner.home, ".warmbox")
+	}
+
+	domain := "system"
 	target := domain + "/" + warmboxLabel
 	lc := func(a ...string) error {
 		cmd := exec.Command("launchctl", a...)
@@ -493,50 +618,72 @@ func serviceLaunchd(args []string) {
 	lcQuiet := func(a ...string) error {
 		return exec.Command("launchctl", a...).Run()
 	}
-	loaded := func() bool {
-		c := exec.Command("launchctl", "print", target)
-		c.Stdout, c.Stderr = nil, nil
-		return c.Run() == nil
-	}
+	loaded := func() bool { return launchctlPrint(target) }
 	// bootstrap can race a just-issued bootout (launchd returns before the old
 	// process exits), so retry briefly.
 	bootstrap := func() error {
 		var err error
 		for i := 0; i < 10; i++ {
-			if err = lc("bootstrap", domain, launchAgentPath()); err == nil {
+			if err = lc("bootstrap", domain, launchDaemonPath()); err == nil {
 				return nil
 			}
 			time.Sleep(400 * time.Millisecond)
 		}
 		return err
 	}
+	// explainRoot teaches the fix instead of just refusing. Writing the plist to
+	// /Library/LaunchDaemons and bootstrapping the system domain are privileged,
+	// but the daemon still runs as the invoking user, not root.
+	explainRoot := func(verb string) {
+		self, _ := os.Executable()
+		fatal(`a system LaunchDaemon is required on macOS so the daemon can reach its guests.
+
+macOS local-network privacy exempts launchd *daemons* but denies per-user
+*agents* (Apple TN3179), so a per-user service cannot connect to the vmnet
+guests — every exec, console and "warmbox connect" fails with "no route to
+host". Install warmbox in the system domain instead (it still runs as %s):
+
+  sudo %s service %s`, owner.name, self, verb)
+	}
 	// Rewrite the plist when asked to (install), when flags are given, or when
-	// no plist exists yet — but not on a bare start/restart, which must keep
-	// the configured pool/image.
-	needWrite := sub == "install" || len(setFlags) > 0 || !stat(launchAgentPath())
+	// no plist exists yet — but not on a bare start/restart, which must keep the
+	// configured pool/image.
+	needWrite := sub == "install" || len(setFlags) > 0 || !stat(launchDaemonPath())
 
 	switch sub {
 	case "install", "start":
-		if err := cfg.EnsureDirs(); err != nil {
+		if os.Geteuid() != 0 {
+			explainRoot(sub)
+		}
+		if err := ensureDirsOwned(cfg, owner); err != nil {
 			fatal("Error: %v", err)
 		}
 		if needWrite {
-			if err := writeLaunchAgent(cfg, pool); err != nil {
+			plist, err := renderLaunchDaemonPlist(cfg, pool, owner)
+			if err != nil {
+				fatal("Error: %v", err)
+			}
+			if err := writeLaunchDaemon(plist); err != nil {
 				fatal("Error: %v", err)
 			}
 		}
-		if sub == "install" || !loaded() {
-			if sub == "install" {
-				_ = lcQuiet("bootout", target)
-			}
+		if sub == "install" {
+			// Boot out any older install first, or it keeps the API port.
+			migrateLegacyAgent(owner, lcQuiet)
+			_ = lcQuiet("bootout", target)
+		}
+		if !loaded() {
 			if err := bootstrap(); err != nil {
 				fatal("Error: %v", err)
 			}
 		} else if err := lc("kickstart", target); err != nil {
 			fatal("Error: %v", err)
 		}
-		fmt.Fprintf(os.Stderr, "started %s\n", warmboxLabel)
+		fmt.Fprintf(os.Stderr, "started %s (system LaunchDaemon, running as %s)\n", warmboxLabel, owner.name)
 	case "stop":
+		if os.Geteuid() != 0 {
+			explainRoot("stop")
+		}
 		if !loaded() {
 			fmt.Fprintln(os.Stderr, "not running")
 			return
@@ -546,8 +693,15 @@ func serviceLaunchd(args []string) {
 		}
 		fmt.Fprintln(os.Stderr, "stopped")
 	case "restart":
+		if os.Geteuid() != 0 {
+			explainRoot("restart")
+		}
 		if needWrite {
-			if err := writeLaunchAgent(cfg, pool); err != nil {
+			plist, err := renderLaunchDaemonPlist(cfg, pool, owner)
+			if err != nil {
+				fatal("Error: %v", err)
+			}
+			if err := writeLaunchDaemon(plist); err != nil {
 				fatal("Error: %v", err)
 			}
 		}
@@ -559,9 +713,18 @@ func serviceLaunchd(args []string) {
 		}
 		fmt.Fprintln(os.Stderr, "restarted")
 	case "status":
+		if !stat(launchDaemonPath()) {
+			if stat(legacyLaunchAgentPath(owner.home)) {
+				self, _ := os.Executable()
+				fmt.Fprintln(os.Stderr, "installed as a per-user LaunchAgent, which macOS local-network privacy blocks from reaching guests.")
+				fmt.Fprintf(os.Stderr, "reinstall as a system daemon:  sudo %s service install\n", self)
+				return
+			}
+			fmt.Fprintln(os.Stderr, "not installed")
+			return
+		}
 		if !loaded() {
 			fmt.Fprintln(os.Stderr, "not running")
-			return
 		}
 		_ = lc("print", target)
 	default:

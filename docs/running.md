@@ -24,9 +24,32 @@ readiness callback. The API is never reachable from the network, and guests can
 still report that they booted.
 
 ```sh
-warmbox service install --pool 1   # launchd on macOS, systemd on Linux
+warmbox service install --pool 1   # launchd on macOS (via sudo), systemd on Linux
 warmbox service status             # start | stop | restart | status
 ```
+
+## macOS
+
+On macOS the daemon runs as a system **LaunchDaemon**
+(`/Library/LaunchDaemons/com.warmbox.daemon.plist`), not a per-user agent. Apple
+gates access to the local network behind the **Local Network** privacy setting,
+and its rules (TN3179) exempt launchd *daemons* but deny per-user *agents*.
+vfkit puts guests on vmnet (`192.168.64.0/24`), so a per-user agent cannot dial
+its own guests — every exec, console and `warmbox connect` fails with
+`no route to host`. A system daemon is exempt, so that is what warmbox installs.
+
+Install it with sudo, once:
+
+```sh
+sudo warmbox service install --pool 1
+```
+
+It runs as **you**, not root, so it still owns `~/.warmbox` — being a launchd
+daemon is what makes it exempt, and that does not depend on the uid it runs as.
+`sudo` here only writes the plist and asks launchd to load it. `service status`
+works without sudo; `start`, `stop` and `restart` manage the system domain and so
+need it too. An install from an older version that left a per-user agent is
+migrated automatically on the next `sudo warmbox service install`.
 
 ## Linux
 

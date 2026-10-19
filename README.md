@@ -44,6 +44,7 @@ curl -fsSL https://raw.githubusercontent.com/Daviduche03/warmbox/master/install.
 warmbox setup
 
 # 3. Run it in the background with one desktop kept ready
+# (sudo it on macOS — the service runs as a system daemon so it can reach guests)
 warmbox service install --pool 1
 ```
 
