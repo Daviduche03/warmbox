@@ -100,4 +100,8 @@ homebrew_casks:
         warmbox setup
         warmbox service install --pool 1
 
+      On macOS, run the service line with sudo: the daemon installs as a
+      system LaunchDaemon (it still runs as you), because macOS local-network
+      privacy exempts launchd daemons but not per-user agents.
+
       The dashboard is on http://localhost:7070
