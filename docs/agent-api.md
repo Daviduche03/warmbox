@@ -1,9 +1,10 @@
 # Agent API — design (for review)
 
-Status: **exec+e files, plus background/streaming runs and interactive sessions.**
+Status: **exec+files, background/streaming runs, interactive sessions, screen
+and input, command history.**
 `warmbox-agent` runs in the guest; the daemon proxies `POST /api/desktops/{id}/exec`,
-the `/file(s)` routes, and the `/runs` + `/sessions` routes to it. Remaining:
-screenshot/input (computer-use), and the SDKs.
+the `/file(s)` routes, the `/runs` + `/sessions` routes, and the screen, input,
+history and process routes to it.
 
 Let an agent (or the host / an SDK) **run commands, move files, and (optionally)
 drive the screen** inside a warmbox VM — without noVNC and without SSH keys.
@@ -61,12 +62,45 @@ POST   /api/desktops/{id}/file/move  {from,to}
 - rooted at a configurable **agent root** (default `/`; recommend `/workspace` or
   the volume). Path-traversal protected.
 
-### Screen / input (computer-use) — phase 3
+### Screen / input (computer-use)
 ```
 GET  /api/desktops/{id}/screenshot                       → PNG
+GET  /api/desktops/{id}/screen                           → {width, height}
 POST /api/desktops/{id}/input  {type:"text"|"key"|"move"|"click", …}
 ```
 - implemented in the guest with `xwd` (+ an X image tool) and `xdotool`.
+- `text` is `{"type":"text","text":"hello"}`; `key` is `{"type":"key","key":"Return"}`
+  (any xdotool key name); `click` is `{"type":"click","x":100,"y":200,"button":"left"}`;
+  `move` is `{"type":"move","x":100,"y":200}`.
+- The guest injects the input with XTEST, so it lands on the focused window
+  whatever is streaming the screen.
+
+**Why the guest does the input, and not the VNC server:** the guest's VNC
+server (TigerVNC) accepts key events on the wire and then drops them before
+they reach the X server. This was checked properly, not assumed: the RFB
+`KeyEvent` bytes are correct on the wire, pointer events and screen updates
+work, the same keystrokes work through XTEST (`xdotool`), and the same
+failure reproduces in a real browser with noVNC — the canvas focused, real key
+events dispatched, nothing arriving in the guest. `AcceptKeyEvents`,
+`xkeyboard-config` and TigerVNC's `RawKeyboard` were each tried and none of
+them changes it.
+
+So a guest that cannot be typed into over VNC is a desktop you can only look
+at, which is why warmbox drives the screen through its own agent instead, and
+the VNC server is left to do what it is good at: showing the screen. The
+limitation is recorded in [limitations.md](limitations.md): a human cannot
+type into the browser console yet.
+
+### History and processes
+```
+GET /api/desktops/{id}/history?limit=50
+→ 200 { "entries": [ {id, cmd, cwd, started, ended, exit, output}, … ] }
+GET /api/desktops/{id}/processes
+→ 200 { "processes": [ {pid, ppid, user, etime, args}, … ] }
+```
+- The history is kept by the guest, on the guest's own disk, so it outlives
+  the host daemon and says what happened in that desktop rather than in the
+  daemon that happened to be running.
 
 ## Guest agent internals
 - Single Go binary, `CGO_ENABLED=0`, a few MB, baked into the base image.

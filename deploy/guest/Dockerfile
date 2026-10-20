@@ -31,7 +31,10 @@ ARG DESKTOP=xfce
 ARG THEME=default
 
 # What every image needs: kernel modules, the shell tools the agent and its
-# users reach for, dbus, and the compressor the final step packs with.
+# users reach for, dbus, and the compressor the final step packs with. The
+# X tools are here too: the agent drives the desktop through xdotool (the
+# VNC servers drop keystrokes), needs a keymap to make that work, and grabs
+# screenshots with ImageMagick.
 RUN set -eux; \
     apk add --no-cache \
         iproute2 socat bash procps coreutils \
@@ -39,7 +42,8 @@ RUN set -eux; \
         darkhttpd \
         dbus \
         curl zstd \
-        dropbear
+        dropbear \
+        imagemagick setxkbmap xdotool xkbcomp xkeyboard-config xwd
 
 # The screen: TigerVNC plus the X plumbing both session layers share, then the
 # session itself — XFCE (default) or LXQt-Ambiance, so squashfs/overlay/VNC

@@ -9,6 +9,75 @@ export interface RequestOptions {
   signal?: AbortSignal;
 }
 
+export interface ListOptions extends RequestOptions {
+  limit?: number;
+  cursor?: string;
+}
+
+export interface PageInfo {
+  nextCursor?: string | null;
+  hasMore?: boolean;
+  limit?: number;
+}
+
+export interface DesktopList {
+  desktops: Desktop[];
+  pageInfo?: PageInfo;
+}
+
+export interface Volume {
+  name: string;
+  size?: number;
+  chunk_size?: number;
+  created?: string;
+  created_at?: string;
+  updated_at?: string;
+  remote?: string;
+  from?: string;
+  workspace_id?: string;
+}
+
+export interface VolumeList {
+  volumes: Volume[];
+  pageInfo?: PageInfo;
+}
+
+export interface Snapshot {
+  id: string;
+  volume?: string;
+  size?: number;
+  chunk_size?: number;
+  created_at?: string;
+  workspace_id?: string;
+}
+
+export interface SnapshotList {
+  snapshots: Snapshot[];
+  pageInfo?: PageInfo;
+}
+
+export interface HistoryEntry {
+  id: string;
+  command: string;
+  startedAt: string;
+  endedAt: string;
+  exitCode: number;
+  output: string;
+}
+
+export interface ProcessInfo {
+  pid: number;
+  ppid: number;
+  user: string;
+  etime: string;
+  args: string;
+}
+
+export interface ErrorDetails {
+  retryable?: boolean;
+  [key: string]: unknown;
+}
+
 export interface CreateDesktopOptions {
   volume?: string;
   image?: string;
@@ -16,6 +85,12 @@ export interface CreateDesktopOptions {
   mem_mib?: number;
   allow?: string[];
   deny?: string[];
+  /** Auto-stop delay in seconds; 0 means the desktop never auto-stops. */
+  ttlSeconds?: number;
+  /** Daemon-side spelling of `ttlSeconds`; both are accepted. */
+  ttl_seconds?: number;
+  /** Key that makes a repeated create return the same desktop. */
+  idempotencyKey?: string;
 }
 
 export interface CreatedDesktop {

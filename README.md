@@ -188,6 +188,7 @@ The details are in [docs/limitations.md](docs/limitations.md).
 | [Volumes](docs/volumes.md) | Volumes, sizing, API |
 | [Snapshots](docs/snapshots.md) | Snapshots and the fast resume plan |
 | [Agent API](docs/agent-api.md) | Running commands, files, sessions |
+| [HTTP API](docs/api.md) | The API: answers, paging, retries, creating desktops |
 | [Egress](docs/egress.md) | Controlling what a desktop can reach on the network |
 | [Limitations](docs/limitations.md) | What it can't do yet, in detail |
 | [Architecture](docs/architecture.md) | How volumes and snapshots are designed |

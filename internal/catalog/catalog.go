@@ -184,6 +184,18 @@ CREATE TABLE IF NOT EXISTS snapshots (
 );
 CREATE INDEX IF NOT EXISTS idx_desktops_volume ON desktops(volume);
 CREATE INDEX IF NOT EXISTS idx_snapshots_volume ON snapshots(volume);
+CREATE TABLE IF NOT EXISTS idempotency (
+    workspace_id TEXT NOT NULL,
+    key         TEXT NOT NULL,
+    body_hash   TEXT NOT NULL,
+    response    TEXT NOT NULL,
+    created_at  TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, key)
+);
+CREATE TABLE IF NOT EXISTS desktop_deadlines (
+    desktop_id TEXT PRIMARY KEY,
+    expires_at TEXT NOT NULL
+);
 `)
 	return err
 }

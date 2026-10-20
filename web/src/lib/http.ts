@@ -8,9 +8,11 @@
 
 export class ApiError extends Error {
   status: number;
-  constructor(message: string, status: number) {
+  code?: string;
+  constructor(message: string, status: number, code?: string) {
     super(message);
     this.status = status;
+    this.code = code;
     this.name = "ApiError";
   }
 }
@@ -35,13 +37,17 @@ export async function request<T>(path: string, init: RequestInit = {}): Promise<
   }
   if (!res.ok) {
     let msg = res.statusText;
+    let code: string | undefined;
     try {
       const body = await res.json();
-      msg = body?.error ?? msg;
+      // The API answers a failure with a structured envelope: the message is
+      // a sentence, the code is the machine-readable half.
+      msg = body?.error?.message ?? body?.message ?? msg;
+      code = body?.error?.code ?? body?.code;
     } catch {
       /* not json */
     }
-    throw new ApiError(msg || `request failed (${res.status})`, res.status);
+    throw new ApiError(msg || `request failed (${res.status})`, res.status, code);
   }
   if (res.status === 204) return undefined as T;
   const text = await res.text();

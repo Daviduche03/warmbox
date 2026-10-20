@@ -1115,6 +1115,10 @@ func cmdDaemon(args []string) {
 
 	apiSrv := api.New(mgr, p, cfg, store, cat, os.Stderr)
 
+	// Desktops that were given a lifetime stop by themselves when it runs
+	// out. The deadline lives in the catalog, so it survives a restart.
+	apiSrv.StartExpiryReaper(ctx)
+
 	// Leases never survive their VM, but they survive a daemon crash (SQLite
 	// outlives the process that wrote it): reclaim anything a dead run left
 	// held, or its volumes 409 forever.
@@ -1993,13 +1997,21 @@ func cmdLogin(args []string) {
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(resp.Body)
 		var msg struct {
-			Error string `json:"error"`
+			Error   json.RawMessage `json:"error"`
+			Message string          `json:"message"`
 		}
 		_ = json.Unmarshal(b, &msg)
-		if msg.Error == "" {
-			msg.Error = resp.Status
+		text := msg.Message
+		if text == "" {
+			var s string
+			if json.Unmarshal(msg.Error, &s) == nil {
+				text = s
+			}
 		}
-		fatal("login failed: %s", msg.Error)
+		if text == "" {
+			text = resp.Status
+		}
+		fatal("login failed: %s", text)
 	}
 	var session string
 	for _, c := range resp.Cookies() {
@@ -2513,13 +2525,28 @@ func checkpointFlags(args []string, name string) (addr, token string, rest []str
 	return addr, token, rest
 }
 
-// apiErr reads the daemon's {"error": ...} body, falling back to the status.
+// apiErr reads the daemon's error envelope, falling back to the status. The
+// envelope carries the message twice — at the top and inside "error" — and an
+// older daemon sent it as a bare string, so both shapes are read.
 func apiErr(resp *http.Response) string {
 	var e struct {
-		Error string `json:"error"`
+		Error   json.RawMessage `json:"error"`
+		Message string          `json:"message"`
 	}
-	if json.NewDecoder(resp.Body).Decode(&e) == nil && e.Error != "" {
-		return e.Error
+	if json.NewDecoder(resp.Body).Decode(&e) == nil {
+		if e.Message != "" {
+			return e.Message
+		}
+		var s string
+		if json.Unmarshal(e.Error, &s) == nil && s != "" {
+			return s
+		}
+		var inner struct {
+			Message string `json:"message"`
+		}
+		if json.Unmarshal(e.Error, &inner) == nil && inner.Message != "" {
+			return inner.Message
+		}
 	}
 	return resp.Status
 }

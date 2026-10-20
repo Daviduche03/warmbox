@@ -21,6 +21,24 @@ NAT, so that port is never on the LAN.
 What remains is the guest itself. It runs as root, and none of this is hardened
 against someone who already has the desktop.
 
+## You cannot type into the browser console yet
+
+The desktop streams to the browser, and the mouse works — but **keystrokes do
+not reach the guest over VNC**. The VNC server accepts the key events and
+then drops them before they reach the X server, while the same keystrokes
+work over the agent's own channel.
+
+This was checked rather than assumed: the RFB bytes on the wire are correct,
+pointer events and screen updates work, `xdotool` (XTEST) types into the
+guest perfectly, and the same failure reproduces in a real browser with
+noVNC. `AcceptKeyEvents`, `xkeyboard-config` and TigerVNC's `RawKeyboard`
+were each tried; none of them changes it.
+
+So today the browser console is a *watch* screen, not a *drive* screen. An
+agent is not blocked: it types through the agent API instead —
+`POST /api/desktops/{id}/input` — which works. Fixing the human path means
+either a different VNC server in the guest or a newer TigerVNC.
+
 ## EFI disk images are macOS-only
 
 Omarchy is an EFI disk and the QEMU backend ships no OVMF firmware, so it cannot

@@ -45,6 +45,9 @@ func main() {
 		fmt.Fprintln(os.Stderr, "warmbox-agent: reset signals:", err)
 		os.Exit(1)
 	}
+	// The stored history is read once at startup so a restart keeps the tail.
+	loadHistory()
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "ok") })
 	mux.HandleFunc("POST /exec", handleExec)
@@ -64,6 +67,16 @@ func main() {
 	mux.HandleFunc("GET /sessions/{id}/output", handleRunStream)
 	mux.HandleFunc("GET /sessions/{id}", handleRunGet)
 	mux.HandleFunc("DELETE /sessions/{id}", handleRunKill)
+
+	// Synthetic input + screen capture: the VNC path drops keystrokes, so
+	// the host drives the desktop through XTEST instead (see input.go).
+	mux.HandleFunc("POST /input", handleInput)
+	mux.HandleFunc("GET /screen", handleScreen)
+	mux.HandleFunc("GET /screenshot", handleScreenshot)
+
+	// History of what ran in the guest, and a process listing.
+	mux.HandleFunc("GET /history", handleHistory)
+	mux.HandleFunc("GET /processes", handleProcesses)
 
 	mux.HandleFunc("GET /files", handleList)
 	mux.HandleFunc("GET /file", handleRead)
@@ -213,6 +226,8 @@ func handleExec(w http.ResponseWriter, r *http.Request) {
 	if cmd.ProcessState != nil {
 		code = cmd.ProcessState.ExitCode()
 	}
+	end := time.Now()
+	recordHistory(describeExec(req.Cmd, req.Argv), execCwd(cmd.Dir), start, end, code, out.String()+errw.String())
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(execResp{
 		Exit: code, Stdout: out.String(), Stderr: errw.String(),

@@ -8,6 +8,72 @@ class CreateDesktopOptions(TypedDict, total=False):
     mem_mib: int
     allow: list[str]
     deny: list[str]
+    # Auto-stop delay in seconds; 0 means the desktop never auto-stops.
+    ttl_seconds: int
+    # Sent as the Idempotency-Key header rather than in the request body.
+    idempotency_key: str
+
+
+class ErrorDetails(TypedDict, total=False):
+    retryable: bool
+
+
+class PageInfo(TypedDict, total=False):
+    nextCursor: str | None
+    hasMore: bool
+    limit: int
+
+
+class DesktopList(TypedDict, total=False):
+    desktops: list["Desktop"]
+    pageInfo: PageInfo
+
+
+class Volume(TypedDict, total=False):
+    name: str
+    size: int
+    chunk_size: int
+    created: str
+    created_at: str
+    updated_at: str
+    remote: str
+    workspace_id: str
+
+
+class VolumeList(TypedDict, total=False):
+    volumes: list[Volume]
+    pageInfo: PageInfo
+
+
+class Snapshot(TypedDict, total=False):
+    id: str
+    volume: str
+    size: int
+    chunk_size: int
+    created_at: str
+    workspace_id: str
+
+
+class SnapshotList(TypedDict, total=False):
+    snapshots: list[Snapshot]
+    pageInfo: PageInfo
+
+
+class HistoryEntry(TypedDict, total=False):
+    id: str
+    command: str
+    startedAt: str
+    endedAt: str
+    exitCode: int
+    output: str
+
+
+class ProcessInfo(TypedDict, total=False):
+    pid: int
+    ppid: int
+    user: str
+    etime: str
+    args: str
 
 
 class CreatedDesktop(TypedDict):

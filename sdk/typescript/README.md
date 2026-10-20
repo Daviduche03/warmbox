@@ -52,6 +52,51 @@ for await (const event of client.streamRun(desktopId, run.id)) {
 }
 ```
 
+## Errors
+
+The daemon returns a structured error envelope. `APIError` exposes it:
+
+```typescript
+try {
+  await client.exec(desktopId, { cmd: "uname -a" });
+} catch (error) {
+  if (error instanceof APIError) {
+    console.error(error.status);     // 409
+    console.error(error.code);       // "desktop_not_ready"
+    console.error(error.serverMessage); // "the desktop is still booting"
+    console.error(error.details);    // { retryable: true }
+    console.error(error.requestId);  // "req_1a2b3c4d"
+  }
+}
+```
+
+`code` is a stable snake_case slug, `details` is optional and may carry
+`retryable: true` for transient failures, and `requestId` is echoed in the
+`X-Request-Id` response header. `error.message` stays human-readable and
+`error.retryable` is a shortcut for `details.retryable`.
+
+## Lifetimes, pagination and history
+
+`createDesktop` accepts `ttlSeconds` (0 = never auto-stop) and an
+`idempotencyKey`; repeating a key returns the same desktop.
+
+```typescript
+const desktop = await client.createDesktop({ image: "headless", ttlSeconds: 900, idempotencyKey: "job-42" });
+await client.extendDesktop(desktop.id, 1800);
+for (const entry of await client.listHistory(desktop.id)) console.log(entry.command, entry.exitCode);
+for (const process of await client.listProcesses(desktop.id)) console.log(process.pid, process.args);
+```
+
+`listDesktopsPage`, `listVolumes` and `listSnapshots` take `limit` (1-200) and
+`cursor` and return the daemon's `pageInfo`:
+
+```typescript
+let page = await client.listDesktopsPage({ limit: 50 });
+while (page.pageInfo?.hasMore) {
+  page = await client.listDesktopsPage({ limit: 50, cursor: page.pageInfo.nextCursor! });
+}
+```
+
 `streamRun` and `streamSession` yield output events followed by an exit event.
 They accept `{ from: byteOffset, signal }` to resume or cancel a stream.
 Reconnecting is explicit. A connection that ends without an exit event throws.
@@ -62,7 +107,9 @@ The client also provides `listDesktops`, `getDesktop`, `pauseDesktop`,
 `resumeDesktop`, `listFiles`, `deleteFile`, `moveFile`, `listRuns`,
 `getRun(id, runId, { tail })`, `writeStdin`, `createSession`, `sessionInput` and
 `destroySession`. Sessions keep shell state between inputs; `sessionInput`
-sends a shell line, while `writeStdin` sends raw bytes.
+sends a shell line, while `writeStdin` sends raw bytes. `extendDesktop`,
+`listHistory` and `listProcesses` cover a desktop's lifetime, command history
+and running processes.
 
 Requests default to a 120-second deadline (`timeoutMs`), separate from the
 guest's `timeout_ms`. Streams have no automatic deadline. Every method accepts
