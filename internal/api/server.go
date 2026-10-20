@@ -1283,8 +1283,19 @@ func (s *Server) ready(w http.ResponseWriter, r *http.Request) {
 			vm.SetVNCPassword(pass)
 		}
 	}
-	if !s.mgr.MarkReady(id, ip) {
-		writeErr(w, r, http.StatusNotFound, "invalid_request", "unknown vm", nil)
+	if err := s.mgr.MarkReady(id, ip); err != nil {
+		if errors.Is(err, desktop.ErrDuplicateGuestIP) {
+			// Two desktops at one address would make the daemon talk to the
+			// wrong one: an exec meant for one would run in the other. This
+			// boot cannot be trusted, so it is thrown away and another VM
+			// takes its place.
+			fmt.Fprintf(s.log, "api: desktop %s refused: %v\n", id, err)
+			_ = s.mgr.Destroy(id)
+			writeErr(w, r, http.StatusConflict, "guest_address_in_use",
+				"this desktop got an address that is already in use", nil)
+			return
+		}
+		writeErr(w, r, http.StatusNotFound, "unknown_vm", "unknown vm", nil)
 		return
 	}
 	if s.catalog != nil && id != "" {

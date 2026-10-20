@@ -85,6 +85,21 @@ always did.
 { "ttl_seconds": 7200 }
 ```
 
+## From the command line
+
+The CLI speaks the same API, and the session cookie or `--token` is enough:
+
+```sh
+warmbox create --ttl 600 --idempotency-key run-42
+warmbox extend <id> --ttl 3600
+warmbox history <id>
+warmbox processes <id>
+```
+
+A user API token is sent as an `Authorization` header, not in the URL, so it
+can authorize a write as well as a read. (A token in a query string only ever
+authorizes reads, because URLs leak into logs.)
+
 ## The guest, over HTTP
 
 The daemon proxies these to the agent inside the guest. They are the same

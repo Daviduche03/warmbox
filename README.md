@@ -79,6 +79,8 @@ warmbox create             # new desktop, prints its URL
 warmbox list               # your desktops
 warmbox connect <id>       # a terminal inside it
 warmbox ssh <id>           # real SSH into it
+warmbox history <id>       # what the guest has run
+warmbox extend <id> --ttl 3600   # stop it by itself in an hour
 warmbox destroy <id>       # remove it
 warmbox help               # everything else
 ```
