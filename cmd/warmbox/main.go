@@ -82,6 +82,12 @@ func main() {
 		cmdList(os.Args[2:])
 	case "destroy":
 		cmdDestroy(os.Args[2:])
+	case "extend":
+		cmdExtend(os.Args[2:])
+	case "history":
+		cmdHistory(os.Args[2:])
+	case "processes":
+		cmdProcesses(os.Args[2:])
 	case "connect":
 		cmdConnect(os.Args[2:])
 	case "ssh":
@@ -154,7 +160,7 @@ func cmdHome() {
 // unknownCommand prints a suggestion for a mistyped command (e.g. "deamon").
 func unknownCommand(cmd string) {
 	known := []string{"daemon", "service", "setup", "login", "logout", "create", "images", "image",
-		"list", "destroy", "volume", "snapshot", "version", "help"}
+		"list", "destroy", "extend", "history", "processes", "volume", "snapshot", "version", "help"}
 	best, dist := "", 3
 	for _, k := range known {
 		if d := editDistance(cmd, k); d < dist {
@@ -202,6 +208,8 @@ Usage:
   warmbox login             Sign in as a user (stores a session)
   warmbox logout            End the CLI session
   warmbox create            Provision a desktop, print its noVNC URL
+                            (--ttl 600 stops it by itself; --idempotency-key
+                            makes a retry safe)
   warmbox images            List the named guest images the daemon can boot
   warmbox image build <name> Build an image from the registry in deploy/images
                             (--all builds every image the checkout can build)
@@ -212,6 +220,10 @@ Usage:
   warmbox image list        List the local images (offline)
   warmbox list              List desktops
   warmbox destroy <id>      Destroy a desktop
+  warmbox extend <id> --ttl <seconds>
+                            Move a desktop's auto-stop deadline (0 = never)
+  warmbox history <id>      What the guest has run, with its output
+  warmbox processes <id>    What is running in the guest right now
   warmbox connect <id>      Open an interactive shell inside a desktop
                             (full terminal when the image supports it)
   warmbox ssh <id> [-- cmd]  SSH into a desktop (dropbear, key-only, port 22)
@@ -1115,6 +1127,10 @@ func cmdDaemon(args []string) {
 
 	apiSrv := api.New(mgr, p, cfg, store, cat, os.Stderr)
 
+	// Desktops that were given a lifetime stop by themselves when it runs
+	// out. The deadline lives in the catalog, so it survives a restart.
+	apiSrv.StartExpiryReaper(ctx)
+
 	// Leases never survive their VM, but they survive a daemon crash (SQLite
 	// outlives the process that wrote it): reclaim anything a dead run left
 	// held, or its volumes 409 forever.
@@ -1877,6 +1893,18 @@ func doAuthed(req *http.Request) (*http.Response, error) {
 // doAuthedTimeout is doAuthed with an explicit timeout; timeout <= 0 means
 // none (the connect output stream lives as long as the session).
 func doAuthedTimeout(req *http.Request, timeout time.Duration) (*http.Response, error) {
+	// A user API token in the query string only authorizes reads: the server
+	// refuses to let a URL authorize a mutation, because URLs leak into logs
+	// and history. The CLI builds its URLs with ?token= everywhere, so the
+	// token is moved into an Authorization header here, where it is safe and
+	// works for every method. Without this, `warmbox create --token ...` and
+	// every other write answered 401.
+	if q := req.URL.Query(); q.Get("token") != "" {
+		tok := q.Get("token")
+		q.Del("token")
+		req.URL.RawQuery = q.Encode()
+		req.Header.Set("Authorization", "Bearer "+tok)
+	}
 	if s := sessionCookieValue(); s != "" {
 		req.AddCookie(&http.Cookie{Name: "warmbox_session", Value: s})
 	}
@@ -1993,13 +2021,21 @@ func cmdLogin(args []string) {
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(resp.Body)
 		var msg struct {
-			Error string `json:"error"`
+			Error   json.RawMessage `json:"error"`
+			Message string          `json:"message"`
 		}
 		_ = json.Unmarshal(b, &msg)
-		if msg.Error == "" {
-			msg.Error = resp.Status
+		text := msg.Message
+		if text == "" {
+			var s string
+			if json.Unmarshal(msg.Error, &s) == nil {
+				text = s
+			}
 		}
-		fatal("login failed: %s", msg.Error)
+		if text == "" {
+			text = resp.Status
+		}
+		fatal("login failed: %s", text)
 	}
 	var session string
 	for _, c := range resp.Cookies() {
@@ -2063,30 +2099,50 @@ func cmdCreate(args []string) {
 	token := tokenDefault()
 	vol := ""
 	image := ""
+	ttl := 0
+	idemKey := ""
 	fs := flag.NewFlagSet("create", flag.ExitOnError)
 	fs.StringVar(&addr, "addr", addr, "daemon API address")
 	fs.StringVar(&token, "token", token, "user API token (or `warmbox login` first)")
 	fs.StringVar(&vol, "volume", "", "attach a persistent volume by name")
 	fs.StringVar(&image, "image", "", "boot from a named image (e.g. omarchy)")
+	fs.IntVar(&ttl, "ttl", 0, "stop the desktop by itself after this many seconds (0 = never)")
+	fs.StringVar(&idemKey, "idempotency-key", "", "make the create safe to retry: the same key returns the same desktop")
 	_ = fs.Parse(args)
 
-	req := map[string]string{}
+	req := map[string]any{}
 	if vol != "" {
 		req["volume"] = vol
 	}
 	if image != "" {
 		req["image"] = image
 	}
+	if ttl > 0 {
+		req["ttl_seconds"] = ttl
+	}
 	var body io.Reader
 	if len(req) > 0 {
 		b, _ := json.Marshal(req)
 		body = strings.NewReader(string(b))
 	}
-	resp, err := postAuthedTimeout(withToken(apiBase(addr)+"/api/desktops", token), "application/json", body, createTimeout)
+	req2, err := http.NewRequest(http.MethodPost, withToken(apiBase(addr)+"/api/desktops", token), body)
+	if err != nil {
+		fatal("Error: %v", err)
+	}
+	if len(req) > 0 {
+		req2.Header.Set("Content-Type", "application/json")
+	}
+	if idemKey != "" {
+		req2.Header.Set("Idempotency-Key", idemKey)
+	}
+	resp, err := doAuthedTimeout(req2, createTimeout)
 	if err != nil {
 		fatal("Error: %v", err)
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		fatal("create failed: %s", apiErr(resp))
+	}
 	var out struct {
 		ID  string `json:"id"`
 		VNC string `json:"vnc"`
@@ -2109,6 +2165,135 @@ func cmdCreate(args []string) {
 		loc = "/api/desktops/" + out.ID
 	}
 	fmt.Printf("%s%s\n", apiBase(addr), loc)
+}
+
+// desktopFlags parses the flags every desktop-scoped command shares: where the
+// daemon is and who to talk to it as. The command adds its own flags through
+// setup. The positional arguments come back too, so a command can take the
+// desktop's id.
+func desktopFlags(args []string, name string, setup ...func(*flag.FlagSet)) (addr, token string, rest []string) {
+	addr = ":7070"
+	token = tokenDefault()
+	fs := flag.NewFlagSet(name, flag.ExitOnError)
+	fs.StringVar(&addr, "addr", addr, "daemon API address")
+	fs.StringVar(&token, "token", token, "user API token (or `warmbox login` first)")
+	for _, f := range setup {
+		f(fs)
+	}
+	rest = parseInterspersed(fs, args)
+	return addr, token, rest
+}
+
+// cmdExtend moves a desktop's auto-stop deadline. A TTL of zero means the
+// desktop never stops by itself.
+func cmdExtend(args []string) {
+	ttl := 0
+	addr, token, rest := desktopFlags(args, "extend", func(fs *flag.FlagSet) {
+		fs.IntVar(&ttl, "ttl", 0, "seconds until the desktop stops (0 = never)")
+	})
+	if len(rest) != 1 {
+		fatal("Usage: warmbox extend <id> --ttl <seconds>   (0 = never stop by itself)")
+	}
+	if ttl < 0 {
+		fatal("--ttl must be 0 or more")
+	}
+	b, _ := json.Marshal(map[string]any{"ttl_seconds": ttl})
+	resp, err := postAuthed(withToken(apiBase(addr)+"/api/desktops/"+rest[0]+"/extend", token),
+		"application/json", strings.NewReader(string(b)))
+	if err != nil {
+		fatal("Error: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		fatal("extend failed: %s", apiErr(resp))
+	}
+	var out struct {
+		ExpiresAt string `json:"expiresAt"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&out)
+	if out.ExpiresAt == "" {
+		fmt.Fprintf(os.Stderr, "%s will not stop by itself\n", rest[0])
+		return
+	}
+	fmt.Fprintf(os.Stderr, "%s stops at %s\n", rest[0], out.ExpiresAt)
+}
+
+// cmdHistory lists what the guest has run. The guest keeps the record, so it
+// says what happened in that desktop rather than in the daemon.
+func cmdHistory(args []string) {
+	limit := 50
+	addr, token, rest := desktopFlags(args, "history", func(fs *flag.FlagSet) {
+		fs.IntVar(&limit, "limit", 50, "how many entries to show")
+	})
+	if len(rest) != 1 {
+		fatal("Usage: warmbox history <id> [--limit N]")
+	}
+	url := withToken(fmt.Sprintf("%s/api/desktops/%s/history?limit=%d", apiBase(addr), rest[0], limit), token)
+	resp, err := getAuthed(url)
+	if err != nil {
+		fatal("Error: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		fatal("history failed: %s", apiErr(resp))
+	}
+	var out struct {
+		Entries []struct {
+			Cmd    string `json:"cmd"`
+			Exit   int    `json:"exit"`
+			Output string `json:"output"`
+		} `json:"entries"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		fatal("Error decoding response: %v", err)
+	}
+	if len(out.Entries) == 0 {
+		fmt.Fprintln(os.Stderr, "nothing has run in that desktop yet")
+		return
+	}
+	for _, e := range out.Entries {
+		fmt.Printf("%-4d  %s\n", e.Exit, e.Cmd)
+		if e.Output != "" {
+			for _, line := range strings.Split(strings.TrimRight(e.Output, "\n"), "\n") {
+				fmt.Printf("      %s\n", line)
+			}
+		}
+	}
+}
+
+// cmdProcesses lists what is running in the guest now.
+func cmdProcesses(args []string) {
+	addr, token, rest := desktopFlags(args, "processes")
+	if len(rest) != 1 {
+		fatal("Usage: warmbox processes <id>")
+	}
+	resp, err := getAuthed(withToken(apiBase(addr)+"/api/desktops/"+rest[0]+"/processes", token))
+	if err != nil {
+		fatal("Error: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		fatal("processes failed: %s", apiErr(resp))
+	}
+	var out struct {
+		Processes []struct {
+			PID  int    `json:"pid"`
+			PPID int    `json:"ppid"`
+			User string `json:"user"`
+			Args string `json:"args"`
+		} `json:"processes"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		fatal("Error decoding response: %v", err)
+	}
+	if len(out.Processes) == 0 {
+		fmt.Fprintln(os.Stderr, "nothing is running")
+		return
+	}
+	fmt.Printf("%-7s %-7s %-10s %s\n", "PID", "PPID", "USER", "COMMAND")
+	for _, p := range out.Processes {
+		fmt.Printf("%-7d %-7d %-10s %s\n", p.PID, p.PPID, p.User, p.Args)
+	}
 }
 
 // cmdImage packs/pulls guest images and lists them offline.
@@ -2513,13 +2698,28 @@ func checkpointFlags(args []string, name string) (addr, token string, rest []str
 	return addr, token, rest
 }
 
-// apiErr reads the daemon's {"error": ...} body, falling back to the status.
+// apiErr reads the daemon's error envelope, falling back to the status. The
+// envelope carries the message twice — at the top and inside "error" — and an
+// older daemon sent it as a bare string, so both shapes are read.
 func apiErr(resp *http.Response) string {
 	var e struct {
-		Error string `json:"error"`
+		Error   json.RawMessage `json:"error"`
+		Message string          `json:"message"`
 	}
-	if json.NewDecoder(resp.Body).Decode(&e) == nil && e.Error != "" {
-		return e.Error
+	if json.NewDecoder(resp.Body).Decode(&e) == nil {
+		if e.Message != "" {
+			return e.Message
+		}
+		var s string
+		if json.Unmarshal(e.Error, &s) == nil && s != "" {
+			return s
+		}
+		var inner struct {
+			Message string `json:"message"`
+		}
+		if json.Unmarshal(e.Error, &inner) == nil && inner.Message != "" {
+			return inner.Message
+		}
 	}
 	return resp.Status
 }

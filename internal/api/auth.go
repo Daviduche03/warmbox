@@ -386,7 +386,7 @@ func (s *Server) setupStatus(w http.ResponseWriter, r *http.Request) {
 // the owner account and a session in one step.
 func (s *Server) setup(w http.ResponseWriter, r *http.Request) {
 	if s.catalog == nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "account store unavailable"})
+		writeErr(w, r, http.StatusServiceUnavailable, "invalid_request", "account store unavailable", nil)
 		return
 	}
 	if s.usersExist() {
@@ -394,7 +394,7 @@ func (s *Server) setup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !setupLimiter.allow(clientIP(r)) {
-		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "too many attempts, try again later"})
+		writeErr(w, r, http.StatusTooManyRequests, "invalid_request", "too many attempts, try again later", nil)
 		return
 	}
 	var req struct {
@@ -404,22 +404,22 @@ func (s *Server) setup(w http.ResponseWriter, r *http.Request) {
 		Workspace string `json:"workspace"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		writeErr(w, r, http.StatusBadRequest, "invalid_request", "invalid request body", nil)
 		return
 	}
 	req.Name = strings.TrimSpace(req.Name)
 	req.Email = strings.TrimSpace(req.Email)
 	req.Workspace = strings.TrimSpace(req.Workspace)
 	if req.Name == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name is required"})
+		writeErr(w, r, http.StatusBadRequest, "invalid_request", "name is required", nil)
 		return
 	}
 	if !validEmail(req.Email) {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "a valid email is required"})
+		writeErr(w, r, http.StatusBadRequest, "invalid_request", "a valid email is required", nil)
 		return
 	}
 	if len(req.Password) < minPasswordLen {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "password must be at least 8 characters"})
+		writeErr(w, r, http.StatusBadRequest, "invalid_request", "password must be at least 8 characters", nil)
 		return
 	}
 	if req.Workspace == "" {
@@ -427,25 +427,25 @@ func (s *Server) setup(w http.ResponseWriter, r *http.Request) {
 	}
 	hash, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcryptCost)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not secure password"})
+		writeErr(w, r, http.StatusInternalServerError, "invalid_request", "could not secure password", nil)
 		return
 	}
 	ws, err := s.catalog.CreateWorkspace(req.Workspace)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not create workspace"})
+		writeErr(w, r, http.StatusInternalServerError, "invalid_request", "could not create workspace", nil)
 		return
 	}
 	u, err := s.catalog.CreateUser(req.Name, req.Email, string(hash))
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "could not create account"})
+		writeErr(w, r, http.StatusBadRequest, "invalid_request", "could not create account", nil)
 		return
 	}
 	if err := s.catalog.AddMember(ws.ID, u.ID, catalog.RoleOwner); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not grant ownership"})
+		writeErr(w, r, http.StatusInternalServerError, "invalid_request", "could not grant ownership", nil)
 		return
 	}
 	if err := s.openSession(w, r, u.ID, ws.ID); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not start session"})
+		writeErr(w, r, http.StatusInternalServerError, "invalid_request", "could not start session", nil)
 		return
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{
@@ -458,11 +458,11 @@ func (s *Server) setup(w http.ResponseWriter, r *http.Request) {
 // POST /api/login — public, rate limited. Errors never say which half failed.
 func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	if s.catalog == nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "account store unavailable"})
+		writeErr(w, r, http.StatusServiceUnavailable, "invalid_request", "account store unavailable", nil)
 		return
 	}
 	if !loginLimiter.allow(clientIP(r)) {
-		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "too many attempts, try again later"})
+		writeErr(w, r, http.StatusTooManyRequests, "invalid_request", "too many attempts, try again later", nil)
 		return
 	}
 	var req struct {
@@ -470,27 +470,27 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		Password string `json:"password"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		writeErr(w, r, http.StatusBadRequest, "invalid_request", "invalid request body", nil)
 		return
 	}
 	u, hash, err := s.catalog.GetUserByEmail(req.Email)
 	if err != nil || bcrypt.CompareHashAndPassword([]byte(hash), []byte(req.Password)) != nil {
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid email or password"})
+		writeErr(w, r, http.StatusUnauthorized, "invalid_request", "invalid email or password", nil)
 		return
 	}
 	memberships, err := s.catalog.MembershipsForUser(u.ID)
 	if err != nil || len(memberships) == 0 {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "account has no workspace"})
+		writeErr(w, r, http.StatusForbidden, "invalid_request", "account has no workspace", nil)
 		return
 	}
 	ws := memberships[0]
 	role, err := s.catalog.GetMembership(ws.ID, u.ID)
 	if err != nil {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "account has no workspace"})
+		writeErr(w, r, http.StatusForbidden, "invalid_request", "account has no workspace", nil)
 		return
 	}
 	if err := s.openSession(w, r, u.ID, ws.ID); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not start session"})
+		writeErr(w, r, http.StatusInternalServerError, "invalid_request", "could not start session", nil)
 		return
 	}
 	writeJSON(w, http.StatusOK, meShape(u, ws, role, memberships))
@@ -523,12 +523,12 @@ func meShape(u *catalog.User, ws *catalog.Workspace, role string, all []*catalog
 func (s *Server) me(w http.ResponseWriter, r *http.Request) {
 	ac := authOf(r)
 	if ac == nil || ac.userID == "" {
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		writeErr(w, r, http.StatusUnauthorized, "invalid_request", "unauthorized", nil)
 		return
 	}
 	u, err := s.catalog.GetUserByID(ac.userID)
 	if err != nil {
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		writeErr(w, r, http.StatusUnauthorized, "invalid_request", "unauthorized", nil)
 		return
 	}
 	memberships, _ := s.catalog.MembershipsForUser(u.ID)
@@ -542,7 +542,7 @@ func (s *Server) me(w http.ResponseWriter, r *http.Request) {
 		ws = memberships[0]
 	}
 	if ws == nil {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "account has no workspace"})
+		writeErr(w, r, http.StatusForbidden, "invalid_request", "account has no workspace", nil)
 		return
 	}
 	role, _ := s.catalog.GetMembership(ws.ID, u.ID)
@@ -553,7 +553,7 @@ func (s *Server) me(w http.ResponseWriter, r *http.Request) {
 func (s *Server) changePassword(w http.ResponseWriter, r *http.Request) {
 	ac := authOf(r)
 	if ac == nil || ac.userID == "" {
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		writeErr(w, r, http.StatusUnauthorized, "invalid_request", "unauthorized", nil)
 		return
 	}
 	var req struct {
@@ -561,37 +561,36 @@ func (s *Server) changePassword(w http.ResponseWriter, r *http.Request) {
 		Next    string `json:"next"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		writeErr(w, r, http.StatusBadRequest, "invalid_request", "invalid request body", nil)
 		return
 	}
 	if len(req.Next) < minPasswordLen {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "password must be at least 8 characters"})
+		writeErr(w, r, http.StatusBadRequest, "invalid_request", "password must be at least 8 characters", nil)
 		return
 	}
 	_, hash, err := s.catalog.GetUserByEmail(ac.email)
 	if err != nil || bcrypt.CompareHashAndPassword([]byte(hash), []byte(req.Current)) != nil {
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "current password is incorrect"})
+		writeErr(w, r, http.StatusUnauthorized, "invalid_request", "current password is incorrect", nil)
 		return
 	}
 	next, err := bcrypt.GenerateFromPassword([]byte(req.Next), bcryptCost)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not secure password"})
+		writeErr(w, r, http.StatusInternalServerError, "invalid_request", "could not secure password", nil)
 		return
 	}
 	if err := s.catalog.SetPasswordHash(ac.userID, string(next)); err != nil {
-		s.fail(w, http.StatusInternalServerError, "could not update password", err)
+		s.fail(w, r, http.StatusInternalServerError, "password_change_failed", "could not update password", err)
 		return
 	}
 	// A new password retires every existing session — a stolen cookie must not
 	// outlive the password it was taken with — then this browser gets a fresh
 	// one so whoever changed it stays signed in.
 	if err := s.catalog.DeleteSessionsForUser(ac.userID); err != nil {
-		s.fail(w, http.StatusInternalServerError, "could not update password", err)
+		s.fail(w, r, http.StatusInternalServerError, "password_change_failed", "could not update password", err)
 		return
 	}
 	if err := s.openSession(w, r, ac.userID, ac.workspaceID); err != nil {
-		writeJSON(w, http.StatusInternalServerError,
-			map[string]string{"error": "password updated; sign in again"})
+		writeErr(w, r, http.StatusInternalServerError, "invalid_request", "password updated; sign in again", nil)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "password updated"})
@@ -602,7 +601,7 @@ func (s *Server) listUsers(w http.ResponseWriter, r *http.Request) {
 	ac := authOf(r)
 	members, err := s.catalog.ListMembers(ac.workspaceID)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not list users"})
+		writeErr(w, r, http.StatusInternalServerError, "invalid_request", "could not list users", nil)
 		return
 	}
 	out := make([]map[string]string, 0, len(members))
@@ -626,7 +625,7 @@ func (s *Server) createUser(w http.ResponseWriter, r *http.Request) {
 		Role     string `json:"role"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		writeErr(w, r, http.StatusBadRequest, "invalid_request", "invalid request body", nil)
 		return
 	}
 	role, err := catalog.ParseRole(req.Role)
@@ -634,30 +633,30 @@ func (s *Server) createUser(w http.ResponseWriter, r *http.Request) {
 		role = catalog.RoleMember
 	}
 	if catalog.RoleRank(role) >= catalog.RoleRank(ac.role) && ac.role != catalog.RoleOwner {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "cannot grant a role at or above your own"})
+		writeErr(w, r, http.StatusForbidden, "invalid_request", "cannot grant a role at or above your own", nil)
 		return
 	}
 	if !validEmail(req.Email) {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "a valid email is required"})
+		writeErr(w, r, http.StatusBadRequest, "invalid_request", "a valid email is required", nil)
 		return
 	}
 	if len(req.Password) < minPasswordLen {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "password must be at least 8 characters"})
+		writeErr(w, r, http.StatusBadRequest, "invalid_request", "password must be at least 8 characters", nil)
 		return
 	}
 	hash, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcryptCost)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not secure password"})
+		writeErr(w, r, http.StatusInternalServerError, "invalid_request", "could not secure password", nil)
 		return
 	}
 	u, err := s.catalog.CreateUser(req.Name, req.Email, string(hash))
 	if err != nil {
-		writeJSON(w, http.StatusConflict, map[string]string{"error": "email is already registered"})
+		writeErr(w, r, http.StatusConflict, "invalid_request", "email is already registered", nil)
 		return
 	}
 	if err := s.catalog.AddMember(ac.workspaceID, u.ID, role); err != nil {
 		_ = s.catalog.DeleteUser(u.ID)
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not add to workspace"})
+		writeErr(w, r, http.StatusInternalServerError, "invalid_request", "could not add to workspace", nil)
 		return
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{
@@ -671,17 +670,17 @@ func (s *Server) createUser(w http.ResponseWriter, r *http.Request) {
 func (s *Server) targetGuard(w http.ResponseWriter, r *http.Request, ac *authCtx, verb string) (targetID, targetRole string, ok bool) {
 	targetID = r.PathValue("id")
 	if targetID == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "user id required"})
+		writeErr(w, r, http.StatusBadRequest, "invalid_request", "user id required", nil)
 		return "", "", false
 	}
 	if targetID == ac.userID {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "use your own account settings instead"})
+		writeErr(w, r, http.StatusBadRequest, "invalid_request", "use your own account settings instead", nil)
 		return "", "", false
 	}
 	var err error
 	targetRole, err = s.catalog.GetMembership(ac.workspaceID, targetID)
 	if err != nil {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "user not found"})
+		writeErr(w, r, http.StatusNotFound, "invalid_request", "user not found", nil)
 		return "", "", false
 	}
 	if catalog.RoleRank(targetRole) > catalog.RoleRank(ac.role) ||
@@ -704,30 +703,30 @@ func (s *Server) updateUser(w http.ResponseWriter, r *http.Request) {
 		Role string `json:"role"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		writeErr(w, r, http.StatusBadRequest, "invalid_request", "invalid request body", nil)
 		return
 	}
 	role, err := catalog.ParseRole(req.Role)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "unknown role"})
+		writeErr(w, r, http.StatusBadRequest, "invalid_request", "unknown role", nil)
 		return
 	}
 	if role == catalog.RoleOwner && ac.role != catalog.RoleOwner {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "only owners can grant ownership"})
+		writeErr(w, r, http.StatusForbidden, "invalid_request", "only owners can grant ownership", nil)
 		return
 	}
 	if catalog.RoleRank(role) >= catalog.RoleRank(ac.role) && ac.role != catalog.RoleOwner {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "cannot grant a role at or above your own"})
+		writeErr(w, r, http.StatusForbidden, "invalid_request", "cannot grant a role at or above your own", nil)
 		return
 	}
 	if targetRole == catalog.RoleOwner && role != catalog.RoleOwner {
 		if n, _ := s.catalog.CountOwners(ac.workspaceID); n <= 1 {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "the workspace needs at least one owner"})
+			writeErr(w, r, http.StatusBadRequest, "invalid_request", "the workspace needs at least one owner", nil)
 			return
 		}
 	}
 	if err := s.catalog.SetMemberRole(ac.workspaceID, targetID, role); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not update role"})
+		writeErr(w, r, http.StatusInternalServerError, "invalid_request", "could not update role", nil)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "role updated", "role": role})
@@ -742,12 +741,12 @@ func (s *Server) deleteUser(w http.ResponseWriter, r *http.Request) {
 	}
 	if targetRole == catalog.RoleOwner {
 		if n, _ := s.catalog.CountOwners(ac.workspaceID); n <= 1 {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "the workspace needs at least one owner"})
+			writeErr(w, r, http.StatusBadRequest, "invalid_request", "the workspace needs at least one owner", nil)
 			return
 		}
 	}
 	if err := s.catalog.DeleteUser(targetID); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not remove user"})
+		writeErr(w, r, http.StatusInternalServerError, "invalid_request", "could not remove user", nil)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "user removed"})
@@ -758,7 +757,7 @@ func (s *Server) listWorkspaces(w http.ResponseWriter, r *http.Request) {
 	ac := authOf(r)
 	memberships, err := s.catalog.MembershipsForUser(ac.userID)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not list workspaces"})
+		writeErr(w, r, http.StatusInternalServerError, "invalid_request", "could not list workspaces", nil)
 		return
 	}
 	out := make([]map[string]string, 0, len(memberships))
@@ -774,7 +773,7 @@ func (s *Server) listTokens(w http.ResponseWriter, r *http.Request) {
 	ac := authOf(r)
 	tokens, err := s.catalog.ListAPITokens(ac.userID)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not list tokens"})
+		writeErr(w, r, http.StatusInternalServerError, "invalid_request", "could not list tokens", nil)
 		return
 	}
 	out := make([]map[string]any, 0, len(tokens))
@@ -801,19 +800,19 @@ func (s *Server) createToken(w http.ResponseWriter, r *http.Request) {
 		Name string `json:"name"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		writeErr(w, r, http.StatusBadRequest, "invalid_request", "invalid request body", nil)
 		return
 	}
 	raw, _, err := mintToken(24)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not mint token"})
+		writeErr(w, r, http.StatusInternalServerError, "invalid_request", "could not mint token", nil)
 		return
 	}
 	plaintext := "wb_" + raw
 	sum := sha256Sum(plaintext)
 	t, err := s.catalog.CreateAPIToken(ac.userID, req.Name, sum, plaintext[:12])
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not store token"})
+		writeErr(w, r, http.StatusInternalServerError, "invalid_request", "could not store token", nil)
 		return
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{
@@ -831,7 +830,7 @@ func (s *Server) deleteToken(w http.ResponseWriter, r *http.Request) {
 	ac := authOf(r)
 	id := r.PathValue("id")
 	if id == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "token id required"})
+		writeErr(w, r, http.StatusBadRequest, "invalid_request", "token id required", nil)
 		return
 	}
 	scope := ac.userID
@@ -839,7 +838,7 @@ func (s *Server) deleteToken(w http.ResponseWriter, r *http.Request) {
 		scope = ""
 	}
 	if err := s.catalog.DeleteAPIToken(id, scope); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not revoke token"})
+		writeErr(w, r, http.StatusInternalServerError, "invalid_request", "could not revoke token", nil)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "token revoked"})
@@ -853,7 +852,7 @@ func (s *Server) createWorkspace(w http.ResponseWriter, r *http.Request) {
 		Name string `json:"name"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		writeErr(w, r, http.StatusBadRequest, "invalid_request", "invalid request body", nil)
 		return
 	}
 	if req.Name == "" {
@@ -861,7 +860,7 @@ func (s *Server) createWorkspace(w http.ResponseWriter, r *http.Request) {
 	}
 	ws, err := s.catalog.CreateWorkspace(req.Name)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not create workspace"})
+		writeErr(w, r, http.StatusInternalServerError, "invalid_request", "could not create workspace", nil)
 		return
 	}
 	ac := authOf(r)
@@ -880,22 +879,22 @@ func (s *Server) removeWorkspaceMember(w http.ResponseWriter, r *http.Request) {
 	workspaceID := r.PathValue("id")
 	targetID := r.PathValue("userId")
 	if workspaceID == "" || targetID == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "workspace and user id required"})
+		writeErr(w, r, http.StatusBadRequest, "invalid_request", "workspace and user id required", nil)
 		return
 	}
 	role, err := s.catalog.GetMembership(workspaceID, targetID)
 	if err != nil {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "membership not found"})
+		writeErr(w, r, http.StatusNotFound, "invalid_request", "membership not found", nil)
 		return
 	}
 	if role == catalog.RoleOwner {
 		if n, _ := s.catalog.CountOwners(workspaceID); n <= 1 {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "the workspace needs at least one owner"})
+			writeErr(w, r, http.StatusBadRequest, "invalid_request", "the workspace needs at least one owner", nil)
 			return
 		}
 	}
 	if err := s.catalog.RemoveMembership(workspaceID, targetID); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not remove member"})
+		writeErr(w, r, http.StatusInternalServerError, "invalid_request", "could not remove member", nil)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "member removed"})
@@ -907,7 +906,7 @@ func (s *Server) removeWorkspaceMember(w http.ResponseWriter, r *http.Request) {
 func (s *Server) addWorkspaceMember(w http.ResponseWriter, r *http.Request) {
 	workspaceID := r.PathValue("id")
 	if workspaceID == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "workspace id required"})
+		writeErr(w, r, http.StatusBadRequest, "invalid_request", "workspace id required", nil)
 		return
 	}
 	var req struct {
@@ -916,7 +915,7 @@ func (s *Server) addWorkspaceMember(w http.ResponseWriter, r *http.Request) {
 		Role   string `json:"role"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		writeErr(w, r, http.StatusBadRequest, "invalid_request", "invalid request body", nil)
 		return
 	}
 	role, err := catalog.ParseRole(req.Role)
@@ -926,28 +925,28 @@ func (s *Server) addWorkspaceMember(w http.ResponseWriter, r *http.Request) {
 	var userID string
 	if req.UserID != "" {
 		if _, err := s.catalog.GetUserByID(req.UserID); err != nil {
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "user not found"})
+			writeErr(w, r, http.StatusNotFound, "invalid_request", "user not found", nil)
 			return
 		}
 		userID = req.UserID
 	} else if req.Email != "" {
 		u, _, err := s.catalog.GetUserByEmail(req.Email)
 		if err != nil {
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "user not found"})
+			writeErr(w, r, http.StatusNotFound, "invalid_request", "user not found", nil)
 			return
 		}
 		userID = u.ID
 	} else {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "user_id or email required"})
+		writeErr(w, r, http.StatusBadRequest, "invalid_request", "user_id or email required", nil)
 		return
 	}
 	if _, err := s.catalog.GetMembership(workspaceID, userID); err == nil {
 		if err := s.catalog.SetMemberRole(workspaceID, userID, role); err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not update membership"})
+			writeErr(w, r, http.StatusInternalServerError, "invalid_request", "could not update membership", nil)
 			return
 		}
 	} else if err := s.catalog.AddMember(workspaceID, userID, role); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not add member"})
+		writeErr(w, r, http.StatusInternalServerError, "invalid_request", "could not add member", nil)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "member added", "role": role})

@@ -291,17 +291,40 @@ func (m *Manager) watch(id string, vm *VM) {
 	}()
 }
 
+// ErrDuplicateGuestIP means another live desktop already answers at this
+// address.
+var ErrDuplicateGuestIP = errors.New("another desktop already has this guest address")
+
 // MarkReady is called by the API when a guest reports readiness.
-func (m *Manager) MarkReady(id, ip string) bool {
+//
+// Two desktops at one address is not a near miss. The daemon reaches guests by
+// address, so an exec meant for one desktop would run in the other, and the
+// VNC console would show the wrong screen. The guest asks the host's DHCP for
+// its address and the host does not choose it, so the only place to catch a
+// collision is here — and the only safe answer is to refuse this boot and let
+// another VM try.
+func (m *Manager) MarkReady(id, ip string) error {
 	m.mu.Lock()
 	vm, ok := m.vms[id]
-	m.mu.Unlock()
 	if !ok {
-		return false
+		m.mu.Unlock()
+		return fmt.Errorf("unknown vm %s", id)
 	}
+	if ip != "" {
+		for other, ovm := range m.vms {
+			if other == id {
+				continue
+			}
+			if ovm.Info().GuestIP == ip && ovm.Info().State != StateDead {
+				m.mu.Unlock()
+				return fmt.Errorf("%w: %s is already at %s", ErrDuplicateGuestIP, other, ip)
+			}
+		}
+	}
+	m.mu.Unlock()
 	vm.markReady(ip)
 	fmt.Fprintf(m.log, "desktop: vm %s ready at %s\n", id, ip)
-	return true
+	return nil
 }
 
 // ErrExitedBeforeReady is a boot whose VM process ended before the guest

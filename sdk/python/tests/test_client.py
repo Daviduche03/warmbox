@@ -187,6 +187,109 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(caught.exception.status, 302)
         self.assertEqual(len(self.requests), before + 1)
 
+    def test_structured_error_envelope(self):
+        self.status = 409
+        self.response = {
+            "ok": False,
+            "type": "error",
+            "status": 409,
+            "code": "desktop_not_ready",
+            "message": "the desktop is still booting",
+            "error": {
+                "code": "desktop_not_ready",
+                "message": "the desktop is still booting",
+                "status": 409,
+                "details": {"retryable": True},
+            },
+            "requestId": "req_1a2b3c4d",
+        }
+        with self.assertRaises(APIError) as caught:
+            self.client.exec("vm1", {"cmd": "true"})
+        error = caught.exception
+        self.assertEqual(error.status, 409)
+        self.assertEqual(error.code, "desktop_not_ready")
+        self.assertEqual(error.server_message, "the desktop is still booting")
+        self.assertIn("the desktop is still booting", str(error))
+        self.assertEqual(error.details, {"retryable": True})
+        self.assertTrue(error.retryable)
+        self.assertEqual(error.request_id, "req_1a2b3c4d")
+
+        self.status = 400
+        self.response = {
+            "ok": False,
+            "type": "error",
+            "status": 400,
+            "code": "invalid_json",
+            "message": "the request body is not valid json",
+            "error": {"code": "invalid_json", "message": "the request body is not valid json", "status": 400},
+            "requestId": "req_9999",
+        }
+        with self.assertRaises(APIError) as caught:
+            self.client.get_desktop("vm1")
+        self.assertEqual(caught.exception.code, "invalid_json")
+        self.assertIsNone(caught.exception.details)
+        self.assertFalse(caught.exception.retryable)
+        self.assertEqual(caught.exception.request_id, "req_9999")
+
+    def test_create_sends_ttl_and_idempotency_key(self):
+        self.client.create_desktop({"image": "headless", "ttl_seconds": 900, "idempotency_key": "job-42"})
+        self.assertEqual(json.loads(self.requests[-1][3]), {"image": "headless", "ttl_seconds": 900})
+        self.assertEqual(self.requests[-1][2]["Idempotency-Key"], "job-42")
+        self.client.create_desktop({"image": "headless"})
+        self.assertEqual(json.loads(self.requests[-1][3]), {"image": "headless"})
+        self.assertNotIn("Idempotency-Key", self.requests[-1][2])
+
+    def test_pagination_sends_limit_and_cursor(self):
+        self.response = {"desktops": [{"id": "vm1"}], "pageInfo": {"nextCursor": "c2", "hasMore": True, "limit": 50}}
+        page = self.client.list_desktops_page(limit=50)
+        self.assertEqual(parse_qs(self.requests[-1][1].query), {"limit": ["50"]})
+        self.assertEqual(page["pageInfo"], {"nextCursor": "c2", "hasMore": True, "limit": 50})
+        self.assertEqual(page["desktops"][0]["id"], "vm1")
+        self.client.list_desktops_page(limit=50, cursor="c2")
+        self.assertEqual(parse_qs(self.requests[-1][1].query), {"limit": ["50"], "cursor": ["c2"]})
+
+        self.response = {"volumes": [{"name": "vol1"}], "pageInfo": {"nextCursor": "", "hasMore": False, "limit": 100}}
+        volumes = self.client.list_volumes_page(limit=10, cursor="v1")
+        self.assertEqual(self.requests[-1][1].path, "/api/volumes")
+        self.assertEqual(parse_qs(self.requests[-1][1].query), {"limit": ["10"], "cursor": ["v1"]})
+        self.assertEqual(volumes["volumes"][0]["name"], "vol1")
+        self.assertFalse(volumes["pageInfo"]["hasMore"])
+        self.assertEqual(self.client.list_volumes(limit=10), [{"name": "vol1"}])
+
+        self.response = {"snapshots": [{"id": "snap1"}], "pageInfo": {"nextCursor": None, "hasMore": False, "limit": 100}}
+        snapshots = self.client.list_snapshots_page(limit=5)
+        self.assertEqual(self.requests[-1][1].path, "/api/snapshots")
+        self.assertEqual(parse_qs(self.requests[-1][1].query), {"limit": ["5"]})
+        self.assertEqual(snapshots["snapshots"][0]["id"], "snap1")
+        self.assertIsNone(snapshots["pageInfo"]["nextCursor"])
+        self.assertEqual(self.client.list_snapshots(limit=5), [{"id": "snap1"}])
+
+        for limit in (0, 201, True):
+            with self.subTest(limit=limit), self.assertRaises(ValueError):
+                self.client.list_desktops_page(limit=limit)
+
+    def test_extend_history_and_processes(self):
+        self.response = {"id": "vm1", "state": "ready", "started": "2026-10-19T00:00:00Z"}
+        desktop = self.client.extend_desktop("vm1", 1800)
+        self.assertEqual(self.requests[-1][0], "POST")
+        self.assertEqual(self.requests[-1][1].path, "/api/desktops/vm1/extend")
+        self.assertEqual(json.loads(self.requests[-1][3]), {"ttl_seconds": 1800})
+        self.assertEqual(desktop["id"], "vm1")
+
+        self.response = {"entries": [{"id": "e1", "command": "uname -a", "startedAt": "s",
+                                      "endedAt": "e", "exitCode": 0, "output": "Linux"}]}
+        entries = self.client.list_history("vm1")
+        self.assertEqual(self.requests[-1][1].path, "/api/desktops/vm1/history")
+        self.assertEqual(entries[0]["command"], "uname -a")
+        self.assertEqual(entries[0]["exitCode"], 0)
+
+        self.response = {"processes": [{"pid": 1, "ppid": 0, "user": "root",
+                                        "etime": "00:00:01", "args": "init"}]}
+        processes = self.client.list_processes("vm1")
+        self.assertEqual(self.requests[-1][1].path, "/api/desktops/vm1/processes")
+        self.assertEqual(processes[0]["pid"], 1)
+        self.assertEqual(processes[0]["args"], "init")
+
     def test_url_and_id_validation(self):
         for url in ["file:///etc/passwd", "https://user:password@example.com", "http://host?token=x", "http://host#x"]:
             with self.subTest(url=url), self.assertRaises(ValueError):

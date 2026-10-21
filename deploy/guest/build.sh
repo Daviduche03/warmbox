@@ -42,6 +42,8 @@
 #                 so the daemon and dashboard know not to offer a screen.
 #                 Requires VARIANT — the built-in image has nowhere to record
 #                 it. Try:  HEADLESS=1 VARIANT=headless ./deploy/guest/build.sh
+#   TOOLCHAIN    0|1 (default 0). 1 bakes git, a Node and pnpm, Python and a
+#                 C/C++ compiler into the guest.
 #   IMAGE         docker image tag                          (default warmbox-guest:latest)
 #   WARMBOX_HOME  output directory                          (default ~/.warmbox)
 #   PLATFORM      docker build platform                     (default linux/arm64)
@@ -54,6 +56,7 @@ DESKTOP="${DESKTOP:-xfce}"
 THEME="${THEME:-win11}"
 VARIANT="${VARIANT:-}"
 HEADLESS="${HEADLESS:-0}"
+TOOLCHAIN="${TOOLCHAIN:-0}"
 IMAGE="${IMAGE:-warmbox-guest:latest}"
 WARMBOX_HOME="${WARMBOX_HOME:-$HOME/.warmbox}"
 # A variant is written as a named image at images/<variant>/ (boot it with
@@ -89,12 +92,13 @@ if [ "$DESKTOP" = "none" ]; then
     fi
 fi
 
-echo "==> building $IMAGE (BROWSER=$BROWSER, DESKTOP=$DESKTOP, THEME=$THEME, headless=$HEADLESS, platform=$PLATFORM, variant=${VARIANT:-default})"
+echo "==> building $IMAGE (BROWSER=$BROWSER, DESKTOP=$DESKTOP, THEME=$THEME, headless=$HEADLESS, toolchain=$TOOLCHAIN, platform=$PLATFORM, variant=${VARIANT:-default})"
 docker build --platform "$PLATFORM" -t "$IMAGE" \
     --build-arg "BROWSER=$BROWSER" \
     --build-arg "DESKTOP=$DESKTOP" \
     --build-arg "HEADLESS=$HEADLESS" \
-    --build-arg "THEME=$THEME" "$here"
+    --build-arg "THEME=$THEME" \
+    --build-arg "TOOLCHAIN=$TOOLCHAIN" "$here"
 
 mkdir -p "$OUTDIR"
 

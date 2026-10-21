@@ -203,6 +203,15 @@ else
         log "Xvnc running (pid $XPID)"
         xsetroot -solid '#204060' 2>/dev/null
         xdpyinfo 2>/dev/null | grep -E 'dimensions' | head -1 > /dev/hvc0
+        # Install a real XKB keymap on the server. A server with no keymap
+        # has no way to turn a key into a character, which is why the guest
+        # agent injects input with xdotool rather than trusting the VNC
+        # server to do it. Best-effort: a boot without a keymap is still a
+        # boot, and the keymap is what xdotool needs to be sure of.
+        if command -v setxkbmap >/dev/null 2>&1; then
+            HOME=/root DISPLAY=:0 timeout 10 setxkbmap us >/dev/null 2>&1 || \
+                log "WARN: setxkbmap us failed (no keymap installed)"
+        fi
     else
         log "WARN: Xvnc not running"
     fi

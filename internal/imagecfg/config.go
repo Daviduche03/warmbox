@@ -55,6 +55,12 @@ type Config struct {
 	// and a run-time fact, so it lands in meta.json too.
 	Headless bool `yaml:"headless"`
 
+	// Toolchain bakes a developer toolchain into the guest: git, a Node and
+	// pnpm, Python and a C/C++ compiler. It is a knob of its own because the
+	// toolchain is most of an image's weight — the desktop images stay small,
+	// and an image that is meant to run code asks for it.
+	Toolchain bool `yaml:"toolchain"`
+
 	// Resolution is a build knob for the EFI engine.
 	Resolution string `yaml:"resolution"`
 
@@ -309,6 +315,11 @@ func (c Config) Env(platform string) map[string]string {
 			env["HEADLESS"] = "1"
 		} else {
 			env["HEADLESS"] = "0"
+		}
+		if c.Toolchain {
+			env["TOOLCHAIN"] = "1"
+		} else {
+			env["TOOLCHAIN"] = "0"
 		}
 	case EngineEFI:
 		env["OMARCHY_NAME"] = c.Name

@@ -8,24 +8,62 @@ from urllib.parse import quote, urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from .types import (
-    CreatedDesktop, CreatedRun, CreateDesktopOptions, Desktop, ExecOptions,
-    ExecResult, FileInfo, RunOptions, RunStatus, SessionOptions, StatusResult,
-    StreamEvent, WriteResult,
+    CreatedDesktop, CreatedRun, CreateDesktopOptions, Desktop, DesktopList,
+    ErrorDetails, ExecOptions, ExecResult, FileInfo, HistoryEntry, PageInfo,
+    ProcessInfo, RunOptions, RunStatus, SessionOptions, Snapshot, SnapshotList,
+    StatusResult, StreamEvent, Volume, VolumeList, WriteResult,
 )
 
 
 class APIError(Exception):
-    def __init__(self, status: int, body: str) -> None:
+    """A failed warmbox request.
+
+    Carries the HTTP ``status``, the machine-readable ``code`` slug, the
+    daemon's ``server_message``, the optional ``details`` mapping (which may
+    include ``retryable``) and the ``request_id`` echoed by the daemon.
+    """
+
+    def __init__(self, status: int, body: str, request_id: str | None = None) -> None:
         self.status = status
         self.body = body
-        message = body.strip()
+        self.code: str | None = None
+        self.details: ErrorDetails | None = None
+        self.request_id: str | None = request_id
+        server_message = body.strip()
         try:
             data = json.loads(body)
-            if isinstance(data, dict) and isinstance(data.get("error"), str):
-                message = data["error"]
         except ValueError:
-            pass
-        super().__init__(f"warmbox HTTP {status}: {message}")
+            data = None
+        if isinstance(data, dict):
+            error = data.get("error")
+            nested = error if isinstance(error, dict) else {}
+            code = data.get("code")
+            if not isinstance(code, str):
+                code = nested.get("code")
+            if isinstance(code, str):
+                self.code = code
+            message = data.get("message")
+            if not isinstance(message, str):
+                message = nested.get("message")
+            if not isinstance(message, str) and isinstance(error, str):
+                message = error
+            if isinstance(message, str) and message:
+                server_message = message
+            details = nested.get("details")
+            if details is None:
+                details = data.get("details")
+            if isinstance(details, dict):
+                self.details = cast(ErrorDetails, details)
+            echoed = data.get("requestId")
+            if isinstance(echoed, str) and echoed:
+                self.request_id = echoed
+        self.server_message = server_message
+        super().__init__(f"warmbox HTTP {status}: {server_message}")
+
+    @property
+    def retryable(self) -> bool:
+        """True when the daemon marked the failure as transient."""
+        return bool(self.details and self.details.get("retryable"))
 
 
 class _NoRedirect(HTTPRedirectHandler):
@@ -40,6 +78,17 @@ def _segment(value: str) -> str:
     if not value or value in (".", ".."):
         raise ValueError("a non-empty resource ID is required")
     return quote(value, safe="")
+
+
+def _page_query(limit: int | None, cursor: str | None) -> str:
+    params: dict[str, str] = {}
+    if limit is not None:
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 200:
+            raise ValueError("limit must be an integer between 1 and 200")
+        params["limit"] = str(limit)
+    if cursor is not None:
+        params["cursor"] = cursor
+    return "?" + urlencode(params) if params else ""
 
 
 class WarmboxClient:
@@ -66,22 +115,28 @@ class WarmboxClient:
     def _open(
         self, method: str, path: str, *, data: bytes | None = None,
         content_type: str | None = None, accept: str = "application/json",
+        headers: dict[str, str] | None = None,
     ) -> HTTPResponse:
-        headers = {**self._headers, "Accept": accept}
+        request_headers = {**self._headers, "Accept": accept}
         if content_type is not None:
-            headers["Content-Type"] = content_type
-        request = Request(self._base_url + path, data=data, headers=headers, method=method)
+            request_headers["Content-Type"] = content_type
+        if headers:
+            request_headers.update(headers)
+        request = Request(self._base_url + path, data=data, headers=request_headers, method=method)
         try:
             return cast(HTTPResponse, self._opener.open(request, timeout=self._timeout))
         except HTTPError as error:
             with error:
                 body = error.read().decode("utf-8", errors="replace")
-            raise APIError(error.code, body) from None
+            request_id = error.headers.get("X-Request-Id") if error.headers else None
+            raise APIError(error.code, body, request_id) from None
 
-    def _json(self, method: str, path: str, payload: Any = None) -> Any:
+    def _json(self, method: str, path: str, payload: Any = None,
+              headers: dict[str, str] | None = None) -> Any:
         data = None if payload is None else json.dumps(payload).encode("utf-8")
         with self._open(method, path, data=data,
-                        content_type="application/json" if data is not None else None) as response:
+                        content_type="application/json" if data is not None else None,
+                        headers=headers) as response:
             body = response.read()
         return json.loads(body) if body else None
 
@@ -93,11 +148,61 @@ class WarmboxClient:
     def _desktop(self, desktop_id: str) -> str:
         return "/api/desktops/" + _segment(desktop_id)
 
-    def create_desktop(self, options: CreateDesktopOptions | None = None) -> CreatedDesktop:
-        return cast(CreatedDesktop, self._json("POST", "/api/desktops", options or {}))
+    def create_desktop(self, options: CreateDesktopOptions | None = None, *,
+                       idempotency_key: str | None = None) -> CreatedDesktop:
+        payload = cast(dict[str, Any], dict(options or {}))
+        if idempotency_key is None:
+            in_options = payload.pop("idempotency_key", None)
+            if isinstance(in_options, str):
+                idempotency_key = in_options
+        headers = ({"Idempotency-Key": idempotency_key}
+                   if idempotency_key is not None else None)
+        return cast(CreatedDesktop, self._json("POST", "/api/desktops", payload, headers))
 
-    def list_desktops(self) -> list[Desktop]:
-        return cast(list[Desktop], self._json("GET", "/api/desktops")["desktops"] or [])
+    def list_desktops(self, *, limit: int | None = None, cursor: str | None = None) -> list[Desktop]:
+        result = self._json("GET", "/api/desktops" + _page_query(limit, cursor))
+        return cast(list[Desktop], result["desktops"] or [])
+
+    def list_desktops_page(self, *, limit: int | None = None,
+                           cursor: str | None = None) -> DesktopList:
+        return cast(DesktopList, self._json("GET", "/api/desktops" + _page_query(limit, cursor)))
+
+    def list_volumes(self, *, limit: int | None = None,
+                     cursor: str | None = None) -> list[Volume]:
+        result = self._json("GET", "/api/volumes" + _page_query(limit, cursor))
+        return cast(list[Volume], result["volumes"] or [])
+
+    def list_volumes_page(self, *, limit: int | None = None,
+                          cursor: str | None = None) -> VolumeList:
+        return cast(VolumeList, self._json("GET", "/api/volumes" + _page_query(limit, cursor)))
+
+    def list_snapshots(self, *, limit: int | None = None,
+                       cursor: str | None = None) -> list[Snapshot]:
+        result = self._json("GET", "/api/snapshots" + _page_query(limit, cursor))
+        return cast(list[Snapshot], result["snapshots"] or [])
+
+    def list_snapshots_page(self, *, limit: int | None = None,
+                            cursor: str | None = None) -> SnapshotList:
+        return cast(SnapshotList, self._json("GET", "/api/snapshots" + _page_query(limit, cursor)))
+
+    def extend_desktop(self, desktop_id: str, ttl_seconds: int) -> Desktop:
+        return cast(Desktop, self._json("POST", self._desktop(desktop_id) + "/extend",
+                                        {"ttl_seconds": ttl_seconds}))
+
+    def list_history(self, desktop_id: str) -> list[HistoryEntry]:
+        return cast(list[HistoryEntry], self._json("GET", self._desktop(desktop_id) + "/history")["entries"] or [])
+
+    def list_processes(self, desktop_id: str) -> list[ProcessInfo]:
+        return cast(list[ProcessInfo], self._json("GET", self._desktop(desktop_id) + "/processes")["processes"] or [])
+
+    def extend(self, desktop_id: str, ttl_seconds: int) -> Desktop:
+        return self.extend_desktop(desktop_id, ttl_seconds)
+
+    def history(self, desktop_id: str) -> list[HistoryEntry]:
+        return self.list_history(desktop_id)
+
+    def processes(self, desktop_id: str) -> list[ProcessInfo]:
+        return self.list_processes(desktop_id)
 
     def get_desktop(self, desktop_id: str) -> Desktop:
         return cast(Desktop, self._json("GET", self._desktop(desktop_id)))

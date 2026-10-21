@@ -1,0 +1,20 @@
+# A screenless image with a developer toolchain: git, a Node and pnpm,
+# Python, and a C/C++ compiler. It is the image for a desktop that is meant to
+# *run* code — an agent's sandbox, a build, a test suite — rather than to be
+# looked at.
+#
+# It is separate from the desktop images because the toolchain is most of an
+# image's weight: the desktop images stay small and quick to pull, and an
+# image that runs code asks for the toolchain.
+#
+# The versions are pinned in the image (Node 22, pnpm 11.1.1) so every desktop
+# starts from the same toolchain, which is what a benchmark comparing runs
+# needs.
+name: dev
+engine: overlay
+desktop: none
+theme: default
+browser: none
+headless: true
+toolchain: true
+publish: true

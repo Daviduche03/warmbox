@@ -35,26 +35,24 @@ func (s *Server) getSettings(w http.ResponseWriter, r *http.Request) {
 // host's RAM.
 func (s *Server) updateSettings(w http.ResponseWriter, r *http.Request) {
 	if s.catalog == nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "settings store unavailable"})
+		writeErr(w, r, http.StatusServiceUnavailable, "invalid_request", "settings store unavailable", nil)
 		return
 	}
 	var req struct {
 		MaxDesktopsPerWorkspace *int `json:"max_desktops_per_workspace"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		writeErr(w, r, http.StatusBadRequest, "invalid_request", "invalid request body", nil)
 		return
 	}
 	if req.MaxDesktopsPerWorkspace != nil {
 		n := *req.MaxDesktopsPerWorkspace
 		if n < 0 || n > maxDesktopsLimit {
-			writeJSON(w, http.StatusBadRequest, map[string]string{
-				"error": "the desktop limit must be between 0 (unlimited) and 1000",
-			})
+			writeErr(w, r, http.StatusBadRequest, "invalid_request", "the desktop limit must be between 0 (unlimited) and 1000", nil)
 			return
 		}
 		if err := s.catalog.SetSetting(catalog.SettingMaxDesktopsPerWorkspace, strconv.Itoa(n)); err != nil {
-			s.fail(w, http.StatusInternalServerError, "could not save settings", err)
+			s.fail(w, r, http.StatusInternalServerError, "settings_save_failed", "could not save settings", err)
 			return
 		}
 	}

@@ -39,6 +39,13 @@ type run struct {
 	pty    bool
 	master *os.File
 
+	// cmdText and cwd describe the command for the history log.
+	cmdText string
+	cwd     string
+	// noHistory keeps interactive sessions out of the history: a session is
+	// a long-lived shell, not a command that was run.
+	noHistory bool
+
 	mu        sync.Mutex
 	out       []byte // stdout+stderr, interleaved
 	truncated bool
@@ -89,6 +96,20 @@ func (r *run) metaLocked() map[string]any {
 		}
 	}
 	return m
+}
+
+// exitCode reports the run's exit code.
+func (r *run) exitCode() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.exit
+}
+
+// outSnapshot copies the buffered output for the history log.
+func (r *run) outSnapshot() []byte {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]byte(nil), r.out...)
 }
 
 // snapshot returns output after the absolute offset from, plus the next offset.
@@ -190,6 +211,8 @@ type runReq struct {
 	Pty  bool `json:"pty"`
 	Cols int  `json:"cols"`
 	Rows int  `json:"rows"`
+	// noHistory keeps an interactive session out of the command history.
+	noHistory bool
 }
 
 func startRun(req runReq) (*run, error) {
@@ -218,6 +241,12 @@ func startRun(req runReq) (*run, error) {
 	}
 
 	r := &run{started: time.Now(), maxOut: defaultRunMaxBytes}
+	r.cmdText = describeExec(req.Cmd, req.Argv)
+	if r.cmdText == "" {
+		r.cmdText = req.Shell
+	}
+	r.cwd = execCwd(cmd.Dir)
+	r.noHistory = req.noHistory
 	if req.MaxBytes > 0 {
 		r.maxOut = req.MaxBytes
 	}
@@ -312,6 +341,9 @@ func startRun(req runReq) (*run, error) {
 	go func() {
 		err := cmd.Wait()
 		r.finish(err, false)
+		if !r.noHistory {
+			recordHistory(r.cmdText, r.cwd, r.started, time.Now(), r.exitCode(), string(r.outSnapshot()))
+		}
 	}()
 	return r, nil
 }
@@ -472,7 +504,7 @@ func handleSessionCreate(w http.ResponseWriter, r *http.Request) {
 		req.Shell = "/bin/sh"
 	}
 	rn, err := startRun(runReq{Cwd: req.Cwd, Env: req.Env, Shell: req.Shell, Interactive: true,
-		Pty: req.Pty, Cols: req.Cols, Rows: req.Rows})
+		Pty: req.Pty, Cols: req.Cols, Rows: req.Rows, noHistory: true})
 	if err != nil {
 		fail(w, http.StatusBadRequest, err)
 		return

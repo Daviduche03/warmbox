@@ -1,23 +1,69 @@
 import type {
   ClientOptions, CreatedDesktop, CreatedRun, CreateDesktopOptions, Desktop,
-  ExecOptions, ExecResult, FileInfo, RequestOptions, RunOptions, RunStatus,
-  SessionOptions, StatusResult, StreamEvent, WriteResult,
+  DesktopList, ErrorDetails, ExecOptions, ExecResult, FileInfo, HistoryEntry,
+  ListOptions, ProcessInfo, RequestOptions, RunOptions, RunStatus,
+  SessionOptions, Snapshot, SnapshotList, StatusResult, StreamEvent, Volume,
+  VolumeList, WriteResult,
 } from "./types.js";
 
 export type * from "./types.js";
 
 export class APIError extends Error {
-  constructor(public readonly status: number, public readonly body: string) {
+  /** The machine-readable error slug, e.g. `desktop_not_ready`. */
+  readonly code?: string;
+  /** Extra context for the failure; `retryable` marks transient errors. */
+  readonly details?: ErrorDetails;
+  /** The request id echoed by the daemon, for support and log correlation. */
+  readonly requestId?: string;
+  /** The human-readable message the daemon sent, without the HTTP prefix. */
+  readonly serverMessage: string;
+
+  constructor(public readonly status: number, public readonly body: string, requestId?: string) {
     let message = body.trim();
+    let code: string | undefined;
+    let details: ErrorDetails | undefined;
+    let serverMessage = message;
     try {
       const data: unknown = JSON.parse(body);
-      if (data && typeof data === "object" && "error" in data && typeof data.error === "string") {
-        message = data.error;
+      if (data && typeof data === "object") {
+        const envelope = data as Record<string, unknown>;
+        const error = envelope.error;
+        const nested = error && typeof error === "object" ? error as Record<string, unknown> : undefined;
+        if (typeof envelope.code === "string") code = envelope.code;
+        else if (typeof nested?.code === "string") code = nested.code;
+        if (typeof envelope.message === "string") serverMessage = envelope.message;
+        else if (typeof nested?.message === "string") serverMessage = nested.message;
+        else if (typeof error === "string" && error) serverMessage = error;
+        const raw = nested?.details ?? envelope.details;
+        if (raw && typeof raw === "object") details = raw as ErrorDetails;
+        if (typeof envelope.requestId === "string" && envelope.requestId) requestId = envelope.requestId;
       }
     } catch {}
-    super(`warmbox HTTP ${status}: ${message}`);
+    super(`warmbox HTTP ${status}: ${serverMessage}`);
     this.name = "APIError";
+    this.code = code;
+    this.details = details;
+    this.requestId = requestId ?? undefined;
+    this.serverMessage = serverMessage;
   }
+
+  /** True when the daemon marked the failure as transient. */
+  get retryable(): boolean {
+    return this.details?.retryable === true;
+  }
+}
+
+function pageQuery(options: ListOptions): string {
+  const params = new URLSearchParams();
+  if (options.limit !== undefined) {
+    if (!Number.isInteger(options.limit) || options.limit < 1 || options.limit > 200) {
+      throw new TypeError("limit must be an integer between 1 and 200");
+    }
+    params.set("limit", String(options.limit));
+  }
+  if (options.cursor !== undefined) params.set("cursor", options.cursor);
+  const query = params.toString();
+  return query ? "?" + query : "";
 }
 
 function segment(value: string): string {
@@ -53,7 +99,7 @@ export class WarmboxClient {
 
   private async request(
     method: string, path: string, options: RequestOptions = {},
-    body?: BodyInit, contentType?: string, stream = false,
+    body?: BodyInit, contentType?: string, stream = false, extraHeaders?: Record<string, string>,
   ): Promise<Response> {
     const response = await fetch(this.baseUrl + path, {
       method, body, redirect: "manual",
@@ -62,16 +108,19 @@ export class WarmboxClient {
         ...this.headers,
         Accept: stream ? "text/event-stream" : "application/json",
         ...(contentType ? { "Content-Type": contentType } : {}),
+        ...extraHeaders,
       },
     });
-    if (!response.ok) throw new APIError(response.status, await response.text());
+    if (!response.ok) {
+      throw new APIError(response.status, await response.text(), response.headers.get("X-Request-Id") ?? undefined);
+    }
     return response;
   }
 
-  private async json<T>(method: string, path: string, payload?: unknown, options?: RequestOptions): Promise<T> {
+  private async json<T>(method: string, path: string, payload?: unknown, options?: RequestOptions, extraHeaders?: Record<string, string>): Promise<T> {
     const response = await this.request(method, path, options,
       payload === undefined ? undefined : JSON.stringify(payload),
-      payload === undefined ? undefined : "application/json");
+      payload === undefined ? undefined : "application/json", false, extraHeaders);
     const body = await response.text();
     return (body ? JSON.parse(body) : undefined) as T;
   }
@@ -83,12 +132,80 @@ export class WarmboxClient {
   }
 
   createDesktop(options: CreateDesktopOptions = {}, request?: RequestOptions): Promise<CreatedDesktop> {
-    return this.json("POST", "/api/desktops", options, request);
+    const { idempotencyKey, ttlSeconds, ttl_seconds, ...rest } = options;
+    const payload: Record<string, unknown> = { ...rest };
+    const ttl = ttlSeconds ?? ttl_seconds;
+    if (ttl !== undefined) payload.ttl_seconds = ttl;
+    const headers = idempotencyKey === undefined ? undefined : { "Idempotency-Key": idempotencyKey };
+    return this.json("POST", "/api/desktops", payload, request, headers);
   }
 
-  async listDesktops(request?: RequestOptions): Promise<Desktop[]> {
-    const result = await this.json<{ desktops: Desktop[] | null }>("GET", "/api/desktops", undefined, request);
+  /**
+   * Lists the desktops visible to the caller. Accepts `limit` and `cursor`;
+   * use {@link WarmboxClient.listDesktopsPage} to read the pagination metadata.
+   */
+  async listDesktops(options: ListOptions = {}): Promise<Desktop[]> {
+    const result = await this.json<{ desktops: Desktop[] | null }>("GET", "/api/desktops" + pageQuery(options), undefined, options);
     return result.desktops ?? [];
+  }
+
+  /** Lists desktops with pagination; `pageInfo.nextCursor` feeds the next call. */
+  listDesktopsPage(options: ListOptions = {}): Promise<DesktopList> {
+    return this.json("GET", "/api/desktops" + pageQuery(options), undefined, options);
+  }
+
+  /** Lists the volumes visible to the caller. */
+  async listVolumes(options: ListOptions = {}): Promise<Volume[]> {
+    const result = await this.json<{ volumes: Volume[] | null }>("GET", "/api/volumes" + pageQuery(options), undefined, options);
+    return result.volumes ?? [];
+  }
+
+  /** Lists volumes with pagination; `pageInfo.nextCursor` feeds the next call. */
+  listVolumesPage(options: ListOptions = {}): Promise<VolumeList> {
+    return this.json("GET", "/api/volumes" + pageQuery(options), undefined, options);
+  }
+
+  /** Lists the snapshots visible to the caller. */
+  async listSnapshots(options: ListOptions = {}): Promise<Snapshot[]> {
+    const result = await this.json<{ snapshots: Snapshot[] | null }>("GET", "/api/snapshots" + pageQuery(options), undefined, options);
+    return result.snapshots ?? [];
+  }
+
+  /** Lists snapshots with pagination; `pageInfo.nextCursor` feeds the next call. */
+  listSnapshotsPage(options: ListOptions = {}): Promise<SnapshotList> {
+    return this.json("GET", "/api/snapshots" + pageQuery(options), undefined, options);
+  }
+
+  /** Extends the desktop's auto-stop deadline; `ttlSeconds` of 0 never expires. */
+  extendDesktop(id: string, ttlSeconds: number, request?: RequestOptions): Promise<Desktop> {
+    return this.json("POST", this.desktop(id) + "/extend", { ttl_seconds: ttlSeconds }, request);
+  }
+
+  /** Lists the desktop's command history, newest first. */
+  async listHistory(id: string, request?: RequestOptions): Promise<HistoryEntry[]> {
+    const result = await this.json<{ entries: HistoryEntry[] | null }>("GET", this.desktop(id) + "/history", undefined, request);
+    return result.entries ?? [];
+  }
+
+  /** Lists the processes running inside the desktop. */
+  async listProcesses(id: string, request?: RequestOptions): Promise<ProcessInfo[]> {
+    const result = await this.json<{ processes: ProcessInfo[] | null }>("GET", this.desktop(id) + "/processes", undefined, request);
+    return result.processes ?? [];
+  }
+
+  /** Alias of {@link WarmboxClient.extendDesktop}. */
+  extend(id: string, ttlSeconds: number, request?: RequestOptions): Promise<Desktop> {
+    return this.extendDesktop(id, ttlSeconds, request);
+  }
+
+  /** Alias of {@link WarmboxClient.listHistory}. */
+  history(id: string, request?: RequestOptions): Promise<HistoryEntry[]> {
+    return this.listHistory(id, request);
+  }
+
+  /** Alias of {@link WarmboxClient.listProcesses}. */
+  processes(id: string, request?: RequestOptions): Promise<ProcessInfo[]> {
+    return this.listProcesses(id, request);
   }
 
   getDesktop(id: string, request?: RequestOptions): Promise<Desktop> {

@@ -191,6 +191,118 @@ test("HTTP failures retain status and body, redirects are not followed", async t
   assert.equal(f.requests.length, before + 1);
 });
 
+test("structured error envelopes become typed APIError fields", async t => {
+  const f = await fixture(t);
+  f.status = 409;
+  f.response = {
+    ok: false,
+    type: "error",
+    status: 409,
+    code: "desktop_not_ready",
+    message: "the desktop is still booting",
+    error: {
+      code: "desktop_not_ready",
+      message: "the desktop is still booting",
+      status: 409,
+      details: { retryable: true },
+    },
+    requestId: "req_1a2b3c4d",
+  };
+  await assert.rejects(f.client.exec("vm1", { cmd: "true" }), error => {
+    assert.ok(error instanceof APIError);
+    assert.equal(error.status, 409);
+    assert.equal(error.code, "desktop_not_ready");
+    assert.equal(error.serverMessage, "the desktop is still booting");
+    assert.ok(error.message.includes("the desktop is still booting"));
+    assert.deepEqual(error.details, { retryable: true });
+    assert.equal(error.retryable, true);
+    assert.equal(error.requestId, "req_1a2b3c4d");
+    return true;
+  });
+
+  f.status = 400;
+  f.response = {
+    ok: false,
+    type: "error",
+    status: 400,
+    code: "invalid_json",
+    message: "the request body is not valid json",
+    error: { code: "invalid_json", message: "the request body is not valid json", status: 400 },
+    requestId: "req_9999",
+  };
+  await assert.rejects(f.client.getDesktop("vm1"), error => {
+    assert.equal(error.code, "invalid_json");
+    assert.equal(error.details, undefined);
+    assert.equal(error.retryable, false);
+    assert.equal(error.requestId, "req_9999");
+    return true;
+  });
+});
+
+test("create sends ttl_seconds and the idempotency key header", async t => {
+  const f = await fixture(t);
+  await f.client.createDesktop({ image: "headless", ttlSeconds: 900, idempotencyKey: "job-42" });
+  assert.deepEqual(JSON.parse(f.requests.at(-1).body), { image: "headless", ttl_seconds: 900 });
+  assert.equal(f.requests.at(-1).headers["idempotency-key"], "job-42");
+  await f.client.createDesktop({ image: "headless" });
+  assert.deepEqual(JSON.parse(f.requests.at(-1).body), { image: "headless" });
+  assert.equal(f.requests.at(-1).headers["idempotency-key"], undefined);
+});
+
+test("pagination sends limit and cursor and exposes pageInfo", async t => {
+  const f = await fixture(t);
+  f.response = { desktops: [{ id: "vm1" }], pageInfo: { nextCursor: "c2", hasMore: true, limit: 50 } };
+  const page = await f.client.listDesktopsPage({ limit: 50 });
+  assert.equal(f.requests.at(-1).url.searchParams.get("limit"), "50");
+  assert.equal(f.requests.at(-1).url.searchParams.get("cursor"), null);
+  assert.deepEqual(page.pageInfo, { nextCursor: "c2", hasMore: true, limit: 50 });
+  assert.equal(page.desktops[0].id, "vm1");
+  await f.client.listDesktopsPage({ limit: 50, cursor: "c2" });
+  assert.equal(f.requests.at(-1).url.searchParams.get("cursor"), "c2");
+
+  f.response = { volumes: [{ name: "vol1" }], pageInfo: { nextCursor: "", hasMore: false, limit: 100 } };
+  const volumes = await f.client.listVolumesPage({ limit: 10, cursor: "v1" });
+  assert.equal(f.requests.at(-1).url.pathname, "/api/volumes");
+  assert.equal(f.requests.at(-1).url.searchParams.get("limit"), "10");
+  assert.equal(f.requests.at(-1).url.searchParams.get("cursor"), "v1");
+  assert.equal(volumes.volumes[0].name, "vol1");
+  assert.equal(volumes.pageInfo.hasMore, false);
+  assert.deepEqual(await f.client.listVolumes({ limit: 10 }), [{ name: "vol1" }]);
+
+  f.response = { snapshots: [{ id: "snap1" }], pageInfo: { nextCursor: null, hasMore: false, limit: 100 } };
+  const snapshots = await f.client.listSnapshotsPage({ limit: 5 });
+  assert.equal(f.requests.at(-1).url.pathname, "/api/snapshots");
+  assert.equal(f.requests.at(-1).url.searchParams.get("limit"), "5");
+  assert.equal(snapshots.snapshots[0].id, "snap1");
+  assert.equal(snapshots.pageInfo.nextCursor, null);
+  assert.deepEqual(await f.client.listSnapshots({ limit: 5 }), [{ id: "snap1" }]);
+
+  assert.throws(() => f.client.listDesktopsPage({ limit: 0 }), /between 1 and 200/);
+  assert.throws(() => f.client.listDesktopsPage({ limit: 201 }), /between 1 and 200/);
+});
+
+test("extend, history and processes use the new desktop routes", async t => {
+  const f = await fixture(t);
+  f.response = { id: "vm1", state: "ready", started: "2026-10-19T00:00:00Z" };
+  const desktop = await f.client.extendDesktop("vm1", 1800);
+  assert.equal(f.requests.at(-1).method, "POST");
+  assert.equal(f.requests.at(-1).url.pathname, "/api/desktops/vm1/extend");
+  assert.deepEqual(JSON.parse(f.requests.at(-1).body), { ttl_seconds: 1800 });
+  assert.equal(desktop.id, "vm1");
+
+  f.response = { entries: [{ id: "e1", command: "uname -a", startedAt: "s", endedAt: "e", exitCode: 0, output: "Linux" }] };
+  const entries = await f.client.listHistory("vm1");
+  assert.equal(f.requests.at(-1).url.pathname, "/api/desktops/vm1/history");
+  assert.equal(entries[0].command, "uname -a");
+  assert.equal(entries[0].exitCode, 0);
+
+  f.response = { processes: [{ pid: 1, ppid: 0, user: "root", etime: "00:00:01", args: "init" }] };
+  const processes = await f.client.listProcesses("vm1");
+  assert.equal(f.requests.at(-1).url.pathname, "/api/desktops/vm1/processes");
+  assert.equal(processes[0].pid, 1);
+  assert.equal(processes[0].args, "init");
+});
+
 test("URLs, IDs, offsets and cancellation", async t => {
   const f = await fixture(t);
   for (const baseUrl of ["file:///etc/passwd", "https://user:password@example.com", "http://host?token=x", "http://host#x"]) {

@@ -7,6 +7,8 @@
 # BROWSER may be: none | netsurf | epiphany | firefox | chromium
 # DESKTOP may be: none | xfce | lxqt   (none = no X at all, for a headless image)
 # THEME may be: default | win11 | ambiance (ambiance pairs with lxqt)
+# TOOLCHAIN may be: 0 | 1 (default 0). 1 bakes in git, a Node and pnpm, Python
+# and a C/C++ compiler: an image meant to run code, not to be looked at.
 # The resulting image contains /initramfs.zst (the whole rootfs, zstd) and
 # /boot/vmlinuz-virt (compressed kernel). See `warmbox setup` for extraction.
 #
@@ -31,7 +33,10 @@ ARG DESKTOP=xfce
 ARG THEME=default
 
 # What every image needs: kernel modules, the shell tools the agent and its
-# users reach for, dbus, and the compressor the final step packs with.
+# users reach for, dbus, and the compressor the final step packs with. The
+# X tools are here too: the agent drives the desktop through xdotool (the
+# VNC servers drop keystrokes), needs a keymap to make that work, and grabs
+# screenshots with ImageMagick.
 RUN set -eux; \
     apk add --no-cache \
         iproute2 socat bash procps coreutils \
@@ -39,7 +44,8 @@ RUN set -eux; \
         darkhttpd \
         dbus \
         curl zstd \
-        dropbear
+        dropbear \
+        imagemagick setxkbmap xdotool xkbcomp xkeyboard-config xwd
 
 # The screen: TigerVNC plus the X plumbing both session layers share, then the
 # session itself — XFCE (default) or LXQt-Ambiance, so squashfs/overlay/VNC
@@ -75,6 +81,25 @@ RUN set -eux; \
         chromium)  apk add --no-cache chromium ;; \
         *) echo "unknown BROWSER=${BROWSER}" >&2; exit 1 ;; \
     esac
+
+# Optional developer toolchain: git, a Node and pnpm, Python and a C/C++
+# compiler. It is a separate layer because it is most of an image's weight, and
+# because an image meant to run code should not cost a desktop image's
+# download. The versions are the ones the guest is tested with, pinned in the
+# image rather than left to whatever the repository's apk index has that day.
+ARG TOOLCHAIN=0
+RUN set -eux; \
+    if [ "$TOOLCHAIN" = "1" ]; then \
+        apk add --no-cache \
+            git \
+            nodejs npm \
+            python3 py3-pip \
+            build-base \
+            linux-headers; \
+        npm install -g pnpm@11.1.1; \
+        pnpm --version; \
+        node --version; \
+    fi
 
 # Chromium is the browser that actually works in this microVM: it runs with
 # --no-sandbox (bubblewrap/user-namespaces are blocked by the kernel) and
