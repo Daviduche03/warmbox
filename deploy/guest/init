@@ -132,6 +132,31 @@ mkdir -p /etc/dropbear
 dropbear -R -s -p 22 >/var/log/dropbear.log 2>&1 &
 log "dropbear started (key-only, port 22)"
 
+# --- phone access: tailscale + opencode web (toolchain images only) ---
+# Lets a toolchain desktop be reached from a phone with no laptop in the loop:
+# tailscaled joins the tailnet, and opencode serve exposes the editor UI on
+# :4096. Tailscale state lives in /var/lib/tailscale (on the volume, so the
+# login survives reboots and image upgrades); opencode's HOME is /root for the
+# same reason. First boot needs one approval: run `tailscale up` in the guest
+# and open the login URL it prints on the phone. After that the bookmark
+# (http://<tailnet-ip>:4096) just works, and SSH to the tailnet IP lands in
+# dropbear above. This is an intentional exposure past the NAT, unlike the
+# agent API: the tailnet is encrypted and membership-controlled, and pairing
+# links stay one-time.
+if [ -f /etc/warmbox/toolchain ]; then
+    export HOME=/root
+    modprobe tun 2>/dev/null
+    mkdir -p /var/lib/tailscale /var/run/tailscale
+    tailscaled --state=/var/lib/tailscale/tailscaled.state --socket=/var/run/tailscale/tailscaled.sock >/var/log/tailscaled.log 2>&1 &
+    log "tailscaled started"
+    if command -v opencode >/dev/null 2>&1; then
+        opencode serve --hostname 0.0.0.0 --port 4096 >/var/log/opencode-serve.log 2>&1 &
+        log "opencode serve started on :4096"
+    else
+        log "WARN: opencode not installed, no web UI"
+    fi
+fi
+
 # --- optional virtiofs workspace share ---
 # The host can attach a directory with `--device virtio-fs,sharedDir=...,
 # mountTag=<tag>`; we mount it at /workspace so agents/editors in the guest see

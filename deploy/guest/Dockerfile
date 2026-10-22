@@ -95,10 +95,17 @@ RUN set -eux; \
             nodejs npm \
             python3 py3-pip \
             build-base \
-            linux-headers; \
+            linux-headers \
+            curl \
+            tailscale; \
         npm install -g pnpm@11.1.1; \
         pnpm --version; \
         node --version; \
+        curl -fsSL https://opencode.ai/v2/install | bash -s -- --version 2.0.32; \
+        cp /root/.opencode/bin/opencode /usr/local/bin/opencode; \
+        opencode --version; \
+        tailscaled --version; \
+        mkdir -p /etc/warmbox && echo "toolchain" > /etc/warmbox/toolchain; \
     fi
 
 # Chromium is the browser that actually works in this microVM: it runs with
