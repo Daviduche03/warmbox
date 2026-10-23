@@ -150,8 +150,17 @@ if [ -f /etc/warmbox/toolchain ]; then
     tailscaled --state=/var/lib/tailscale/tailscaled.state --socket=/var/run/tailscale/tailscaled.sock >/var/log/tailscaled.log 2>&1 &
     log "tailscaled started"
     if command -v opencode >/dev/null 2>&1; then
-        opencode serve --hostname 0.0.0.0 --port 4096 >/var/log/opencode-serve.log 2>&1 &
-        log "opencode serve started on :4096"
+        # Stable password for the phone bookmark: generated once into the
+        # volume, reused on every boot, never baked into the image. Changing
+        # it is editing one file and rebooting (or restarting serve).
+        OPENCODE_PASS_FILE=/root/.opencode-server-password
+        if [ ! -s "$OPENCODE_PASS_FILE" ]; then
+            head -c 24 /dev/urandom | base64 | tr -d '/+=\n' | head -c 32 > "$OPENCODE_PASS_FILE"
+            chmod 600 "$OPENCODE_PASS_FILE"
+        fi
+        OPENCODE_PASSWORD=$(cat "$OPENCODE_PASS_FILE") \
+            opencode serve --hostname 0.0.0.0 --port 4096 >/var/log/opencode-serve.log 2>&1 &
+        log "opencode serve started on :4096 (password in /root/.opencode-server-password)"
     else
         log "WARN: opencode not installed, no web UI"
     fi
