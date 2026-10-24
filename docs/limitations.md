@@ -18,6 +18,16 @@ Each guest's VNC server requires a per-VM password, generated inside the guest
 and handed to noVNC with the console URL. The guest sits behind the hypervisor's
 NAT, so that port is never on the LAN.
 
+Guests are on QEMU user-mode networking (`-netdev user`), never tap or
+vhost-net. That is deliberate: slirp ends the guest's L2/L3 in QEMU's userspace
+and re-originates its traffic as ordinary host sockets, so guest-controlled
+packet metadata never enters the host kernel's network stack. Hypervisor CVEs
+that need a tap/vhost-net backend to reach the host — for example
+CVE-2026-99999 ("PwnEscape", an IPv4 checksum-offload guest-to-host escape) —
+do not have that path here. On macOS the host is not Linux at all, so the same
+bug class does not apply. Keep it that way: bridged or tap networking would
+trade this boundary for LAN reachability.
+
 What remains is the guest itself. It runs as root, and none of this is hardened
 against someone who already has the desktop.
 

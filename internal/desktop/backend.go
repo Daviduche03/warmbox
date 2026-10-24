@@ -365,6 +365,14 @@ func (b *qemuBackend) Launch(spec LaunchSpec) (*Instance, error) {
 		"-chardev", "file,id=vserchar0,path=" + spec.Console + ",append=on",
 		"-device", "virtconsole,chardev=vserchar0,name=warmbox",
 		"-device", "virtio-rng-pci",
+		// User-mode networking is a security invariant, not just a convenience.
+		// A tap/vhost-net backend hands guest TX descriptors — including their
+		// checksum metadata — to the host kernel's IP stack. That is the path
+		// CVE-2026-99999 ("PwnEscape") abuses to rewrite an IPv4 header after
+		// validation and escape the guest. Slirp terminates L2/L3 in QEMU's
+		// userspace and re-originates packets as ordinary host sockets, so no
+		// guest-controlled checksum_start ever reaches the host kernel. Do not
+		// swap this for tap/vhost-net while that bug is unpatched.
 		"-netdev", fmt.Sprintf("user,id=n0,hostfwd=tcp:127.0.0.1:%d-:5900,hostfwd=tcp:127.0.0.1:%d-:7077,hostfwd=tcp:127.0.0.1:%d-:22", vncPort, agentPort, sshPort),
 		"-device", "virtio-net-pci,netdev=n0",
 	}
