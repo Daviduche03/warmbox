@@ -234,7 +234,10 @@ func (s *Server) Handler() http.Handler {
 	// Publish a guest HTTP server (e.g. an agent-built dashboard) at a link.
 	mux.HandleFunc("GET /p/{id}/{port}/", s.expose)
 
-	// Short desktop URL: serves noVNC full-screen, no token in the address bar.
+	// The desktop's voxl stream (page, websocket, screenshots, /wait).
+	mux.HandleFunc("GET /voxl/{id}/", s.voxlStream)
+
+	// Short desktop URL: the voxl console, or noVNC when the guest has none.
 	mux.HandleFunc("GET /d/{id}", s.dash)
 
 	// Static noVNC assets, one namespace per VM.
@@ -267,18 +270,19 @@ func (s *Server) GuestHandler() http.Handler {
 // the app satisfies (same-origin scripts, inline styles for the charts,
 // same-origin websockets for the console, blob workers for noVNC).
 //
-// noVNC is the one exception, and it is a deliberate one. vnc.html boots from an
-// inline module script — `import UI from "./app/ui.js"; …` — which script-src
-// 'self' refuses. A refused bootstrap is completely silent: noVNC's UI never
-// starts, so it never opens the websocket, so the daemon has nothing to log and
-// the page sits on its loading screen forever. Allowing that script by hash
-// would work exactly until a noVNC release changed it, and then break the
-// console just as silently, so the CSP stops at our own documents: noVNC is a
-// vendored app we serve, not a page we wrote.
+// noVNC and voxl are the exceptions, and they are deliberate ones. Both are
+// vendored apps we serve, not pages we wrote, and both bootstrap in ways
+// `script-src 'self'` refuses: noVNC's vnc.html starts from an inline module
+// script, and voxl's page pulls its own bundles and worklets. A refused
+// bootstrap is completely silent — the UI never starts, so it never opens the
+// websocket, so the daemon has nothing to log and the page sits on its loading
+// screen forever. Allowing those scripts by hash would work exactly until the
+// next release changed them, and then break the console just as silently, so
+// the CSP stops at our own documents.
 func (s *Server) securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h := w.Header()
-		if !strings.HasPrefix(r.URL.Path, "/vnc/") {
+		if !strings.HasPrefix(r.URL.Path, "/vnc/") && !strings.HasPrefix(r.URL.Path, "/voxl/") {
 			h.Set("Content-Security-Policy",
 				"default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'self'; "+
 					"img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; "+
@@ -363,7 +367,7 @@ func (s *Server) withAuth(next http.Handler) http.Handler {
 // gate: everything else falls to webui, which serves a real file if one exists
 // and the SPA shell otherwise.
 func isShellPath(p string) bool {
-	for _, prefix := range []string{"/api/", "/internal/", "/websockify/", "/p/", "/d/", "/vnc/"} {
+	for _, prefix := range []string{"/api/", "/internal/", "/websockify/", "/p/", "/d/", "/vnc/", "/voxl/"} {
 		if strings.HasPrefix(p, prefix) {
 			return false
 		}
@@ -969,14 +973,15 @@ func (s *Server) createWithVolume(w http.ResponseWriter, r *http.Request, name, 
 	writeJSON(w, http.StatusCreated, out)
 }
 
-// dashHTML is the short desktop page: noVNC fills the viewport. The iframe
-// inherits the session cookie, so the URL carries no credential.
-const dashHTML = `<!doctype html>
-<html><head><meta charset="utf-8"><title>warmbox</title>
+// consoleHTML is the short desktop page: the console fills the viewport, and the
+// iframe inherits the session cookie, so the URL carries no credential of its
+// own. Which console is chosen is the only thing that varies.
+const consoleHTML = `<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>warmbox</title>
 <style>html,body{margin:0;height:100%%;background:#111}
 iframe{border:0;width:100vw;height:100vh;display:block}</style></head>
-<body><iframe allow="clipboard-read;clipboard-write"
- src="/vnc/%s/vnc.html?autoconnect=1&resize=scale&show_dot=1&path=/websockify/%s%s"></iframe>
+<body><iframe allow="clipboard-read; clipboard-write; autoplay"
+ src="%s"></iframe>
 </body></html>`
 
 // headlessHTML is what /d/ shows for a desktop with no screen: the link is
@@ -999,8 +1004,10 @@ or start something long-lived with <code>/runs</code>.</p>
 <p><a href="/desktops">Back to desktops</a></p>
 </main></body></html>`
 
-// dash serves the short desktop URL. A request that still carries ?token= is
-// redirected to the bare path only when a login cookie already proves the
+// dash serves the short desktop URL: voxl when the guest runs it, noVNC
+// otherwise. `?classic=1` asks for the noVNC console explicitly, which is also
+// what a browser without WebCodecs needs. A request that still carries ?token=
+// is redirected to the bare path only when a login cookie already proves the
 // session — otherwise the query token IS the credential (API tokens don't set
 // cookies) and stripping it would lock the client out.
 func (s *Server) dash(w http.ResponseWriter, r *http.Request) {
@@ -1018,15 +1025,52 @@ func (s *Server) dash(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/d/"+id, http.StatusFound)
 		return
 	}
-	// noVNC reads `password` from the query string. It is the per-VM VNC
-	// password the guest generated, so the console is not open to anything else
-	// on the host that can reach the guest's port.
-	pass := ""
-	if p := vm.VNCPassword(); p != "" {
-		pass = "&password=" + url.QueryEscape(p)
+	// Both consoles take the per-VM password the guest generated, so neither is
+	// open to anything else on the host that can reach the guest's ports.
+	pass := vm.VNCPassword()
+
+	src := "/vnc/" + id + "/vnc.html?autoconnect=1&resize=scale&show_dot=1&path=/websockify/" + id
+	if r.URL.Query().Get("classic") != "" || !s.voxlUp(r.Context(), vm) {
+		if pass != "" {
+			src += "&password=" + url.QueryEscape(pass)
+		}
+	} else {
+		src = "/voxl/" + id + "/"
+		if pass != "" {
+			src += "?token=" + url.QueryEscape(pass)
+		}
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	fmt.Fprintf(w, dashHTML, id, id, pass)
+	fmt.Fprintf(w, consoleHTML, src)
+}
+
+// voxlUp reports whether this desktop's streamer answers. Images built before
+// voxl have nothing on the port, so the console falls back to noVNC instead of
+// showing a page that can never connect. The probe is cheap and host-local: the
+// guest is on the NAT next door, and the timeout only costs the page it is on.
+func (s *Server) voxlUp(ctx context.Context, vm *desktop.VM) bool {
+	if s.cfg == nil {
+		return false
+	}
+	port := s.cfg.GuestVoxlPort
+	ip := vm.IP()
+	if port <= 0 || ip == "" {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(ctx, 400*time.Millisecond)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		"http://"+net.JoinHostPort(ip, strconv.Itoa(port))+"/healthz", nil)
+	if err != nil {
+		return false
+	}
+	resp, err := guestTransport.RoundTrip(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 512))
+	return resp.StatusCode == http.StatusOK
 }
 
 func (s *Server) list(w http.ResponseWriter, r *http.Request) {
@@ -1511,6 +1555,53 @@ func (s *Server) expose(w http.ResponseWriter, r *http.Request) {
 		Transport: guestTransport,
 		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, err error) {
 			s.fail(w, r, http.StatusBadGateway, "port_unreachable", "could not reach that port on the desktop", err)
+		},
+	}
+	proxy.ServeHTTP(w, r)
+}
+
+// voxlStream proxies the desktop's voxl streamer: the page at the root of
+// /voxl/<id>/, its websocket, its screenshots and its /wait endpoint.
+//
+// voxl refuses any request whose Origin is not the host it was asked for, which
+// is what stops another site's page from driving the desktop. Our page is
+// served from the dashboard's origin, so every request through here would be
+// refused; rewriting Origin to the address we dial (an IP, which cannot be
+// rebound) makes it look like voxl's own page. Direct requests, which never
+// pass through this handler and keep their real Origin, are still refused.
+func (s *Server) voxlStream(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	vm, ok := s.visibleVM(w, r, id)
+	if !ok {
+		return
+	}
+	port := s.cfg.GuestVoxlPort
+	if port <= 0 {
+		http.NotFound(w, r)
+		return
+	}
+	ip := vm.IP()
+	if ip == "" {
+		writeErr(w, r, http.StatusServiceUnavailable, "desktop_not_ready", "desktop not ready", nil)
+		return
+	}
+	target := net.JoinHostPort(ip, strconv.Itoa(port))
+	prefix := "/voxl/" + id
+
+	proxy := &httputil.ReverseProxy{
+		Director: func(req *http.Request) {
+			req.URL.Scheme = "http"
+			req.URL.Host = target
+			req.URL.Path = strings.TrimPrefix(req.URL.Path, prefix)
+			if req.URL.Path == "" {
+				req.URL.Path = "/"
+			}
+			req.Host = target
+			req.Header.Set("Origin", "http://"+target)
+		},
+		Transport: guestTransport,
+		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, err error) {
+			s.fail(w, r, http.StatusBadGateway, "stream_unreachable", "could not reach the desktop's streamer", err)
 		},
 	}
 	proxy.ServeHTTP(w, r)

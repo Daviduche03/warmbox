@@ -319,6 +319,40 @@ else
 
     log "xfce procs: $(ps -o comm= 2>/dev/null | grep -E 'xfwm4|xfce4-panel|xfdesktop|xfsettingsd|xfconfd|xfce4-terminal' | tr '\n' ' ')"
     log "session log: $(tail -4 /var/log/xfce-session.log 2>&1 | tr '\n' '|')"
+
+    # --- voxl: the default console streamer ---
+    # H.264 over a WebSocket, decoded by the browser's WebCodecs, instead of
+    # RFB. Xvnc stays up underneath: it is both the X server voxl reads and the
+    # fallback console, so an image built before voxl — or a browser without
+    # WebCodecs — still gets a desktop. Best-effort: a streamer that fails to
+    # start must never stop the VM reporting ready.
+    #
+    # The password rides in the environment, not on a command line: this is a
+    # guest-local /proc, so unlike the kernel cmdline the host cannot read it.
+    # It is the same per-VM secret noVNC is given, so neither console widens
+    # what a sibling VM on the NAT could already reach.
+    if command -v voxl >/dev/null 2>&1; then
+        if [ "$VNC_AUTH" = "1" ] && [ -n "$VNCPASS" ]; then
+            VOXL_PASSWORD="$VNCPASS" voxl --addr 0.0.0.0 --port 6901 \
+                --audio-enabled=false >/var/log/voxl.log 2>&1 &
+        else
+            voxl --addr 0.0.0.0 --port 6901 --enable-basic-auth=false \
+                --audio-enabled=false >/var/log/voxl.log 2>&1 &
+        fi
+        i=0
+        while [ $i -lt 50 ]; do
+            ss -ltn 2>/dev/null | grep -q ':6901' && break
+            sleep 0.1
+            i=$((i+1))
+        done
+        if ss -ltn 2>/dev/null | grep -q ':6901'; then
+            log "voxl streaming on :6901 (H.264 over WebCodecs)"
+        else
+            log "WARN: voxl did not start: $(tail -3 /var/log/voxl.log 2>/dev/null | tr '\n' '|')"
+        fi
+    else
+        log "voxl not in this image: noVNC is the console"
+    fi
 fi
 
 # --- readiness callback ---
@@ -326,8 +360,13 @@ fi
 # /files and runs talk to, and on an image with a screen that screen has to be
 # streamable too — hence 5900. A headless image has no 5900 to wait for, and
 # gating on it would leave create hanging until the daemon's own timeout.
+# When voxl is listening, gate on it instead: it is the console a browser will
+# actually get, and reporting ready a moment early means the first /d/ load
+# falls back to noVNC for no reason.
 if [ -f /etc/warmbox/headless ]; then
     READY_PORT=7077
+elif ss -ltn 2>/dev/null | grep -q ':6901'; then
+    READY_PORT=6901
 else
     READY_PORT=5900
 fi

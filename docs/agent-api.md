@@ -86,10 +86,10 @@ events dispatched, nothing arriving in the guest. `AcceptKeyEvents`,
 them changes it.
 
 So a guest that cannot be typed into over VNC is a desktop you can only look
-at, which is why warmbox drives the screen through its own agent instead, and
-the VNC server is left to do what it is good at: showing the screen. The
-limitation is recorded in [limitations.md](limitations.md): a human cannot
-type into the browser console yet.
+at, which is why warmbox drives the screen through its own agent as well. The
+default console does not have this problem — voxl injects input with XTEST
+directly — but the noVNC fallback still does, so the agent API remains the
+reliable path for anything that must type. See [limitations.md](limitations.md).
 
 ### History and processes
 ```

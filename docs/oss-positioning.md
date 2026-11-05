@@ -16,7 +16,8 @@ lock-in to one cloud, or a bespoke pile of QEMU/Firecracker/Docker glue per team
 A single binary with one opinionated stack baked in:
 
 - `internal/desktop/manager.go` shells out to **vfkit** directly.
-- `internal/vnc/websockify.go` *is* the streaming transport (noVNC/RFB).
+- `internal/vnc/websockify.go` *is* the fallback streaming transport (noVNC/RFB);
+  `internal/api` proxies the default one (voxl, H.264).
 - `internal/config` + `internal/sync` are welded to **rclone/S3**.
 - `cmd/warmbox/main.go` wires all of it together.
 
@@ -46,6 +47,7 @@ backends** (hypervisors) and **pluggable transports** (screen/input).
 - Reference implementation: this repo.
 - First backend: vfkit (macOS/Apple Silicon). Second: Cloud Hypervisor or QEMU (Linux/x86_64).
 - First transport: VNC/noVNC. Then WebRTC.
+- Now: voxl (H.264 over WebSocket) is the default; noVNC is the fallback.
 - Storage: the portable volume store (see `docs/volumes.md`).
 
 One sentence: *"containerd for agent sandboxes."*

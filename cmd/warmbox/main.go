@@ -1,6 +1,6 @@
 // Command warmbox is the self-hosted GUI-desktop orchestrator: it boots
 // microVMs from a pre-baked image with vfkit, keeps a warm pool, and streams
-// each desktop to the browser over noVNC.
+// each desktop to the browser — voxl by default, noVNC as the fallback.
 package main
 
 import (
@@ -197,7 +197,7 @@ func editDistance(a, b string) int {
 }
 
 func usage() {
-	fmt.Fprint(os.Stderr, `warmbox — self-hosted GUI desktop orchestrator (vfkit + noVNC)
+	fmt.Fprint(os.Stderr, `warmbox — self-hosted GUI desktop orchestrator (vfkit + voxl)
 
 Usage:
   warmbox daemon            Run the orchestrator (web dashboard + REST API)
@@ -205,9 +205,10 @@ Usage:
                             systemd on Linux):
                             install | start | stop | restart | status
   warmbox setup             Install what's missing: hypervisor, guest image, noVNC
+                            (the fallback console)
   warmbox login             Sign in as a user (stores a session)
   warmbox logout            End the CLI session
-  warmbox create            Provision a desktop, print its noVNC URL
+  warmbox create            Provision a desktop, print its console URL
                             (--ttl 600 stops it by itself; --idempotency-key
                             makes a retry safe)
   warmbox images            List the named guest images the daemon can boot
