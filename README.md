@@ -22,7 +22,7 @@ open the same one on a server next week.
 
 ```mermaid
 flowchart LR
-    B["Your browser"] -->|noVNC| D["warmbox daemon<br/>on your host"]
+    B["Your browser"] -->|voxl / noVNC| D["warmbox daemon<br/>on your host"]
     D --> V["Linux desktop<br/>in a small VM"]
     I[("OS image<br/>read-only, shared")] --> V
     V <--> S[("Your volume<br/>files and apps")]
@@ -62,6 +62,7 @@ updating are in [docs/install.md](docs/install.md).
 | You want to | How |
 |---|---|
 | Get a desktop fast | warmbox keeps a few VMs booted and ready, so **New desktop** takes about a second. |
+| Type and scroll in the tab | The console streams H.264 at 60 fps and takes keyboard, mouse and clipboard. |
 | Choose the operating system | `warmbox create --image lxqt` |
 | Keep your work | Attach a volume. The desktop can be destroyed and your files stay. |
 | Move to another computer | Store the volume in a bucket and attach it on another host. |
@@ -162,7 +163,7 @@ background jobs and interactive sessions too, and all of it is in
 
 | Status | What |
 |---|---|
-| Solid and used daily | XFCE and LXQt desktops, the ready pool, accounts and workspaces, volumes with snapshots and clones, image build, pack and pull, running commands and moving files through the API |
+| Solid and used daily | XFCE and LXQt desktops, the voxl console, the ready pool, accounts and workspaces, volumes with snapshots and clones, image build, pack and pull, running commands and moving files through the API |
 | Solid on Linux only | Memory checkpoints: `checkpoint`, `restore`, `hibernate` and `wake` |
 | Experimental | `warmbox-app` and the `/p/` port proxy |
 | Not built yet | Screenshots and input through the API, `omarchy` outside macOS, memory checkpoints on macOS, GPU and audio |
@@ -171,7 +172,8 @@ background jobs and interactive sessions too, and all of it is in
 
 - The dashboard is plain HTTP unless you give it a certificate, so it only
   listens on your own machine by default. To reach it from elsewhere, follow
-  [docs/remote-access.md](docs/remote-access.md).
+  [docs/remote-access.md](docs/remote-access.md). The console needs HTTPS or
+  localhost — browsers only decode video on a secure origin.
 - Everything inside a desktop runs as root.
 - A volume attaches to one desktop at a time.
 - Desktops have no GPU and no audio.

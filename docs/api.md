@@ -15,6 +15,11 @@ A result:
 { "ok": true, "id": "9f2c1ab4", "vnc": "/d/9f2c1ab4" }
 ```
 
+`vnc` is the console page. It serves the voxl stream by default and falls back
+to noVNC when the image has no streamer; add `?classic=1` to ask for noVNC
+explicitly. The stream itself is mounted at `/voxl/<id>/` (page, WebSocket,
+`/screenshot`, `/record`, `/wait`).
+
 A failure:
 
 ```json

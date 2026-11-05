@@ -99,6 +99,13 @@ type Config struct {
 	// GuestVNCPort is the VNC port the guest listens on.
 	GuestVNCPort int
 
+	// GuestVoxlPort is the port the guest's voxl streamer listens on. voxl is
+	// the default console: H.264 over a WebSocket, decoded by the browser's
+	// WebCodecs. The VNC server above stays up as the fallback, because an
+	// image built before voxl has nothing on this port and a browser without
+	// WebCodecs cannot decode it. 0 disables the voxl console entirely.
+	GuestVoxlPort int
+
 	// AgentPort is the port warmbox-agent listens on inside the guest.
 	AgentPort int
 	// GuestSSHPort is the port the guest's SSH server listens on (dropbear,
@@ -166,6 +173,7 @@ func DefaultConfig() *Config {
 		CPUs:            4,
 		Display:         "1280x800",
 		GuestVNCPort:    5900,
+		GuestVoxlPort:   6901,
 		AgentPort:       7077,
 		GuestSSHPort:    22,
 		PoolSize:        2,

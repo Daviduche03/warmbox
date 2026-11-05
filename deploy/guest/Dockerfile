@@ -26,6 +26,48 @@ WORKDIR /src
 COPY agent/ ./
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /warmbox-agent .
 
+# voxl — the default console streamer (H.264 over a WebSocket, decoded by
+# WebCodecs). Built from the published crate rather than a git clone so the
+# image carries an exact, checksum-verified version; its build script bundles
+# the browser client, so esbuild and clang (for bindgen over x264.h) are
+# build-time only.
+#
+# This is the one dependency that needs a C toolchain, which is why it is its
+# own stage: the build tools stay out of the runtime image.
+FROM alpine:3.22 AS voxlbuild
+ARG VOXL_VERSION=0.3.2
+RUN apk add --no-cache \
+        rust cargo pkgconf musl-dev linux-headers \
+        clang20 clang20-dev clang20-libclang llvm20-dev \
+        x264-dev libyuv libyuv-dev opus-dev pulseaudio-dev libxcb-dev esbuild
+ENV LIBCLANG_PATH=/usr/lib/llvm20/lib
+# Alpine ships libyuv's headers (libyuv-dev) and its shared object (libyuv),
+# but no pkg-config file — and voxl's build script asks pkg-config for it, so
+# the build would stop at "The file libyuv.pc needs to be installed". This is
+# that file, describing exactly what the two packages install.
+RUN printf '%s\n' \
+        'prefix=/usr' \
+        'exec_prefix=${prefix}' \
+        'libdir=${exec_prefix}/lib' \
+        'includedir=${prefix}/include' \
+        'Name: libyuv' \
+        'Description: YUV scaling and conversion' \
+        'Version: 0' \
+        'Libs: -L${libdir} -lyuv' \
+        'Cflags: -I${includedir}' \
+        > /usr/lib/pkgconfig/libyuv.pc
+RUN cargo install voxl-server --version "${VOXL_VERSION}" --locked --root /voxl
+
+# A directory that is empty for a headless image, so the final stage can copy
+# it unconditionally: a screenless guest has nothing to stream and should not
+# carry the encoder.
+FROM alpine:3.22 AS voxlstage
+ARG DESKTOP=xfce
+COPY --from=voxlbuild /voxl/bin/voxl /usr/local/bin/voxl
+RUN set -eux; \
+    mkdir -p /out; \
+    if [ "${DESKTOP}" != "none" ]; then mv /usr/local/bin/voxl /out/voxl; fi
+
 FROM alpine:3.22
 
 ARG BROWSER=chromium
@@ -179,8 +221,17 @@ RUN set -eux; \
     rm -rf /themes
 
 COPY --from=agentbuild /warmbox-agent /usr/local/bin/warmbox-agent
+COPY --from=voxlstage /out/ /usr/local/bin/
 COPY init /init
 RUN chmod +x /init /usr/local/bin/warmbox-agent
+
+# voxl's runtime libraries: x264 for the encoder, libyuv to convert the frame,
+# Opus and the PulseAudio client because the binary links them (it runs with
+# --audio-enabled=false — the guest has no sound device).
+RUN set -eux; \
+    if [ "${DESKTOP}" != "none" ]; then \
+        apk add --no-cache x264-libs libyuv opus libpulse libxcb; \
+    fi
 
 # HEADLESS=1 marks the image as one with no screen: /init reads this file and
 # skips Xvnc and the desktop session, reporting ready off the agent port

@@ -100,3 +100,16 @@ fi
 
 note "ok: $(cat "$WD/create.json")"
 note "'$NAME' boots and reports ready"
+
+# Which console the desktop link picked. A note, not an assertion: an image
+# built before voxl is supposed to fall back to noVNC, and the smoke test is
+# run against published images too.
+id=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["id"])' "$WD/create.json" 2>/dev/null || true)
+if [ -n "$id" ]; then
+	console=$(curl -s -b "$JAR" "http://127.0.0.1:$PORT/d/$id" || true)
+	case "$console" in
+		*/voxl/*) note "console: voxl (H.264)" ;;
+		*/vnc/*) note "console: noVNC fallback" ;;
+		*) note "console: no screen" ;;
+	esac
+fi

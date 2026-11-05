@@ -15,8 +15,10 @@ loopback by default and refuses a network address without TLS or an explicit
 `--insecure`.
 
 Each guest's VNC server requires a per-VM password, generated inside the guest
-and handed to noVNC with the console URL. The guest sits behind the hypervisor's
-NAT, so that port is never on the LAN.
+and handed to noVNC with the console URL. voxl uses the same secret. The guest
+sits behind the hypervisor's NAT, so neither port is ever on the LAN, and voxl
+additionally refuses any browser request whose origin is not the console page's
+own.
 
 Guests are on QEMU user-mode networking (`-netdev user`), never tap or
 vhost-net. That is deliberate: slirp ends the guest's L2/L3 in QEMU's userspace
@@ -31,23 +33,32 @@ trade this boundary for LAN reachability.
 What remains is the guest itself. It runs as root, and none of this is hardened
 against someone who already has the desktop.
 
-## You cannot type into the browser console yet
+## The noVNC fallback cannot type
 
-The desktop streams to the browser, and the mouse works — but **keystrokes do
-not reach the guest over VNC**. The VNC server accepts the key events and
-then drops them before they reach the X server, while the same keystrokes
-work over the agent's own channel.
+The default console is **voxl**: H.264 over a WebSocket, decoded by the
+browser's WebCodecs. It carries keyboard, mouse, clipboard and scrolling.
+
+The fallback is noVNC, which the daemon still serves — an image built before
+voxl has no streamer, and a browser without WebCodecs cannot decode one. Over
+that fallback **keystrokes do not reach the guest**: the VNC server accepts the
+key events and then drops them before they reach the X server, while the same
+keystrokes work over the agent's own channel.
 
 This was checked rather than assumed: the RFB bytes on the wire are correct,
 pointer events and screen updates work, `xdotool` (XTEST) types into the
 guest perfectly, and the same failure reproduces in a real browser with
 noVNC. `AcceptKeyEvents`, `xkeyboard-config` and TigerVNC's `RawKeyboard`
-were each tried; none of them changes it.
+were each tried; none of them changes it. voxl injects keys through XTEST
+itself, which is why the default console does not have the problem. An agent is
+never blocked either way: it types through the agent API,
+`POST /api/desktops/{id}/input`.
 
-So today the browser console is a *watch* screen, not a *drive* screen. An
-agent is not blocked: it types through the agent API instead —
-`POST /api/desktops/{id}/input` — which works. Fixing the human path means
-either a different VNC server in the guest or a newer TigerVNC.
+## The default console needs HTTPS or localhost
+
+Browsers only expose WebCodecs on a secure origin. `http://localhost:7070`
+qualifies; so does a Tailscale or TLS endpoint. A plain-HTTP daemon reached
+over a network address (`--insecure`) serves a console that loads and then
+refuses to decode — use `?classic=1` there, which selects noVNC.
 
 ## EFI disk images are macOS-only
 
@@ -70,6 +81,17 @@ a substitute. It freezes the CPUs in place and the memory stays allocated. See
 Guests get virtio-gpu without 3D, so a Wayland desktop composites through Mesa
 `llvmpipe`. The Omarchy image is tuned for it, with a small output and effects
 off. X11 is much lighter for remote display.
+
+## The console streams X11, not Wayland
+
+voxl captures an X11 display, so it is what the XFCE and LXQt images use. The
+Omarchy image is a Wayland session and keeps its own VNC path; `/d/` notices the
+streamer is not there and serves noVNC instead.
+
+voxl links x264, which is GPL-2.0, so a guest image that ships it is distributed
+under the GPL. warmbox itself (Apache-2.0) is unaffected — voxl is a separate
+process inside the guest — but the image, which already carries GPL-2.0
+TigerVNC, must ship with that obligation met.
 
 ## Images are big
 

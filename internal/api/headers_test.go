@@ -69,3 +69,20 @@ func TestNoVNCPageIsExemptFromTheCSP(t *testing.T) {
 		t.Error("the console page lost its CSP")
 	}
 }
+
+// voxl is a vendored app we serve, like noVNC, and its page brings its own
+// bundles and worklets. A CSP that blocked them would leave the console on a
+// black frame with nothing in the daemon's log to explain it, so the stream
+// namespace is exempt for the same reason noVNC's is.
+func TestVoxlIsExemptFromTheCSP(t *testing.T) {
+	s := &Server{}
+	for _, path := range []string{"/voxl/abc123/", "/voxl/abc123/main.js", "/voxl/abc123/ws"} {
+		if got := headerFor(t, s, path).Get("Content-Security-Policy"); got != "" {
+			t.Errorf("%s served with %q, which blocks voxl's bootstrap", path, got)
+		}
+	}
+	// Everything else keeps it, including the neighbouring proxy namespace.
+	if h := headerFor(t, s, "/p/abc123/6901/"); h.Get("Content-Security-Policy") == "" {
+		t.Error("the generic port proxy lost its CSP")
+	}
+}

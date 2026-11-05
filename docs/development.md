@@ -107,7 +107,8 @@ comes up fails the workflow.
   snapshot/restore.
 - **The agent API**: TTY, screenshot and input, so an agent can drive the screen
   as well as the shell ([agent-api.md](agent-api.md)).
-- **WebRTC streaming**: replace noVNC/RFB for latency and bandwidth.
+- **Streaming**: voxl (H.264/WebCodecs) is the default console; noVNC/RFB is the
+  fallback. A WebRTC transport is the next step for lossy networks.
 - **Windows**: a WSL2 guide, or a native WHPX QEMU backend. Unverified. The seam
   is `internal/desktop/backend.go`.
 - **Tests**: API and VM-lifecycle integration.

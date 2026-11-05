@@ -200,6 +200,7 @@ func minRoleFor(method, path string) int {
 	case strings.HasPrefix(path, "/d/") ||
 		strings.HasPrefix(path, "/websockify/") ||
 		strings.HasPrefix(path, "/vnc/") ||
+		strings.HasPrefix(path, "/voxl/") ||
 		strings.HasPrefix(path, "/p/"):
 		return catalog.RoleRank(catalog.RoleMember)
 	case strings.HasPrefix(path, "/api/"):
