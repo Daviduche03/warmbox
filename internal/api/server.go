@@ -157,6 +157,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/desktops/{id}/screenshot", s.agentScreenshot)
 	mux.HandleFunc("GET /api/desktops/{id}/screen", s.agentScreen)
 	mux.HandleFunc("POST /api/desktops/{id}/input", s.agentInput)
+	mux.HandleFunc("GET /api/desktops/{id}/wait", s.agentWait)
+	mux.HandleFunc("POST /api/desktops/{id}/record", s.agentRecord)
 
 	// Memory checkpoints: live RAM+device snapshots on disk, restorable
 	// without booting (qemu backend; see docs/snapshots.md).
@@ -1605,6 +1607,51 @@ func (s *Server) voxlStream(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 	proxy.ServeHTTP(w, r)
+}
+
+// voxlRequest performs one request against a desktop's streamer, authenticated
+// with the same per-VM secret the console uses, and relays the answer.
+//
+// It returns false without writing anything when the guest has no streamer (an
+// image built before voxl), so a caller can fall back to the agent's own
+// implementation. Once the guest answers, its status and body are relayed
+// verbatim: voxl says why it refused better than a rephrasing would.
+func (s *Server) voxlRequest(w http.ResponseWriter, r *http.Request, vm *desktop.VM, path string, query url.Values, timeout time.Duration) bool {
+	if s.cfg == nil || s.cfg.GuestVoxlPort <= 0 {
+		return false
+	}
+	ip := vm.IP()
+	if ip == "" {
+		return false
+	}
+	target := net.JoinHostPort(ip, strconv.Itoa(s.cfg.GuestVoxlPort))
+	q := url.Values{}
+	for k, v := range query {
+		q[k] = v
+	}
+	if p := vm.VNCPassword(); p != "" {
+		q.Set("token", p)
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), timeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+target+path+"?"+q.Encode(), nil)
+	if err != nil {
+		return false
+	}
+	resp, err := guestTransport.RoundTrip(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	for _, h := range []string{"Content-Type", "Content-Length", "X-Voxl-Seq"} {
+		if v := resp.Header.Get(h); v != "" {
+			w.Header().Set(h, v)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	// A recording is streamed as it is produced, so this copy is the work.
+	_, _ = io.Copy(w, resp.Body)
+	return true
 }
 
 func (s *Server) novnc(w http.ResponseWriter, r *http.Request) {

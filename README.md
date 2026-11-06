@@ -138,6 +138,8 @@ HTTP with no SSH keys and no screen.
 curl -X POST localhost:7070/api/desktops/$ID/exec -d '{"cmd":"uname -a"}'
 curl "localhost:7070/api/desktops/$ID/files?path=/home"
 curl "localhost:7070/api/desktops/$ID/file?path=/etc/hostname"
+curl "localhost:7070/api/desktops/$ID/wait?idle=300"    # block until the screen settles
+curl -X POST "localhost:7070/api/desktops/$ID/record?seconds=10" -o clip.mp4
 ```
 
 | Client | Install |
