@@ -241,6 +241,7 @@ Usage:
   warmbox volume list
   warmbox volume clone <name> <new>
   warmbox volume rm <name>
+  warmbox volume gc [--dry-run]
 
   warmbox snapshot create <volume> [--name <id>]
   warmbox snapshot list
@@ -1290,7 +1291,11 @@ func newVolumeStore(ctx context.Context, cfg *desktop.Config) (*volume.Store, st
 		return nil, "disabled"
 	}
 	fmt.Fprintf(os.Stderr, "warmbox: volumes backed by local dir %s (no cloud remote configured; run `warmbox cloud set`)\n", local)
-	return volume.NewStore(f, cfg.VolumePrefix, cfg.VolumeDir, cfg.VolumeBase, chunk), "local"
+	st := volume.NewStore(f, cfg.VolumePrefix, cfg.VolumeDir, cfg.VolumeBase, chunk)
+	// The remote is a dir on this disk: read chunks straight through to it
+	// instead of copying every byte into the local cache first.
+	st.SetLocalRemoteDir(local)
+	return st, "local"
 }
 
 // openCatalog opens the SQLite catalog at <workdir>/warmbox.db.
@@ -1882,6 +1887,12 @@ const defaultAPITimeout = 30 * time.Second
 // createTimeout covers a cold boot: the server waits up to ~120s for
 // readiness before giving up, so anything shorter would kill healthy creates.
 const createTimeout = 180 * time.Second
+
+// destroyTimeout covers a slow volume commit: destroy commits the volume
+// before answering, and a multi-GB commit outlasts the default API timeout —
+// which used to make the CLI report failure for an operation that then
+// succeeded server-side (and left the lease looking stale).
+const destroyTimeout = 150 * time.Second
 
 // cleanupTimeout bounds best-effort teardown (connect's session DELETE):
 // long enough for a slow daemon, short enough that Ctrl-C always exits.
@@ -2676,7 +2687,7 @@ func cmdDestroy(args []string) {
 		fatal("Usage: warmbox destroy <id>")
 	}
 	req, _ := http.NewRequest(http.MethodDelete, withToken(apiBase(addr)+"/api/desktops/"+rest[0], token), nil)
-	resp, err := doAuthed(req)
+	resp, err := doAuthedTimeout(req, destroyTimeout)
 	if err != nil {
 		fatal("Error: %v", err)
 	}
@@ -3560,6 +3571,7 @@ Usage:
   warmbox volume list
   warmbox volume clone <name> <new>
   warmbox volume rm <name>
+  warmbox volume gc [--dry-run]   delete chunks no volume or snapshot uses
 `)
 }
 
@@ -3769,6 +3781,17 @@ func cmdVolume(args []string) {
 		}
 		req, _ := http.NewRequest(http.MethodDelete, withToken(apiBase(addr)+"/api/volumes/"+rest[0], token), nil)
 		resp, err := doAuthed(req)
+		doVolume(resp, err)
+
+	case "gc":
+		fs := flag.NewFlagSet("volume gc", flag.ExitOnError)
+		fs.StringVar(&addr, "addr", addr, "daemon API address")
+		fs.StringVar(&token, "token", token, "user API token (or `warmbox login` first)")
+		dry := fs.Bool("dry-run", false, "list orphaned chunks without deleting them")
+		_ = fs.Parse(args[1:])
+		payload, _ := json.Marshal(map[string]bool{"dry_run": *dry})
+		resp, err := postAuthed(withToken(apiBase(addr)+"/api/volumes/gc", token),
+			"application/json", strings.NewReader(string(payload)))
 		doVolume(resp, err)
 
 	default:

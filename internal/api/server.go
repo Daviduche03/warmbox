@@ -198,6 +198,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/volumes/{name}", s.volumeGet)
 	mux.HandleFunc("DELETE /api/volumes/{name}", s.volumeDelete)
 	mux.HandleFunc("POST /api/volumes/{name}/clone", s.volumeClone)
+	mux.HandleFunc("POST /api/volumes/gc", s.volumeGC)
 
 	// Snapshots: frozen volume manifests.
 	mux.HandleFunc("POST /api/snapshots", s.snapshotCreate)
@@ -1718,11 +1719,61 @@ func (s *Server) ReapStaleLeases() int {
 
 // lockVolume takes the single-writer lock for a volume (a catalog lease when
 // available, otherwise the in-process store lock).
+//
+// A destroy that timed out client-side leaves its lease behind while the
+// server already tore the desktop down — without reconciliation every later
+// create fails with "already leased" until a daemon restart. So a conflict
+// against an owner with no live desktop is treated as stale: it is released
+// and the acquire retried once, and the theft is logged.
 func (s *Server) lockVolume(name, owner string) error {
+	if err := s.acquireLease(name, owner); err == nil {
+		return nil
+	} else if !isLeaseConflict(err) {
+		return err
+	}
+	if s.volumeOwnerLive(name) {
+		return fmt.Errorf("volume %q is already leased", name)
+	}
+	stale := s.volumeOwner(name)
+	if s.log != nil {
+		fmt.Fprintf(s.log, "warmbox: reclaimed stale volume lease %s from dead desktop %s\n", name, stale)
+	}
+	s.unlockVolume(name, stale)
+	s.volumes.Release(name, stale)
+	return s.acquireLease(name, owner)
+}
+
+func (s *Server) acquireLease(name, owner string) error {
 	if s.catalog != nil {
 		return s.catalog.AcquireLease(name, owner)
 	}
 	return s.volumes.Attach(name, owner)
+}
+
+// volumeOwnerLive reports whether a volume's current owner is a live desktop.
+// A nil manager means fail-closed: the owner counts as live, so a lease is
+// never stolen without something to check liveness against.
+func (s *Server) volumeOwnerLive(name string) bool {
+	owner := s.volumeOwner(name)
+	if owner == "" || s.mgr == nil {
+		return owner != ""
+	}
+	for _, info := range s.mgr.List() {
+		if info.ID == owner {
+			return true
+		}
+	}
+	return false
+}
+
+// isLeaseConflict reports whether err is a "held by someone else" lock
+// failure, as opposed to a storage error.
+func isLeaseConflict(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "already attached") ||
+		strings.Contains(err.Error(), "already leased")
 }
 
 func (s *Server) unlockVolume(name, owner string) {
@@ -1897,6 +1948,28 @@ func (s *Server) volumeDelete(w http.ResponseWriter, r *http.Request) {
 		_ = s.catalog.DeleteVolume(name)
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted", "name": name})
+}
+
+// volumeGC deletes remote chunks no volume or snapshot manifest references.
+// Failed commits and prepares leave exactly such orphans behind, and nothing
+// else ever cleans them. It only deletes unreferenced chunks, so running it
+// while a desktop is attached is safe: the attached volume's manifest keeps
+// its chunks referenced. Chunks newer than the grace period are spared, so an
+// in-flight commit's not-yet-linked uploads survive.
+func (s *Server) volumeGC(w http.ResponseWriter, r *http.Request) {
+	if !s.volumesEnabled(w, r) {
+		return
+	}
+	var req struct {
+		DryRun bool `json:"dry_run"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	rep, err := s.volumes.GC(r.Context(), req.DryRun)
+	if err != nil {
+		s.fail(w, r, http.StatusBadGateway, "volume_gc_failed", "garbage collection failed", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, rep)
 }
 
 func (s *Server) volumeClone(w http.ResponseWriter, r *http.Request) {

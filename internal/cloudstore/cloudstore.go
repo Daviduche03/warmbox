@@ -19,6 +19,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -30,6 +31,11 @@ import (
 
 // DefaultChunkSize is the transfer/allocation granularity.
 const DefaultChunkSize = 16 << 20
+
+// DefaultMaxCacheBytes bounds the local chunk cache for real (non-local)
+// remotes: 4 GiB of 16 MiB chunks. A cache bigger than this is a second copy
+// of the data, not a cache.
+const DefaultMaxCacheBytes = 4 << 30
 
 // Manifest maps chunk index -> content hash (and the geometry).
 type Manifest struct {
@@ -43,6 +49,17 @@ type Store struct {
 	fs        rfs.Fs
 	chunkRoot string // e.g. "volumes/chunks"
 	chunkSize int64
+
+	// localChunks, when non-empty, is a directory on this host's disk holding
+	// exactly the objects under chunkRoot: the "remote" is a local dir, so
+	// GetChunk reads straight through to it instead of copying every byte
+	// into cacheDir first. Without this a local backend stores every volume
+	// byte three times (live image + cacheDir copy + remote copy).
+	localChunks string
+
+	// maxCacheBytes bounds cacheDir for real remotes (LRU by mtime).
+	// <= 0 means DefaultMaxCacheBytes.
+	maxCacheBytes int64
 }
 
 // New builds a Store. chunkSize <= 0 uses DefaultChunkSize.
@@ -50,11 +67,55 @@ func New(f rfs.Fs, chunkRoot string, chunkSize int64) *Store {
 	if chunkSize <= 0 {
 		chunkSize = DefaultChunkSize
 	}
-	return &Store{fs: f, chunkRoot: chunkRoot, chunkSize: chunkSize}
+	return &Store{fs: f, chunkRoot: chunkRoot, chunkSize: chunkSize, maxCacheBytes: DefaultMaxCacheBytes}
+}
+
+// SetLocalChunksDir tells the store its remote chunk root lives at dir on
+// this host's disk, so reads go straight to it and the cache stays empty.
+// dir must hold exactly the objects under chunkRoot.
+func (s *Store) SetLocalChunksDir(dir string) { s.localChunks = dir }
+
+// SetMaxCacheBytes bounds the local chunk cache for real remotes. n <= 0
+// restores the default.
+func (s *Store) SetMaxCacheBytes(n int64) {
+	if n <= 0 {
+		n = DefaultMaxCacheBytes
+	}
+	s.maxCacheBytes = n
 }
 
 // ChunkSize returns the configured chunk size.
 func (s *Store) ChunkSize() int64 { return s.chunkSize }
+
+// ChunkRef names a stored chunk and its size.
+type ChunkRef struct {
+	Hash    string
+	Size    int64
+	ModTime time.Time
+}
+
+// DeleteChunk removes one stored chunk.
+func (s *Store) DeleteChunk(ctx context.Context, hash string) error {
+	return s.Delete(ctx, s.chunkPath(hash))
+}
+
+// ListChunks lists the chunks in the remote store. Used by garbage
+// collection to find hashes no manifest references anymore.
+func (s *Store) ListChunks(ctx context.Context) ([]ChunkRef, error) {
+	entries, err := s.fs.List(ctx, s.chunkRoot)
+	if err != nil {
+		return nil, err
+	}
+	var out []ChunkRef
+	for _, e := range entries {
+		obj, ok := e.(rfs.Object)
+		if !ok {
+			continue
+		}
+		out = append(out, ChunkRef{Hash: pathBase(obj.Remote()), Size: obj.Size(), ModTime: obj.ModTime(ctx)})
+	}
+	return out, nil
+}
 
 // Fs returns the underlying rclone filesystem.
 func (s *Store) Fs() rfs.Fs { return s.fs }
@@ -161,21 +222,150 @@ func (s *Store) PutChunk(ctx context.Context, data []byte) (string, error) {
 }
 
 // GetChunk returns a chunk by content hash, using cacheDir as a local cache.
+//
+// A cache hit is hash-verified: a partial file left by a crashed or killed
+// run is deleted and re-fetched, never served as good data. Cache entries are
+// written atomically (temp file + rename), so a crash cannot leave a torn
+// file behind in the first place.
+//
+// When the remote is a local dir (see SetLocalChunksDir) the bytes are read
+// straight through to it and cacheDir is untouched: copying them would store
+// every byte twice on one disk for no benefit.
 func (s *Store) GetChunk(ctx context.Context, hash, cacheDir string) ([]byte, error) {
+	if s.localChunks != "" {
+		b, err := os.ReadFile(filepath.Join(s.localChunks, hash))
+		if err != nil {
+			return nil, err
+		}
+		return b, nil
+	}
 	if cacheDir != "" {
 		if b, err := os.ReadFile(filepath.Join(cacheDir, hash)); err == nil {
-			return b, nil
+			if Hash(b) == hash {
+				return b, nil
+			}
+			// Corrupt entry: drop it so the fetch below replaces it.
+			_ = os.Remove(filepath.Join(cacheDir, hash))
 		}
 	}
 	b, err := s.GetBytes(ctx, s.chunkPath(hash))
 	if err != nil {
 		return nil, err
 	}
+	if Hash(b) != hash {
+		return nil, fmt.Errorf("chunk %s: remote bytes do not match their hash", hash)
+	}
 	if cacheDir != "" {
 		_ = os.MkdirAll(cacheDir, 0o755)
-		_ = os.WriteFile(filepath.Join(cacheDir, hash), b, 0o644)
+		_ = writeFileAtomic(filepath.Join(cacheDir, hash), b, 0o644)
+		_, _ = s.pruneCache(cacheDir)
 	}
 	return b, nil
+}
+
+// writeFileAtomic writes data to path via a temp file in the same directory
+// plus rename, so a crash mid-write leaves the old file (or nothing), never
+// a partial one.
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	if err := os.Chmod(tmpName, perm); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	return nil
+}
+
+// PruneCache deletes the oldest cache entries (by mtime) until cacheDir fits
+// in maxBytes, and returns the bytes reclaimed. maxBytes <= 0 uses the
+// store's bound. It never touches a cache the local read-through made
+// obsolete: with no cache writes there is nothing to bound.
+func (s *Store) PruneCache(cacheDir string, maxBytes int64) (int64, error) {
+	if s.localChunks != "" {
+		return 0, nil
+	}
+	return s.pruneCacheTo(cacheDir, maxBytes)
+}
+
+func (s *Store) pruneCache(cacheDir string) (int64, error) {
+	return s.pruneCacheTo(cacheDir, 0)
+}
+
+func (s *Store) pruneCacheTo(cacheDir string, maxBytes int64) (int64, error) {
+	max := maxBytes
+	if max <= 0 {
+		max = s.maxCacheBytes
+	}
+	if max <= 0 {
+		max = DefaultMaxCacheBytes
+	}
+	if cacheDir == "" {
+		return 0, nil
+	}
+	entries, err := os.ReadDir(cacheDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	type fi struct {
+		name string
+		size int64
+		mod  time.Time
+	}
+	var total int64
+	files := make([]fi, 0, len(entries))
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		if strings.HasPrefix(e.Name(), ".tmp-") {
+			// A torn write from a crashed run: never a valid entry. Only
+			// remove settled ones so an in-flight write is never disturbed.
+			if info, err := e.Info(); err == nil && time.Since(info.ModTime()) > time.Hour {
+				_ = os.Remove(filepath.Join(cacheDir, e.Name()))
+			}
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		total += info.Size()
+		files = append(files, fi{e.Name(), info.Size(), info.ModTime()})
+	}
+	if total <= max {
+		return 0, nil
+	}
+	sort.Slice(files, func(i, j int) bool { return files[i].mod.Before(files[j].mod) })
+	var reclaimed int64
+	for _, f := range files {
+		if total <= max {
+			break
+		}
+		if err := os.Remove(filepath.Join(cacheDir, f.name)); err == nil {
+			total -= f.size
+			reclaimed += f.size
+		}
+	}
+	return reclaimed, nil
 }
 
 // Hash returns the content hash of a chunk.
@@ -225,23 +415,75 @@ func (s *Store) BuildManifest(ctx context.Context, img *os.File, size, chunkSize
 	return m, nil
 }
 
+// ApplyStats reports what ApplyManifest did. Wrote is the number of chunks
+// actually written; Skipped is the number already identical on disk.
+type ApplyStats struct {
+	Wrote        int
+	Skipped      int
+	BytesWritten int64
+	BytesSkipped int64
+}
+
 // ApplyManifest materializes a manifest into a local image. Chunks already in
 // cacheDir are reused (so shared chunks are downloaded once per host).
-func (s *Store) ApplyManifest(ctx context.Context, m *Manifest, img *os.File, cacheDir string) error {
+//
+// Every manifest chunk is compared against the bytes already on disk first,
+// and identical ranges are left untouched: a create on an up-to-date image
+// performs zero chunk writes instead of rewriting the whole disk. Ranges the
+// manifest does not list are never touched, so a crash mid-apply can only
+// leave an old-or-new chunk behind — never a torn one — and the next apply
+// repairs it by the same comparison. Fetched bytes are always hash-verified
+// before they reach the image, so a corrupt cache entry (see GetChunk) can
+// never be written into a disk.
+func (s *Store) ApplyManifest(ctx context.Context, m *Manifest, img *os.File, cacheDir string) (ApplyStats, error) {
+	var st ApplyStats
+	if m.ChunkSize <= 0 {
+		return st, fmt.Errorf("manifest has no chunk size")
+	}
+	buf := make([]byte, m.ChunkSize)
 	for idxStr, hash := range m.Chunks {
 		idx, err := strconv.Atoi(idxStr)
 		if err != nil {
 			continue
 		}
+		off := int64(idx) * m.ChunkSize
+		ln := m.ChunkSize
+		if rem := m.Size - off; rem < ln {
+			ln = rem
+		}
+		if ln <= 0 {
+			continue
+		}
+		b := buf[:ln]
+		n, err := img.ReadAt(b, off)
+		if err != nil && err != io.EOF {
+			return st, err
+		}
+		for i := n; i < len(b); i++ {
+			b[i] = 0
+		}
+		if Hash(b) == hash {
+			st.Skipped++
+			st.BytesSkipped += ln
+			continue
+		}
 		data, err := s.GetChunk(ctx, hash, cacheDir)
 		if err != nil {
-			return fmt.Errorf("chunk %d: %w", idx, err)
+			return st, fmt.Errorf("chunk %d: %w", idx, err)
 		}
-		if _, err := img.WriteAt(data, int64(idx)*m.ChunkSize); err != nil {
-			return err
+		if Hash(data) != hash {
+			return st, fmt.Errorf("chunk %d: fetched bytes do not match their hash", idx)
 		}
+		if _, err := img.WriteAt(data, off); err != nil {
+			return st, err
+		}
+		st.Wrote++
+		st.BytesWritten += int64(len(data))
 	}
-	return nil
+	if cacheDir != "" {
+		_, _ = s.pruneCache(cacheDir)
+	}
+	return st, nil
 }
 
 // AllocatedChunks returns the chunk indices that contain allocated (non-hole)
