@@ -332,12 +332,23 @@ else
     # It is the same per-VM secret noVNC is given, so neither console widens
     # what a sibling VM on the NAT could already reach.
     if command -v voxl >/dev/null 2>&1; then
+        # Audio only when the image has a sound stack to stream: voxl plays the
+        # output monitor, and pointing it at a server that is not there only
+        # delays the first frame. Our images ship no audio yet, so this is off
+        # by default and switches on by itself for an image that adds one.
+        AUDIO="--audio-enabled=false"
+        if [ -S /run/pulse/native ] || [ -S /var/run/pulse/native ] || \
+           [ -S "$XDG_RUNTIME_DIR/pulse/native" ]; then
+            AUDIO="--audio-enabled=true"
+        fi
         if [ "$VNC_AUTH" = "1" ] && [ -n "$VNCPASS" ]; then
-            VOXL_PASSWORD="$VNCPASS" voxl --addr 0.0.0.0 --port 6901 \
-                --audio-enabled=false >/var/log/voxl.log 2>&1 &
+            # shellcheck disable=SC2086
+            VOXL_PASSWORD="$VNCPASS" voxl --addr 0.0.0.0 --port 6901 $AUDIO \
+                >/var/log/voxl.log 2>&1 &
         else
-            voxl --addr 0.0.0.0 --port 6901 --enable-basic-auth=false \
-                --audio-enabled=false >/var/log/voxl.log 2>&1 &
+            # shellcheck disable=SC2086
+            voxl --addr 0.0.0.0 --port 6901 --enable-basic-auth=false $AUDIO \
+                >/var/log/voxl.log 2>&1 &
         fi
         i=0
         while [ $i -lt 50 ]; do

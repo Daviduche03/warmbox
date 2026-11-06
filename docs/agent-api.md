@@ -67,6 +67,8 @@ POST   /api/desktops/{id}/file/move  {from,to}
 GET  /api/desktops/{id}/screenshot                       → PNG
 GET  /api/desktops/{id}/screen                           → {width, height}
 POST /api/desktops/{id}/input  {type:"text"|"key"|"move"|"click", …}
+GET  /api/desktops/{id}/wait?idle=300&timeout=10000      → {changed, timed_out, seq, waited_ms}
+POST /api/desktops/{id}/record?seconds=10                → MP4
 ```
 - implemented in the guest with `xwd` (+ an X image tool) and `xdotool`.
 - `text` is `{"type":"text","text":"hello"}`; `key` is `{"type":"key","key":"Return"}`
@@ -74,6 +76,30 @@ POST /api/desktops/{id}/input  {type:"text"|"key"|"move"|"click", …}
   `move` is `{"type":"move","x":100,"y":200}`.
 - The guest injects the input with XTEST, so it lands on the focused window
   whatever is streaming the screen.
+
+**Screenshots come from the streamer when there is one.** voxl already holds
+the last frame, so `/screenshot` is a copy rather than a process spawn; an
+image without voxl falls back to the agent's own capture.
+
+**`/wait` is the reason a computer-use agent can be reliable.** It returns when
+the screen stops changing, so a loop reads as *act → wait → look* instead of
+*act → sleep → hope*. It is damage-driven inside the guest (XDamage), so no
+polling and no screenshots happen while the screen is still.
+
+| Query | Meaning |
+|---|---|
+| `idle` | ms the screen must stay still before returning (default 300) |
+| `change` | return at the first change instead of at stillness |
+| `region=x,y,w,h` | only watch that rectangle |
+| `since=<seq>` | return at once if anything changed after that sequence |
+| `timeout` | give up after this many ms (default 10000) |
+
+A blinking text caret redraws about twice a second, so keep `idle` under 500 ms
+or leave the caret out of `region`.
+
+**`/record` reuses the encode that is already running**, so a clip costs no
+extra CPU and no second pass. It answers with an MP4 (max 300 s), has no cursor
+in the frame, and ends early on a resize.
 
 **Why the guest does the input, and not the VNC server:** the guest's VNC
 server (TigerVNC) accepts key events on the wire and then drops them before

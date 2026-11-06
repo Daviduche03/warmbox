@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"net/url"
+	"strconv"
 	"time"
 )
 
@@ -120,13 +122,83 @@ func (s *Server) agentProcesses(w http.ResponseWriter, r *http.Request) {
 }
 
 // agentScreenshot returns a PNG of the guest's screen.
+//
+// The streamer already holds the last frame, so asking it costs a copy instead
+// of spawning ImageMagick inside the guest. An image without voxl falls back to
+// the agent, which captures the root window itself.
 func (s *Server) agentScreenshot(w http.ResponseWriter, r *http.Request) {
-	s.agentProxy(w, r, r.PathValue("id"), "/screenshot")
+	vm, ok := s.visibleVM(w, r, r.PathValue("id"))
+	if !ok {
+		return
+	}
+	if s.voxlRequest(w, r, vm, "/screenshot", nil, 10*time.Second) {
+		return
+	}
+	s.agentProxy(w, r, vm.ID, "/screenshot")
 }
 
 // agentScreen returns the guest's screen size.
 func (s *Server) agentScreen(w http.ResponseWriter, r *http.Request) {
 	s.agentProxy(w, r, r.PathValue("id"), "/screen")
+}
+
+// agentWait blocks until the desktop's screen settles (or, with ?change=1,
+// until it changes at all) and answers with voxl's own JSON: changed, timed_out,
+// seq and waited_ms.
+//
+// This is the difference between an agent that sleeps after every click and one
+// that reacts to what actually happened. It is damage-driven inside the guest —
+// no polling, no screenshots — so waiting costs nothing while the screen is
+// still.
+func (s *Server) agentWait(w http.ResponseWriter, r *http.Request) {
+	vm, ok := s.visibleVM(w, r, r.PathValue("id"))
+	if !ok {
+		return
+	}
+	q := url.Values{}
+	for _, k := range []string{"idle", "change", "region", "since", "timeout"} {
+		if v := r.URL.Query().Get(k); v != "" {
+			q.Set(k, v)
+		}
+	}
+	// voxl's own default timeout is 10s; give the request room above it.
+	if !s.voxlRequest(w, r, vm, "/wait", q, 60*time.Second) {
+		writeErr(w, r, http.StatusNotImplemented, "stream_unavailable",
+			"this desktop has no voxl streamer, so it cannot report when the screen settles", nil)
+	}
+}
+
+// agentRecord records the screen for a few seconds and answers with an MP4.
+//
+// voxl saves the H.264 it is already encoding, so there is no second encoder
+// and no extra CPU. It does not include the cursor (viewers draw it), and a
+// resize ends it.
+func (s *Server) agentRecord(w http.ResponseWriter, r *http.Request) {
+	vm, ok := s.visibleVM(w, r, r.PathValue("id"))
+	if !ok {
+		return
+	}
+	seconds := recordSeconds(r.URL.Query().Get("seconds"))
+	w.Header().Set("Content-Disposition", `attachment; filename="`+vm.ID+`.mp4"`)
+	if !s.voxlRequest(w, r, vm, "/record", url.Values{"seconds": {strconv.Itoa(seconds)}},
+		time.Duration(seconds+30)*time.Second) {
+		w.Header().Del("Content-Disposition")
+		writeErr(w, r, http.StatusNotImplemented, "stream_unavailable",
+			"this desktop has no voxl streamer, so it cannot record", nil)
+	}
+}
+
+// recordSeconds bounds a recording request. 10s is long enough to show a short
+// interaction; 300s is voxl's own default ceiling.
+func recordSeconds(v string) int {
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return 10
+	}
+	if n > 300 {
+		return 300
+	}
+	return n
 }
 
 // agentInput injects a keystroke, a click or a pointer move into the guest's
