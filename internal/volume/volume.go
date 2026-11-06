@@ -9,7 +9,9 @@ package volume
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -17,6 +19,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -47,9 +50,29 @@ type Store struct {
 	baseImage string
 	chunkSize int64
 
+	// localRemote is set when the remote store is a directory on this host:
+	// chunk reads go straight to it and the cacheDir copy is skipped.
+	localRemote string
+
 	mu       sync.Mutex
 	attached map[string]string // volume name -> owner (VM id)
+
+	applyMu   sync.Mutex
+	lastApply cloudstore.ApplyStats
+
+	// gcGrace skips chunks newer than this during garbage collection, so an
+	// in-flight commit's not-yet-referenced uploads are never deleted.
+	// Zero uses DefaultGCGrace.
+	gcGrace time.Duration
+
+	cleanedCache sync.Once
 }
+
+// DefaultGCGrace is how young a chunk may be and still be safe from the
+// garbage collector. A commit uploads chunks before writing the manifest that
+// references them; without a grace window GC could delete an upload that is
+// seconds away from being referenced.
+const DefaultGCGrace = time.Hour
 
 // NewStore builds a Store. prefix defaults to "volumes"; chunkSize <= 0 uses
 // DefaultChunkSize.
@@ -69,6 +92,36 @@ func NewStore(f rfs.Fs, prefix, localDir, baseImage string, chunkSize int64) *St
 		chunkSize: chunkSize,
 		attached:  map[string]string{},
 	}
+}
+
+// SetLocalRemoteDir tells the store its remote lives at dir on this host's
+// disk, so chunk reads go straight through to it instead of being copied into
+// the local cache first. dir is the remote root (the "volume-remote" dir),
+// not the chunks dir itself.
+func (s *Store) SetLocalRemoteDir(dir string) {
+	s.localRemote = dir
+	s.cs.SetLocalChunksDir(filepath.Join(dir, s.prefix, "chunks"))
+}
+
+// SetGCGrace overrides how young a chunk may be and still be safe from GC.
+// A negative grace disables the grace window (tests).
+func (s *Store) SetGCGrace(d time.Duration) { s.gcGrace = d }
+
+func (s *Store) gcGracePeriod() time.Duration {
+	if s.gcGrace < 0 {
+		return 0 // tests: no grace
+	}
+	if s.gcGrace == 0 {
+		return DefaultGCGrace
+	}
+	return s.gcGrace
+}
+
+// LastApply reports what the most recent EnsureLocal wrote vs skipped.
+func (s *Store) LastApply() cloudstore.ApplyStats {
+	s.applyMu.Lock()
+	defer s.applyMu.Unlock()
+	return s.lastApply
 }
 
 // --- paths ---
@@ -129,7 +182,9 @@ func (s *Store) Create(ctx context.Context, name string, size int64, from string
 			return nil, fmt.Errorf("source manifest: %w", err)
 		}
 		if srcImg := s.ImagePath(from); fileExists(srcImg) {
-			_ = cloneFile(srcImg, s.ImagePath(name))
+			if err := cloneFile(srcImg, s.ImagePath(name)); err != nil {
+				return nil, err
+			}
 		}
 		meta.Size, meta.ChunkSize, meta.From = src.Size, src.ChunkSize, from
 		man = m
@@ -138,7 +193,9 @@ func (s *Store) Create(ctx context.Context, name string, size int64, from string
 		if err != nil {
 			return nil, err
 		}
-		_ = cloneFile(s.baseImage, s.ImagePath(name))
+		if err := cloneFile(s.baseImage, s.ImagePath(name)); err != nil {
+			return nil, err
+		}
 		meta.Size, meta.ChunkSize, meta.From = bm.Size, bm.ChunkSize, "_base"
 		man = bm
 	default:
@@ -180,6 +237,14 @@ func (s *Store) Create(ctx context.Context, name string, size int64, from string
 	}
 	if err := s.cs.PutJSON(ctx, s.manifestRemote(name), man); err != nil {
 		return nil, err
+	}
+	// The local image provably matches the manifest in every path above: a
+	// clone copies the source bytes, and a fresh sparse image matches the
+	// empty manifest. (CreateFromSnapshot is the exception — it leaves a
+	// sparse image behind for EnsureLocal — and records no sidecar.)
+	// The grow path below only extends with holes, so it stays matched too.
+	if fileExists(s.ImagePath(name)) {
+		s.recordApplied(name, man)
 	}
 	return meta, nil
 }
@@ -399,10 +464,24 @@ func (s *Store) CreateFromSnapshot(ctx context.Context, name, snapID string) (*M
 
 // EnsureLocal materializes the volume's image locally from the manifest using
 // the shared chunk cache, and returns its path.
+//
+// Ranges already identical to the manifest are left untouched (per-chunk
+// hash compare), so a create on an up-to-date image performs zero chunk
+// writes. A sidecar records the last materialized manifest plus the image's
+// size/mtime, so the fully-up-to-date case skips even the comparison reads.
+// When the remote is a local dir, chunk reads go straight through to it and
+// the legacy cache copy is removed.
 func (s *Store) EnsureLocal(ctx context.Context, name string) (string, error) {
 	meta, err := s.Get(ctx, name)
 	if err != nil {
 		return "", err
+	}
+	// Local backend: the cache is pure waste (every byte would live twice on
+	// one disk), so drop it once instead of feeding it. Concurrent applies
+	// already hold full chunk bytes in memory, so deleting files out from
+	// under them only turns into a re-fetch, never corruption.
+	if s.localRemote != "" {
+		s.cleanedCache.Do(func() { _ = os.RemoveAll(s.cacheDir()) })
 	}
 	man, err := s.Manifest(ctx, name)
 	if err != nil {
@@ -410,6 +489,10 @@ func (s *Store) EnsureLocal(ctx context.Context, name string) (string, error) {
 	}
 	if err := os.MkdirAll(s.dirPath(name), 0o755); err != nil {
 		return "", err
+	}
+	if s.appliedCurrent(name, man) {
+		s.setLastApply(cloudstore.ApplyStats{})
+		return s.ImagePath(name), nil
 	}
 	f, err := os.OpenFile(s.ImagePath(name), os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
@@ -419,10 +502,90 @@ func (s *Store) EnsureLocal(ctx context.Context, name string) (string, error) {
 	if err := f.Truncate(meta.Size); err != nil {
 		return "", err
 	}
-	if err := s.cs.ApplyManifest(ctx, man, f, s.cacheDir()); err != nil {
+	st, err := s.cs.ApplyManifest(ctx, man, f, s.cacheDir())
+	if err != nil {
 		return "", err
 	}
+	s.setLastApply(st)
+	if err := f.Sync(); err != nil {
+		return "", err
+	}
+	s.recordApplied(name, man)
 	return s.ImagePath(name), nil
+}
+
+func (s *Store) setLastApply(st cloudstore.ApplyStats) {
+	s.applyMu.Lock()
+	defer s.applyMu.Unlock()
+	s.lastApply = st
+}
+
+// appliedSidecar is the sidecar recording what disk.img currently holds.
+type appliedSidecar struct {
+	Manifest string `json:"manifest"` // digest of the materialized manifest
+	Size     int64  `json:"size"`
+	Mtime    int64  `json:"mtime_ns"`
+}
+
+func (s *Store) sidecarPath(name string) string {
+	return filepath.Join(s.dirPath(name), ".applied.json")
+}
+
+// manifestDigest is the content hash of a manifest's canonical form.
+func manifestDigest(m *cloudstore.Manifest) string {
+	keys := make([]string, 0, len(m.Chunks))
+	for k := range m.Chunks {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var sb strings.Builder
+	sb.WriteString(strconv.FormatInt(m.ChunkSize, 10))
+	sb.WriteByte('/')
+	sb.WriteString(strconv.FormatInt(m.Size, 10))
+	for _, k := range keys {
+		sb.WriteByte('/')
+		sb.WriteString(k)
+		sb.WriteByte('=')
+		sb.WriteString(m.Chunks[k])
+	}
+	sum := sha256.Sum256([]byte(sb.String()))
+	return hex.EncodeToString(sum[:])
+}
+
+// appliedCurrent reports whether disk.img provably matches man: the sidecar
+// names the same manifest digest and the image is byte-identical in size and
+// mtime to when the sidecar was written. Any guest run or external write
+// changes mtime and forces the full per-chunk comparison.
+func (s *Store) appliedCurrent(name string, man *cloudstore.Manifest) bool {
+	raw, err := os.ReadFile(s.sidecarPath(name))
+	if err != nil {
+		return false
+	}
+	var sc appliedSidecar
+	if err := json.Unmarshal(raw, &sc); err != nil {
+		return false
+	}
+	if sc.Manifest == "" || sc.Manifest != manifestDigest(man) {
+		return false
+	}
+	fi, err := os.Stat(s.ImagePath(name))
+	if err != nil || fi.Size() != sc.Size {
+		return false
+	}
+	return fi.ModTime().UnixNano() == sc.Mtime
+}
+
+func (s *Store) recordApplied(name string, man *cloudstore.Manifest) {
+	fi, err := os.Stat(s.ImagePath(name))
+	if err != nil {
+		return
+	}
+	sc := appliedSidecar{Manifest: manifestDigest(man), Size: fi.Size(), Mtime: fi.ModTime().UnixNano()}
+	raw, err := json.Marshal(sc)
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(s.sidecarPath(name), raw, 0o644)
 }
 
 // Commit uploads the local image's allocated chunks and refreshes the manifest.
@@ -440,7 +603,107 @@ func (s *Store) Commit(ctx context.Context, name string) error {
 	if err != nil {
 		return err
 	}
-	return s.cs.PutJSON(ctx, s.manifestRemote(name), m)
+	if err := s.cs.PutJSON(ctx, s.manifestRemote(name), m); err != nil {
+		return err
+	}
+	// The manifest was just built from this exact disk, so they match.
+	s.recordApplied(name, m)
+	return nil
+}
+
+// --- garbage collection ---
+
+// GCReport describes what a garbage-collection pass found and did.
+type GCReport struct {
+	Volumes   int      `json:"volumes"`
+	Chunks    int      `json:"chunks"`
+	Orphans   []string `json:"orphans"`
+	Reclaimed int64    `json:"reclaimed_bytes"`
+	Deleted   int      `json:"deleted"`
+	DryRun    bool     `json:"dry_run"`
+}
+
+// ReferencedHashes collects the chunk hashes named by every volume manifest,
+// every snapshot manifest, and the base-image manifest. Anything stored but
+// not in this set is unreachable and safe to delete — including while a
+// desktop is attached, because the attached volume's own manifest keeps its
+// chunks referenced.
+func (s *Store) ReferencedHashes(ctx context.Context) (map[string]bool, error) {
+	ref := map[string]bool{}
+	vols, err := s.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, v := range vols {
+		man, err := s.Manifest(ctx, v.Name)
+		if err != nil {
+			continue
+		}
+		for _, h := range man.Chunks {
+			ref[h] = true
+		}
+	}
+	snaps, err := s.ListSnapshots(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, sn := range snaps {
+		man := &cloudstore.Manifest{Chunks: map[string]string{}}
+		if err := s.cs.GetJSON(ctx, s.snapshotManifestRemote(sn.ID), man); err != nil {
+			continue
+		}
+		for _, h := range man.Chunks {
+			ref[h] = true
+		}
+	}
+	base := &cloudstore.Manifest{Chunks: map[string]string{}}
+	if err := s.cs.GetJSON(ctx, s.baseManifestRemote(), base); err == nil {
+		for _, h := range base.Chunks {
+			ref[h] = true
+		}
+	}
+	return ref, nil
+}
+
+// GC deletes remote chunks no manifest or snapshot references. Chunks newer
+// than the grace period are spared, so an in-flight commit's not-yet-linked
+// uploads survive. Dry-run lists without deleting.
+func (s *Store) GC(ctx context.Context, dryRun bool) (GCReport, error) {
+	var rep GCReport
+	rep.DryRun = dryRun
+	ref, err := s.ReferencedHashes(ctx)
+	if err != nil {
+		return rep, err
+	}
+	chunks, err := s.cs.ListChunks(ctx)
+	if err != nil {
+		return rep, err
+	}
+	rep.Chunks = len(chunks)
+	grace := s.gcGracePeriod()
+	cutoff := time.Now().Add(-grace)
+	for _, c := range chunks {
+		if ref[c.Hash] {
+			continue
+		}
+		if c.ModTime.After(cutoff) {
+			continue
+		}
+		rep.Orphans = append(rep.Orphans, c.Hash)
+		rep.Reclaimed += c.Size
+	}
+	sort.Strings(rep.Orphans)
+	vols, _ := s.List(ctx)
+	rep.Volumes = len(vols)
+	if dryRun {
+		return rep, nil
+	}
+	for _, h := range rep.Orphans {
+		if err := s.cs.DeleteChunk(ctx, h); err == nil {
+			rep.Deleted++
+		}
+	}
+	return rep, nil
 }
 
 // --- single-attach lock (in-process) ---

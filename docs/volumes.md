@@ -77,6 +77,7 @@ warmbox volume list
 warmbox volume clone <name> <new>
 warmbox volume snapshot <name> [--as <snap>]
 warmbox volume rm <name>
+warmbox volume gc [--dry-run]   delete remote chunks no volume or snapshot uses
 ```
 
 Daemon flags for volumes:
@@ -117,6 +118,20 @@ changing size means growing the disk file and then telling ext4 to stretch
   the volume. No host tools and no Docker needed — it works on any host.
 - `Create` stays O(1): it just extends the local image; the filesystem catches up
   on first boot. The extra space is holes until written.
+
+## Storage layout and garbage collection
+
+Each volume byte lives in two places, not three: the live `disk.img` and one
+copy in the chunk store. When the store is a local dir (no cloud remote), the
+daemon reads chunks straight through to it instead of keeping a second copy in
+`volumes/chunks/`, and any leftover cache from before is removed. With a real
+remote, the local chunk cache is bounded (4 GiB, oldest-first).
+
+`warmbox volume gc [--dry-run]` deletes remote chunks no volume manifest and no
+snapshot references — the orphans failed commits and prepares leave behind.
+Chunks newer than an hour are spared, so an in-flight commit's not-yet-linked
+uploads survive. It only deletes unreferenced chunks, so it is safe to run
+while a desktop is attached.
 
 ## REST API
 
